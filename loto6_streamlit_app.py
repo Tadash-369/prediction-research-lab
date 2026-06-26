@@ -73,9 +73,10 @@ RESULT_COLUMNS = [
 ]
 PRIZE_COUNT_COLUMNS = ["1等口数", "2等口数", "3等口数", "4等口数", "5等口数"]
 PRIZE_AMOUNT_COLUMNS = ["1等賞金", "2等賞金", "3等賞金", "4等賞金", "5等賞金"]
+PRIZE_FILL_COLUMNS = [*PRIZE_COUNT_COLUMNS, *PRIZE_AMOUNT_COLUMNS, "キャリーオーバー"]
 SET_COLUMNS = ["開催回", "日付", "球セット", "信頼度", "根拠", "動画メタID", "メモ"]
 NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字"]
-FILL_ONLY_COLUMNS = ["日付", *NUMBER_COLUMNS, "BONUS数字", *PRIZE_COUNT_COLUMNS, *PRIZE_AMOUNT_COLUMNS, "キャリーオーバー"]
+FILL_ONLY_COLUMNS = ["日付", *NUMBER_COLUMNS, "BONUS数字", *PRIZE_FILL_COLUMNS]
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
@@ -589,6 +590,66 @@ def format_update_report(report):
         f"保存先: {report['saved_path']}",
     ]
     return "\n".join(lines)
+
+
+def format_manual_prize_report(report):
+    lines = [
+        f"補完した開催回: 第{report['round_no']}回",
+        f"補完した項目: {', '.join(report['filled_columns']) if report['filled_columns'] else 'なし'}",
+        f"上書きした項目: {', '.join(report['overwritten_columns']) if report['overwritten_columns'] else 'なし'}",
+        f"変更なしだった項目: {', '.join(report['unchanged_columns']) if report['unchanged_columns'] else 'なし'}",
+        f"保存先: {report['saved_path']}",
+    ]
+    return "\n".join(lines)
+
+
+def fill_loto6_prize_values_manually(round_no, input_values, overwrite_existing=False):
+    results = read_csv(RESULTS_CSV, RESULT_COLUMNS)
+    if results.empty or "開催回" not in results:
+        raise ValueError("loto6.csv に対象データがありません。先に当選結果を登録してください。")
+
+    results = results.copy()
+    for column in RESULT_COLUMNS:
+        if column not in results:
+            results[column] = ""
+    results = results.reindex(columns=RESULT_COLUMNS).astype(object)
+    results["開催回"] = results["開催回"].map(to_int)
+
+    round_no = int(round_no)
+    same_round = results["開催回"] == round_no
+    if not same_round.any():
+        raise ValueError(f"第{round_no}回は loto6.csv に存在しません。新規追加はしません。")
+
+    row_index = results.index[same_round][0]
+    report = {
+        "round_no": round_no,
+        "filled_columns": [],
+        "overwritten_columns": [],
+        "unchanged_columns": [],
+        "saved_path": str(RESULTS_CSV),
+    }
+
+    for column in PRIZE_FILL_COLUMNS:
+        input_value = clean_result_value(column, input_values.get(column, ""))
+        if is_blank_value(input_value):
+            report["unchanged_columns"].append(column)
+            continue
+
+        current_value = results.at[row_index, column]
+        if is_blank_value(current_value):
+            results.at[row_index, column] = input_value
+            report["filled_columns"].append(column)
+        elif overwrite_existing and clean_result_value(column, current_value) != input_value:
+            results.at[row_index, column] = input_value
+            report["overwritten_columns"].append(column)
+        else:
+            report["unchanged_columns"].append(column)
+
+    for column in RESULT_COLUMNS:
+        results[column] = results[column].map(lambda value, col=column: clean_result_value(col, value))
+    results = results.sort_values("開催回")
+    save_csv(results, RESULTS_CSV, RESULT_COLUMNS)
+    return report
 
 
 def update_latest_result_from_web(run_analysis_after=True):
@@ -1382,6 +1443,40 @@ def render_registration_form():
         st.sidebar.error(str(exc))
 
 
+def render_manual_prize_fill_form():
+    results = read_csv(RESULTS_CSV, RESULT_COLUMNS)
+    existing_rounds = []
+    if not results.empty and "開催回" in results:
+        existing_rounds = sorted({to_int(value) for value in results["開催回"] if to_int(value) > 0})
+    default_round = existing_rounds[-1] if existing_rounds else 1
+
+    with st.expander("口数・賞金を手動補完", expanded=False):
+        st.caption("自動取得できない場合に使います。通常は空欄だけを補完し、チェックを入れた時だけ既存値を上書きします。")
+        with st.form("manual_loto6_prize_fill_form"):
+            round_no = st.number_input("開催回", min_value=1, value=int(default_round), step=1)
+            count_cols = st.columns(5)
+            amount_cols = st.columns(5)
+            input_values = {}
+            for index, column in enumerate(PRIZE_COUNT_COLUMNS):
+                input_values[column] = count_cols[index].text_input(column, value="", placeholder="例: 2口")
+            for index, column in enumerate(PRIZE_AMOUNT_COLUMNS):
+                input_values[column] = amount_cols[index].text_input(column, value="", placeholder="例: 124,941,200円")
+            input_values["キャリーオーバー"] = st.text_input("キャリーオーバー", value="", placeholder="例: 0円")
+            overwrite_existing = st.checkbox("既存値を上書きする", value=False)
+            submitted = st.form_submit_button("口数・賞金を補完")
+
+        if not submitted:
+            return
+
+        try:
+            report = fill_loto6_prize_values_manually(int(round_no), input_values, overwrite_existing=overwrite_existing)
+            message = format_manual_prize_report(report)
+            st.session_state["loto6_manual_prize_message"] = message
+            st.success(message)
+        except Exception as exc:
+            st.error(str(exc))
+
+
 def render_prediction_picks(scores, results, target_round):
     st.markdown("**研究フロー: 当選番号追加 → 結果分析 → 反省履歴保存 → 履歴分析 → モデル評価 → 改善条件抽出 → 次回予想生成**")
     with st.spinner("予想生成前の履歴分析とモデル評価を実行しています..."):
@@ -1613,6 +1708,11 @@ if action_cols[3].button("手元のCSVで再分析"):
 
 if st.session_state.get("loto6_update_message"):
     st.info(st.session_state["loto6_update_message"])
+
+render_manual_prize_fill_form()
+
+if st.session_state.get("loto6_manual_prize_message"):
+    st.info(st.session_state["loto6_manual_prize_message"])
 
 
 results = merge_official_results(read_csv(RESULTS_CSV, RESULT_COLUMNS))
