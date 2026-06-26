@@ -43,6 +43,38 @@ def save_csv(df, path, columns=None):
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
+DISPLAY_TEXT_COLUMNS = [
+    "予想保存数",
+    "予測保存数",
+    "検証数",
+    "平均一致数",
+    "平均期待値",
+    "平均的中率",
+    "平均勝率",
+    "状態",
+]
+
+
+def dataframe_for_display(df, text_columns=None):
+    display_df = df.copy()
+    for column in (text_columns or DISPLAY_TEXT_COLUMNS):
+        if column in display_df.columns:
+            display_df[column] = display_df[column].astype(str)
+    for column in display_df.columns:
+        values = display_df[column].dropna()
+        if values.empty:
+            continue
+        has_placeholder = values.astype(str).str.strip().isin(["-", "－", ""]).any()
+        has_numeric = pd.to_numeric(values, errors="coerce").notna().any()
+        if has_placeholder and has_numeric:
+            display_df[column] = display_df[column].astype(str)
+    return display_df
+
+
+def display_dataframe(df, **kwargs):
+    st.dataframe(dataframe_for_display(df), **kwargs)
+
+
 def numeric_column(df, column_name, default=0):
     if column_name not in df:
         return pd.Series([default] * len(df), index=df.index)
@@ -105,7 +137,7 @@ def render_home():
     for column in ["予想保存数", "検証数", "平均一致数", "平均期待値"]:
         summary[column] = summary[column].astype(str)
     st.markdown("**研究所サマリー**")
-    st.dataframe(summary, width="stretch", hide_index=True)
+    display_dataframe(summary, width="stretch", hide_index=True)
 
     next_actions = pd.DataFrame(
         [
@@ -116,7 +148,7 @@ def render_home():
         ]
     )
     st.markdown("**次にやること**")
-    st.dataframe(next_actions, width="stretch", hide_index=True)
+    display_dataframe(next_actions, width="stretch", hide_index=True)
 
 
 def render_model_catalog():
@@ -127,7 +159,7 @@ def render_model_catalog():
             for index, label in enumerate(FUTURE_LOTO_MODEL_LABELS.values(), start=len(LOTO_MODEL_LABELS) + 1)
         ]
     )
-    st.dataframe(model_df, width="stretch", hide_index=True)
+    display_dataframe(model_df, width="stretch", hide_index=True)
 
 
 def render_loto_lab(name, prediction_file, result_file, report_file, contribution_file, cycle_file, number_max, draw_size):
@@ -144,32 +176,32 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
     cols[3].metric("貢献度ログ", len(contributions))
 
     st.markdown("**研究フロー**")
-    st.dataframe(build_research_flow_table(), width="stretch", hide_index=True)
+    display_dataframe(build_research_flow_table(), width="stretch", hide_index=True)
 
     tabs = st.tabs(["研究サイクル", "モデル別成績", "モデル貢献度", "条件別成功率", "AI改善レポート", "動画仮説"])
     with tabs[0]:
         if cycles.empty:
             st.info(f"{name}の研究サイクル履歴は、検証レポート作成後に保存されます。")
         else:
-            st.dataframe(cycles.sort_values(["開催回", "予想ID"], ascending=[False, True]), width="stretch", hide_index=True)
+            display_dataframe(cycles.sort_values(["開催回", "予想ID"], ascending=[False, True]), width="stretch", hide_index=True)
     with tabs[1]:
         dashboard = build_model_dashboard(reports, draw_size=draw_size)
         if dashboard.empty:
             st.info(f"{name}のモデル別成績は、予想と結果の照合後に表示されます。")
         else:
-            st.dataframe(dashboard, width="stretch", hide_index=True)
+            display_dataframe(dashboard, width="stretch", hide_index=True)
     with tabs[2]:
         ranking = build_contribution_ranking(contributions)
         if ranking.empty:
             st.info(f"{name}の貢献度ランキングは、的中数字の要因分析後に表示されます。")
         else:
-            st.dataframe(ranking, width="stretch", hide_index=True)
+            display_dataframe(ranking, width="stretch", hide_index=True)
     with tabs[3]:
         condition_df = build_condition_success_table(reports, number_max=number_max)
         if condition_df.empty:
             st.info(f"{name}の条件別成功率は、検証レポート作成後に表示されます。")
         else:
-            st.dataframe(condition_df, width="stretch", hide_index=True)
+            display_dataframe(condition_df, width="stretch", hide_index=True)
     with tabs[4]:
         summary = build_ai_improvement_summary(reports)
         metric_cols = st.columns(3)
@@ -185,7 +217,7 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
         if video_logs.empty:
             st.info("動画仮説ログはまだありません。")
         else:
-            st.dataframe(video_logs.sort_values("保存日時", ascending=False), width="stretch", hide_index=True)
+            display_dataframe(video_logs.sort_values("保存日時", ascending=False), width="stretch", hide_index=True)
 
 
 def render_investment_lab():
@@ -255,7 +287,7 @@ def render_investment_lab():
             save_csv(edited, portfolio_path, portfolio_columns)
             st.success("ポートフォリオを保存しました。")
         st.markdown("**集計**")
-        st.dataframe(portfolio_calc, width="stretch", hide_index=True)
+        display_dataframe(portfolio_calc, width="stretch", hide_index=True)
     with tabs[1]:
         edited_dividends = st.data_editor(dividends, num_rows="dynamic", width="stretch", hide_index=True, key="dividend_editor")
         if st.button("配当履歴を保存"):
@@ -267,7 +299,7 @@ def render_investment_lab():
             save_csv(edited_watchlist, watch_path, watch_columns)
             st.success("売買候補を保存しました。")
     with tabs[3]:
-        st.dataframe(targets, width="stretch", hide_index=True)
+        display_dataframe(targets, width="stretch", hide_index=True)
 
 
 def render_ai_department():
@@ -309,7 +341,7 @@ def render_verification_department():
                 "平均期待値": round(float(reports["期待値"].mean()), 3),
             }
         )
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    display_dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def render_hospital_system():
@@ -374,7 +406,7 @@ def render_hospital_system():
                 {"機能": "業務負担分析", "状態": "負担度集計まで実装"},
             ]
         )
-        st.dataframe(functions, width="stretch", hide_index=True)
+        display_dataframe(functions, width="stretch", hide_index=True)
 
 def render_system_department():
     apps = pd.DataFrame(
@@ -384,7 +416,7 @@ def render_system_department():
             {"アプリ": "病院業務改善システム", "機能": "勤務表条件 / 人員配置集計 / 委員会管理 / 業務負担分析", "状態": "基礎機能実装"},
         ]
     )
-    st.dataframe(apps, width="stretch", hide_index=True)
+    display_dataframe(apps, width="stretch", hide_index=True)
 
 
 def render_maintenance_department():
@@ -392,11 +424,11 @@ def render_maintenance_department():
     cols = st.columns(2)
     if cols[0].button("補完内容を確認"):
         summary = run_maintenance(apply_changes=False)
-        st.dataframe(summary, width="stretch", hide_index=True)
+        display_dataframe(summary, width="stretch", hide_index=True)
     if cols[1].button("Ver1.0補完を実行"):
         summary = run_maintenance(apply_changes=True)
         st.success("補完を実行しました。")
-        st.dataframe(summary, width="stretch", hide_index=True)
+        display_dataframe(summary, width="stretch", hide_index=True)
 
 
 def render_launch_guide():
@@ -409,7 +441,7 @@ def render_launch_guide():
             {"画面": "ロト7専用画面", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run loto7_streamlit_app.py --server.port 8503"},
         ]
     )
-    st.dataframe(guide, width="stretch", hide_index=True)
+    display_dataframe(guide, width="stretch", hide_index=True)
     st.markdown("**ブラウザで開くURL**")
     st.code(
         "トップ画面: http://localhost:8501\n"
@@ -430,7 +462,7 @@ def render_roadmap():
             {"Phase": "Phase6", "内容": "完全自動研究所"},
         ]
     )
-    st.dataframe(roadmap, width="stretch", hide_index=True)
+    display_dataframe(roadmap, width="stretch", hide_index=True)
 
 
 st.set_page_config(page_title=f"{PROJECT_JAPANESE_NAME} | {PROJECT_SHORT_NAME}", layout="wide")
