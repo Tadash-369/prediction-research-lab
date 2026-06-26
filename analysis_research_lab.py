@@ -102,6 +102,8 @@ def render_home():
             {"部門": "保守", "予想保存数": "-", "検証数": "-", "平均一致数": "-", "平均期待値": "-", "状態": "同期・補完対応"},
         ]
     )
+    for column in ["予想保存数", "検証数", "平均一致数", "平均期待値"]:
+        summary[column] = summary[column].astype(str)
     st.markdown("**研究所サマリー**")
     st.dataframe(summary, width="stretch", hide_index=True)
 
