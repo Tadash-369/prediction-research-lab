@@ -71,8 +71,11 @@ RESULT_COLUMNS = [
     "5等賞金",
     "キャリーオーバー",
 ]
+PRIZE_COUNT_COLUMNS = ["1等口数", "2等口数", "3等口数", "4等口数", "5等口数"]
+PRIZE_AMOUNT_COLUMNS = ["1等賞金", "2等賞金", "3等賞金", "4等賞金", "5等賞金"]
 SET_COLUMNS = ["開催回", "日付", "球セット", "信頼度", "根拠", "動画メタID", "メモ"]
 NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字"]
+FILL_ONLY_COLUMNS = ["日付", *NUMBER_COLUMNS, "BONUS数字", *PRIZE_COUNT_COLUMNS, *PRIZE_AMOUNT_COLUMNS, "キャリーオーバー"]
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
@@ -300,8 +303,44 @@ def merge_official_results(results):
 
 
 def normalize_digits(text):
-    table = str.maketrans("０１２３４５６７８９", "0123456789")
+    table = str.maketrans("０１２３４５６７８９，．－", "0123456789,.-")
     return str(text).translate(table)
+
+
+def is_blank_value(value):
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    text = normalize_digits(value).strip()
+    return text in {"", "-", "－", "None", "none", "NaN", "nan", "NAN"}
+
+
+def parse_amount_value(value):
+    if is_blank_value(value):
+        return None
+    text = normalize_digits(value)
+    text = re.sub(r"[^\d.-]", "", text)
+    if text in {"", "-", "."}:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def clean_result_value(column, value):
+    if is_blank_value(value):
+        return ""
+    if column in ["開催回", *NUMBER_COLUMNS, "BONUS数字", *PRIZE_COUNT_COLUMNS, *PRIZE_AMOUNT_COLUMNS, "キャリーオーバー"]:
+        parsed = parse_amount_value(value)
+        return parsed if parsed is not None else ""
+    if column == "日付" and hasattr(value, "strftime"):
+        return value.strftime("%Y/%m/%d")
+    return str(value).strip()
 
 
 def parse_japanese_date(text):
@@ -346,6 +385,66 @@ def numbers_from_text(text):
     return [int(value) for value in re.findall(r"\d+", normalize_digits(text))]
 
 
+def empty_loto6_result_row():
+    return {column: "" for column in RESULT_COLUMNS}
+
+
+def build_loto6_result_row(round_no, draw_date, main_numbers, bonus_number, extra_values=None):
+    sorted_numbers = sorted(main_numbers)
+    row = empty_loto6_result_row()
+    row.update(
+        {
+            "開催回": int(round_no),
+            "日付": draw_date.strftime("%Y/%m/%d") if hasattr(draw_date, "strftime") else str(draw_date),
+            "第1数字": sorted_numbers[0],
+            "第2数字": sorted_numbers[1],
+            "第3数字": sorted_numbers[2],
+            "第4数字": sorted_numbers[3],
+            "第5数字": sorted_numbers[4],
+            "第6数字": sorted_numbers[5],
+            "BONUS数字": int(bonus_number),
+        }
+    )
+    if extra_values:
+        for column, value in extra_values.items():
+            if column in row:
+                row[column] = clean_result_value(column, value)
+    return {column: clean_result_value(column, row.get(column, "")) for column in RESULT_COLUMNS}
+
+
+def extract_prize_values_from_lines(lines):
+    values = {}
+    for raw_line in lines:
+        line = normalize_digits(raw_line)
+        carry_match = re.search(r"キャリーオーバー[^0-9-]*([0-9,]+)", line)
+        if carry_match:
+            values["キャリーオーバー"] = parse_amount_value(carry_match.group(1))
+
+        for grade, count, amount in re.findall(r"([1-5])\s*等[^0-9]*(\d[\d,]*)\s*口[^0-9]*(\d[\d,]*)", line):
+            values[f"{grade}等口数"] = parse_amount_value(count)
+            values[f"{grade}等賞金"] = parse_amount_value(amount)
+    return values
+
+
+def extract_prize_values_from_table(table, lines):
+    values = extract_prize_values_from_lines(lines)
+    for _, row in table.iterrows():
+        cells = [normalize_digits(value).strip() for value in row.tolist() if not pd.isna(value)]
+        if not cells:
+            continue
+        joined = " ".join(cells)
+        grade_match = re.search(r"([1-5])\s*等", joined)
+        if not grade_match:
+            continue
+        grade = grade_match.group(1)
+        numeric_values = [parse_amount_value(cell) for cell in cells]
+        numeric_values = [value for value in numeric_values if value is not None]
+        if len(numeric_values) >= 2:
+            values[f"{grade}等口数"] = numeric_values[-2]
+            values[f"{grade}等賞金"] = numeric_values[-1]
+    return values
+
+
 def extract_latest_loto6_result(page_text):
     tables = pd.read_html(StringIO(page_text))
 
@@ -372,11 +471,19 @@ def extract_latest_loto6_result(page_text):
                 main_numbers = candidates[:6]
 
         if len(main_numbers) == 6 and bonus_number:
+            prize_values = extract_prize_values_from_table(table, lines)
             return {
                 "round_no": int(round_match.group(1)),
                 "draw_date": draw_date,
                 "main_numbers": sorted(main_numbers),
                 "bonus_number": bonus_number,
+                "result_row": build_loto6_result_row(
+                    int(round_match.group(1)),
+                    draw_date,
+                    main_numbers,
+                    bonus_number,
+                    prize_values,
+                ),
             }
 
     raise RuntimeError("最新当選番号を自動判定できませんでした。手入力フォームで登録してください。")
@@ -410,83 +517,110 @@ def upsert_official_result(round_no, draw_date, main_numbers, bonus_number, sour
     save_csv(official_results, OFFICIAL_RESULTS_CSV, OFFICIAL_RESULT_COLUMNS)
 
 
-def upsert_result_row(round_no, draw_date, main_numbers, bonus_number):
-    results = read_csv(RESULTS_CSV, RESULT_COLUMNS)
-    sorted_numbers = sorted(main_numbers)
-    result_row = {
-        "開催回": round_no,
-        "日付": draw_date.strftime("%Y/%m/%d"),
-        "第1数字": sorted_numbers[0],
-        "第2数字": sorted_numbers[1],
-        "第3数字": sorted_numbers[2],
-        "第4数字": sorted_numbers[3],
-        "第5数字": sorted_numbers[4],
-        "第6数字": sorted_numbers[5],
-        "BONUS数字": bonus_number,
-        "1等口数": "",
-        "2等口数": "",
-        "3等口数": "",
-        "4等口数": "",
-        "5等口数": "",
-        "1等賞金": "",
-        "2等賞金": "",
-        "3等賞金": "",
-        "4等賞金": "",
-        "5等賞金": "",
-        "キャリーオーバー": "",
+def merge_loto_result_row(results, fetched_row):
+    fetched_row = {column: clean_result_value(column, fetched_row.get(column, "")) for column in RESULT_COLUMNS}
+    round_no = int(fetched_row["開催回"])
+    report = {
+        "new_rounds": [],
+        "filled_rounds": [],
+        "unchanged_rounds": [],
+        "missing_fields": [],
+        "saved_path": str(RESULTS_CSV),
     }
 
     if results.empty:
-        results = pd.DataFrame([result_row])
-        changed = True
+        results = pd.DataFrame([fetched_row])
+        report["new_rounds"].append(round_no)
     else:
+        results = results.copy()
+        for column in RESULT_COLUMNS:
+            if column not in results:
+                results[column] = ""
+        results = results.reindex(columns=RESULT_COLUMNS)
+        results = results.astype(object)
         results["開催回"] = results["開催回"].map(to_int)
         same_round = results["開催回"] == round_no
         if same_round.any():
-            current = results.loc[same_round].iloc[0]
-            current_numbers = [to_int(current[column]) for column in NUMBER_COLUMNS]
-            current_bonus = to_int(current["BONUS数字"])
-            current_date = str(current["日付"])
-            changed = current_numbers != sorted_numbers or current_bonus != bonus_number or current_date != result_row["日付"]
-            for key, value in result_row.items():
-                results.loc[same_round, key] = value
+            filled_columns = []
+            row_index = results.index[same_round][0]
+            for column in FILL_ONLY_COLUMNS:
+                fetched_value = fetched_row.get(column, "")
+                if is_blank_value(fetched_value):
+                    continue
+                current_value = results.at[row_index, column]
+                if is_blank_value(current_value):
+                    results.at[row_index, column] = fetched_value
+                    filled_columns.append(column)
+            if filled_columns:
+                report["filled_rounds"].append(f"第{round_no}回: {', '.join(filled_columns)}")
+            else:
+                report["unchanged_rounds"].append(round_no)
         else:
-            results = pd.concat([results, pd.DataFrame([result_row])], ignore_index=True)
-            changed = True
+            results = pd.concat([results, pd.DataFrame([fetched_row])], ignore_index=True)
+            report["new_rounds"].append(round_no)
 
     results["開催回"] = results["開催回"].map(to_int)
     results = results.sort_values("開催回")
+    for column in RESULT_COLUMNS:
+        results[column] = results[column].map(lambda value, col=column: clean_result_value(col, value))
+
+    for column in [*PRIZE_COUNT_COLUMNS, *PRIZE_AMOUNT_COLUMNS, "キャリーオーバー"]:
+        if is_blank_value(fetched_row.get(column, "")):
+            report["missing_fields"].append(column)
+    return results, report
+
+
+def upsert_result_row(round_no, draw_date, main_numbers, bonus_number, extra_values=None):
+    results = read_csv(RESULTS_CSV, RESULT_COLUMNS)
+    sorted_numbers = sorted(main_numbers)
+    result_row = build_loto6_result_row(round_no, draw_date, sorted_numbers, bonus_number, extra_values)
+    results, report = merge_loto_result_row(results, result_row)
     save_csv(results, RESULTS_CSV, RESULT_COLUMNS)
     upsert_official_result(round_no, draw_date, sorted_numbers, bonus_number, "web")
-    return changed
+    return report
 
 
-def update_latest_result_from_web():
+def format_update_report(report):
+    lines = [
+        f"新規追加した開催回: {', '.join(map(str, report['new_rounds'])) if report['new_rounds'] else 'なし'}",
+        f"補完した開催回: {' / '.join(map(str, report['filled_rounds'])) if report['filled_rounds'] else 'なし'}",
+        f"変更なしだった開催回: {', '.join(map(str, report['unchanged_rounds'])) if report['unchanged_rounds'] else 'なし'}",
+        f"取得できなかった項目: {', '.join(report['missing_fields']) if report['missing_fields'] else 'なし'}",
+        f"保存先: {report['saved_path']}",
+    ]
+    return "\n".join(lines)
+
+
+def update_latest_result_from_web(run_analysis_after=True):
     latest = extract_latest_loto6_result(fetch_web_text(MIZUHO_LOTO6_URL))
-    changed = upsert_result_row(
+    report = upsert_result_row(
         latest["round_no"],
         latest["draw_date"],
         latest["main_numbers"],
         latest["bonus_number"],
+        latest.get("result_row", {}),
     )
 
     helper_messages = []
-    for script in ("import_dream_backnumber_videos.py", "import_charlie_recent_loto6_sets.py"):
-        try:
-            run_helper_script(script)
-            helper_messages.append(f"{script}: OK")
-        except Exception as exc:
-            helper_messages.append(f"{script}: {exc}")
+    verified_count = 0
+    if run_analysis_after:
+        for script in ("import_dream_backnumber_videos.py", "import_charlie_recent_loto6_sets.py"):
+            try:
+                run_helper_script(script)
+                helper_messages.append(f"{script}: OK")
+            except Exception as exc:
+                helper_messages.append(f"{script}: {exc}")
 
-    run_analysis()
-    verified_count = verify_predictions_for_round(latest["round_no"])
+        run_analysis()
+        verified_count = verify_predictions_for_round(latest["round_no"])
 
     numbers = " - ".join(f"{number:02d}" for number in latest["main_numbers"])
-    status = "更新しました" if changed else "すでに最新でした"
     return (
         f"第{latest['round_no']}回 {latest['draw_date'].strftime('%Y/%m/%d')} "
-        f"{numbers} / BONUS {latest['bonus_number']:02d} を確認し、CSVを{status}。"
-        f" 検証レポート{verified_count}件を更新しました。"
+        f"{numbers} / BONUS {latest['bonus_number']:02d} を確認しました。"
+        + (f" 検証レポート{verified_count}件を更新しました。" if run_analysis_after else "")
+        + "\n"
+        + format_update_report(report)
         + "\n"
         + "\n".join(helper_messages)
     )
@@ -1441,22 +1575,44 @@ if "registration_message" in st.session_state:
 
 st.info("当選結果を入力する場合は、画面左側のサイドバーにある「新しい当選結果を登録」を使ってください。サイドバーが見えない場合は、左上の矢印で開けます。")
 
-action_cols = st.columns(2)
-if action_cols[0].button("最新当選番号を取得してCSV更新"):
+action_cols = st.columns(4)
+if action_cols[0].button("ロト6最新結果を自動更新"):
     try:
-        with st.spinner("最新当選番号を取得し、CSV更新と再分析を実行しています..."):
+        with st.spinner("最新結果を取得し、CSV更新と再分析を実行しています..."):
             message = update_latest_result_from_web()
+        st.session_state["loto6_update_message"] = message
         st.success(message)
     except Exception as exc:
         st.error(str(exc))
 
-if action_cols[1].button("手元のCSVで再分析"):
+if action_cols[1].button("ロト6の口数・賞金を再取得"):
+    try:
+        with st.spinner("口数・賞金を再取得しています..."):
+            message = update_latest_result_from_web(run_analysis_after=False)
+        st.session_state["loto6_update_message"] = message
+        st.success(message)
+    except Exception as exc:
+        st.error(f"取得に失敗しました。時間をおいて再実行してください。詳細: {exc}")
+
+if action_cols[2].button("空欄の賞金情報を補完"):
+    try:
+        with st.spinner("空欄の賞金情報を補完しています..."):
+            message = update_latest_result_from_web(run_analysis_after=False)
+        st.session_state["loto6_update_message"] = message
+        st.success(message)
+    except Exception as exc:
+        st.error(f"補完に失敗しました。既存データは変更されていません。詳細: {exc}")
+
+if action_cols[3].button("手元のCSVで再分析"):
     try:
         with st.spinner("分析を更新しています..."):
             run_analysis()
         st.success("分析を更新しました。")
     except Exception as exc:
         st.error(str(exc))
+
+if st.session_state.get("loto6_update_message"):
+    st.info(st.session_state["loto6_update_message"])
 
 
 results = merge_official_results(read_csv(RESULTS_CSV, RESULT_COLUMNS))
