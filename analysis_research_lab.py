@@ -400,14 +400,23 @@ def render_maintenance_department():
 
 
 def render_launch_guide():
+    st.markdown("**専用画面を同時に使う場合は、画面ごとに別ポートで起動します。**")
+    st.caption("トップ画面を開いたまま、別のターミナルでロト6・ロト7専用画面を起動できます。")
     guide = pd.DataFrame(
         [
             {"画面": "分析研究所トップ", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run analysis_research_lab.py --server.port 8501"},
-            {"画面": "ロト6分析", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run loto6_streamlit_app.py --server.port 8501"},
-            {"画面": "ロト7分析", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run loto7_streamlit_app.py --server.port 8501"},
+            {"画面": "ロト6専用画面", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run loto6_streamlit_app.py --server.port 8502"},
+            {"画面": "ロト7専用画面", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run loto7_streamlit_app.py --server.port 8503"},
         ]
     )
     st.dataframe(guide, width="stretch", hide_index=True)
+    st.markdown("**ブラウザで開くURL**")
+    st.code(
+        "トップ画面: http://localhost:8501\n"
+        "ロト6専用画面: http://localhost:8502\n"
+        "ロト7専用画面: http://localhost:8503",
+        language="text",
+    )
 
 
 def render_roadmap():
