@@ -1,6 +1,9 @@
 from collections import Counter, OrderedDict
 from datetime import datetime
+from itertools import combinations
+import json
 import random
+from pathlib import Path
 
 import pandas as pd
 
@@ -87,6 +90,47 @@ RESEARCH_CYCLE_COLUMNS = [
 ]
 
 VIDEO_HYPOTHESIS_COLUMNS = ["動画名", "仮説", "法則抽出", "成績", "採用可否", "保存日時"]
+
+WINNING_CONDITION_HISTORY_COLUMNS = [
+    "lottery_type",
+    "draw_no",
+    "prediction_id",
+    "prediction_date",
+    "predicted_numbers",
+    "actual_numbers",
+    "matched_numbers",
+    "missed_numbers",
+    "should_have_included_numbers",
+    "should_have_excluded_numbers",
+    "matched_count",
+    "failure_reason",
+    "winning_condition_analysis",
+    "useful_models",
+    "weak_models",
+    "weight_up_models",
+    "weight_down_models",
+    "model_improvement_analysis",
+    "ensemble_analysis",
+    "next_hypothesis",
+    "created_at",
+]
+
+MODEL_IMPROVEMENT_HISTORY_COLUMNS = [
+    "lottery_type",
+    "draw_no",
+    "prediction_id",
+    "model_name",
+    "predicted_numbers",
+    "actual_numbers",
+    "matched_numbers",
+    "missed_numbers",
+    "should_have_included_numbers",
+    "should_have_excluded_numbers",
+    "matched_count",
+    "needed_conditions",
+    "next_hypothesis",
+    "created_at",
+]
 
 
 def canonical_model_key(model_key):
@@ -384,6 +428,422 @@ def build_model_support_map(predicted, number_rows, number_max, draw_size, targe
             if label not in support_map[number]:
                 support_map[number].append(label)
     return support_map
+
+
+def json_text(value):
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def parse_json_text(value, fallback=None):
+    if fallback is None:
+        fallback = {}
+    if value is None:
+        return fallback
+    try:
+        if pd.isna(value):
+            return fallback
+    except Exception:
+        pass
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return fallback
+
+
+def game_low_limit(number_max):
+    return 21 if number_max >= 43 else 18
+
+
+def game_balance(numbers, number_max):
+    low_limit = game_low_limit(number_max)
+    tails = Counter(number % 10 for number in numbers)
+    return {
+        "odd": sum(number % 2 for number in numbers),
+        "even": len(numbers) - sum(number % 2 for number in numbers),
+        "low": sum(number <= low_limit for number in numbers),
+        "high": sum(number > low_limit for number in numbers),
+        "sum": sum(numbers),
+        "consecutive": count_consecutive_pairs(numbers),
+        "same_tail": sum(1 for count in tails.values() if count >= 2),
+    }
+
+
+def rank_map_from_scores(scores):
+    ranked = sorted(scores.items(), key=lambda item: (item[1], -item[0]), reverse=True)
+    return {number: index + 1 for index, (number, _) in enumerate(ranked)}
+
+
+def top_score_numbers(scores, limit):
+    ranked = sorted(scores.items(), key=lambda item: (item[1], -item[0]), reverse=True)
+    return sorted(number for number, value in ranked[:limit] if value > 0)
+
+
+def summarize_condition_shift(predicted, actual, number_max):
+    predicted_summary = game_balance(predicted, number_max)
+    actual_summary = game_balance(actual, number_max)
+    parts = []
+    for key, label in [
+        ("odd", "奇数"),
+        ("low", "低数字"),
+        ("high", "高数字"),
+        ("consecutive", "連番"),
+        ("same_tail", "同じ下一桁"),
+    ]:
+        diff = actual_summary[key] - predicted_summary[key]
+        if diff > 0:
+            parts.append(f"{label}を{diff}枠増やす条件")
+        elif diff < 0:
+            parts.append(f"{label}を{abs(diff)}枠減らす条件")
+    sum_diff = actual_summary["sum"] - predicted_summary["sum"]
+    if abs(sum_diff) >= 10:
+        direction = "上げる" if sum_diff > 0 else "下げる"
+        parts.append(f"合計値を{abs(sum_diff)}程度{direction}条件")
+    return " / ".join(parts) if parts else "構造条件は近く、候補数字の入れ替え幅を検証"
+
+
+def describe_sum_band(actual, number_rows):
+    if not number_rows:
+        return "履歴不足のため合計値帯は未判定"
+    sums = [sum(row) for row in number_rows if row]
+    if not sums:
+        return "履歴不足のため合計値帯は未判定"
+    average = sum(sums) / len(sums)
+    if len(sums) > 1:
+        variance = sum((value - average) ** 2 for value in sums) / (len(sums) - 1)
+        deviation = variance ** 0.5
+    else:
+        deviation = max(10.0, average * 0.1)
+    actual_sum = sum(actual)
+    if average - deviation <= actual_sum <= average + deviation:
+        return f"過去平均帯内({actual_sum}, 平均{average:.1f})"
+    direction = "高い" if actual_sum > average else "低い"
+    return f"過去平均より{direction}合計({actual_sum}, 平均{average:.1f})"
+
+
+def build_number_feature_profiles(predicted, actual, number_rows, bonus_rows, number_max, draw_size, target_round=0):
+    rows = clean_number_rows(number_rows, number_max)
+    bonus_rows = clean_number_rows(bonus_rows or [], number_max)
+    candidate_window = max(10, draw_size * 2)
+    counts = frequency_scores(rows, number_max)
+    recent = recent_scores(rows, number_max)
+    cold = cold_scores(rows, number_max)
+    gaps = last_seen_gaps(rows, number_max) if rows else {number: 0 for number in range(1, number_max + 1)}
+    bonus_counts = frequency_scores(bonus_rows, number_max) if bonus_rows else {number: 0.0 for number in range(1, number_max + 1)}
+    freq_rank = rank_map_from_scores(counts)
+    recent_rank = rank_map_from_scores(recent)
+    gap_rank = rank_map_from_scores(gaps)
+    bonus_rank = rank_map_from_scores(bonus_counts)
+    pair_candidates = set(top_score_numbers(build_model_scores(rows, "pair_analysis", number_max, draw_size, target_round, bonus_rows), candidate_window))
+    triple_candidates = set(top_score_numbers(build_model_scores(rows, "triple_analysis", number_max, draw_size, target_round, bonus_rows), candidate_window))
+    bonus_candidates = set(top_score_numbers(build_model_scores(rows, "bonus_analysis", number_max, draw_size, target_round, bonus_rows), candidate_window))
+    support_map = build_model_support_map(actual, rows, number_max, draw_size, target_round, bonus_rows)
+    previous_numbers = set(rows[-1]) if rows else set()
+    actual_set = set(actual)
+    predicted_set = set(predicted)
+    actual_tails = Counter(number % 10 for number in actual)
+    sum_band = describe_sum_band(actual, rows)
+    low_limit = game_low_limit(number_max)
+
+    profiles = []
+    for number in sorted(actual):
+        not_seen_count = max(gaps.get(number, 0) - 1, 0) if rows else 0
+        profile = {
+            "数字": f"{number:02d}",
+            "予測に含まれていたか": "はい" if number in predicted_set else "いいえ",
+            "一致数改善に必要だったか": "はい" if number not in predicted_set else "既に選択",
+            "出現回数": int(counts.get(number, 0)),
+            "出現頻度順位": int(freq_rank.get(number, 0)),
+            "出現頻度上位": freq_rank.get(number, number_max) <= candidate_window,
+            "ホットナンバー": recent_rank.get(number, number_max) <= candidate_window and recent.get(number, 0) > 0,
+            "コールドナンバー": gap_rank.get(number, number_max) <= candidate_window and not_seen_count >= 2,
+            "直近未出現回数": int(not_seen_count),
+            "前回からの継続数字": number in previous_numbers,
+            "連番条件": "当選番号内で連番" if any(abs(number - other) == 1 for other in actual_set if other != number) else "単独数字",
+            "下一桁条件": "同じ下一桁あり" if actual_tails[number % 10] >= 2 else "下一桁の重複なし",
+            "高低条件": "低数字" if number <= low_limit else "高数字",
+            "奇数偶数条件": "奇数" if number % 2 else "偶数",
+            "合計値条件": sum_band,
+            "ペア分析候補": number in pair_candidates,
+            "トリプル分析候補": number in triple_candidates,
+            "ボーナス傾向候補": number in bonus_candidates or bonus_counts.get(number, 0) > 0,
+            "ボーナス出現回数": int(bonus_counts.get(number, 0)),
+            "ボーナス頻度順位": int(bonus_rank.get(number, 0)),
+            "候補入りモデル": support_map.get(number, []),
+        }
+        profiles.append(profile)
+    return profiles
+
+
+def model_candidate_numbers(scores, draw_size):
+    ranked = sorted(scores.items(), key=lambda item: (item[1], -item[0]), reverse=True)
+    return sorted(number for number, _ in ranked[:draw_size])
+
+
+def build_model_needed_condition(model_name, model_numbers, actual, number_max):
+    include_numbers = sorted(set(actual) - set(model_numbers))
+    exclude_numbers = sorted(set(model_numbers) - set(actual))
+    parts = []
+    if include_numbers:
+        parts.append(f"追加候補 {numbers_to_text(include_numbers)} を上位に残す")
+    if exclude_numbers:
+        parts.append(f"除外候補 {numbers_to_text(exclude_numbers)} の重みを抑える")
+    parts.append(summarize_condition_shift(model_numbers, actual, number_max))
+    return f"{model_name}: " + " / ".join(parts)
+
+
+def build_model_improvement_rows(lottery_type, draw_no, prediction_id, actual, number_rows, bonus_rows, number_max, draw_size, target_round, created_at):
+    rows = clean_number_rows(number_rows, number_max)
+    bonus_rows = clean_number_rows(bonus_rows or [], number_max)
+    score_cache = {}
+    model_rows = []
+    actual_set = set(actual)
+    for model_key, model_name in ARL_MODEL_LABELS.items():
+        scores = build_model_scores(rows, model_key, number_max, draw_size, target_round, bonus_rows)
+        score_cache[model_key] = scores
+        model_numbers = model_candidate_numbers(scores, draw_size)
+        matched = sorted(set(model_numbers) & actual_set)
+        missed = sorted(set(model_numbers) - actual_set)
+        should_include = sorted(actual_set - set(model_numbers))
+        should_exclude = missed
+        needed_conditions = build_model_needed_condition(model_name, model_numbers, actual, number_max)
+        hypothesis = (
+            f"{model_name}では、{numbers_to_text(should_include) if should_include else '追加不要'}を候補に残す条件と、"
+            f"{numbers_to_text(should_exclude) if should_exclude else '除外不要'}の過採用抑制を次回検証する"
+        )
+        model_rows.append(
+            {
+                "lottery_type": lottery_type,
+                "draw_no": int(draw_no),
+                "prediction_id": str(prediction_id),
+                "model_key": model_key,
+                "model_name": model_name,
+                "predicted_numbers": numbers_to_text(model_numbers),
+                "actual_numbers": numbers_to_text(actual),
+                "matched_numbers": numbers_to_text(matched) if matched else "",
+                "missed_numbers": numbers_to_text(missed) if missed else "",
+                "should_have_included_numbers": numbers_to_text(should_include) if should_include else "",
+                "should_have_excluded_numbers": numbers_to_text(should_exclude) if should_exclude else "",
+                "matched_count": len(matched),
+                "needed_conditions": needed_conditions,
+                "next_hypothesis": hypothesis,
+                "created_at": created_at,
+            }
+        )
+    return model_rows, score_cache
+
+
+def build_best_ensemble_analysis(score_cache, actual, number_max, draw_size):
+    if not score_cache:
+        return {}
+    actual_set = set(actual)
+    normalized = {model_key: normalize_scores(scores, number_max) for model_key, scores in score_cache.items()}
+    best = None
+    model_keys = list(normalized.keys())
+    for size in (2, 3):
+        for model_combo in combinations(model_keys, size):
+            combined = {
+                number: sum(normalized[model_key].get(number, 0.0) for model_key in model_combo)
+                for number in range(1, number_max + 1)
+            }
+            candidates = model_candidate_numbers(combined, draw_size)
+            matched = sorted(set(candidates) & actual_set)
+            score = (len(matched), -len(set(candidates) - actual_set), sum(combined[number] for number in candidates))
+            if best is None or score > best["score"]:
+                best = {
+                    "score": score,
+                    "models": [ARL_MODEL_LABELS.get(model_key, model_key) for model_key in model_combo],
+                    "candidate_numbers": candidates,
+                    "matched_numbers": matched,
+                }
+    if not best:
+        return {}
+    candidate_set = set(best["candidate_numbers"])
+    return {
+        "組み合わせ": best["models"],
+        "候補数字": numbers_to_text(best["candidate_numbers"]),
+        "一致数": len(best["matched_numbers"]),
+        "一致数字": numbers_to_text(best["matched_numbers"]) if best["matched_numbers"] else "",
+        "残すべき候補数字": numbers_to_text(best["matched_numbers"]) if best["matched_numbers"] else "",
+        "切るべき候補数字": numbers_to_text(sorted(candidate_set - actual_set)) if candidate_set - actual_set else "",
+        "追加すべき候補数字": numbers_to_text(sorted(actual_set - candidate_set)) if actual_set - candidate_set else "",
+    }
+
+
+def build_posthoc_optimization(model_rows, score_cache, predicted, actual, number_max, draw_size):
+    current_count = len(set(predicted) & set(actual))
+    ranked = sorted(model_rows, key=lambda row: (int(row["matched_count"]), -len(parse_numbers(row["should_have_excluded_numbers"], number_max))), reverse=True)
+    max_count = int(ranked[0]["matched_count"]) if ranked else 0
+    min_count = int(ranked[-1]["matched_count"]) if ranked else 0
+    useful = [row["model_name"] for row in ranked if int(row["matched_count"]) == max_count][:5]
+    weak = [row["model_name"] for row in reversed(ranked) if int(row["matched_count"]) == min_count][:5]
+    weight_up = [row["model_name"] for row in ranked if int(row["matched_count"]) > current_count][:5] or useful[:3]
+    weight_down = [row["model_name"] for row in reversed(ranked) if int(row["matched_count"]) < current_count][:5] or weak[:3]
+    ensemble = build_best_ensemble_analysis(score_cache, actual, number_max, draw_size)
+    return {
+        "useful_models": useful,
+        "weak_models": weak,
+        "weight_up_models": weight_up,
+        "weight_down_models": weight_down,
+        "keep_numbers": numbers_to_text(sorted(set(predicted) & set(actual))) if set(predicted) & set(actual) else "",
+        "cut_numbers": numbers_to_text(sorted(set(predicted) - set(actual))) if set(predicted) - set(actual) else "",
+        "include_numbers": numbers_to_text(sorted(set(actual) - set(predicted))) if set(actual) - set(predicted) else "",
+        "ensemble_analysis": ensemble,
+    }
+
+
+def build_winning_condition_report(
+    lottery_type,
+    draw_no,
+    prediction_id,
+    prediction_date,
+    predicted,
+    actual,
+    bonus_numbers,
+    number_rows,
+    bonus_rows,
+    number_max,
+    draw_size,
+    selected_model="",
+    failure_reason="",
+    created_at=None,
+):
+    created_at = created_at or datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    predicted = parse_numbers(numbers_to_text(predicted), number_max)
+    actual = parse_numbers(numbers_to_text(actual), number_max)
+    bonus_numbers = parse_numbers(numbers_to_text(bonus_numbers), number_max)
+    matched = sorted(set(predicted) & set(actual))
+    missed = sorted(set(predicted) - set(actual))
+    should_include = sorted(set(actual) - set(predicted))
+    should_exclude = missed
+    model_rows, score_cache = build_model_improvement_rows(
+        lottery_type,
+        draw_no,
+        prediction_id,
+        actual,
+        number_rows,
+        bonus_rows,
+        number_max,
+        draw_size,
+        draw_no,
+        created_at,
+    )
+    optimization = build_posthoc_optimization(model_rows, score_cache, predicted, actual, number_max, draw_size)
+    number_profiles = build_number_feature_profiles(predicted, actual, number_rows, bonus_rows, number_max, draw_size, draw_no)
+    winning_conditions = {
+        "選択できていれば一致数が増えた数字": numbers_to_text(should_include) if should_include else "",
+        "除外すべきだった数字": numbers_to_text(should_exclude) if should_exclude else "",
+        "数字別特徴": number_profiles,
+        "必要だった条件": summarize_condition_shift(predicted, actual, number_max),
+        "ボーナス数字": numbers_to_text(bonus_numbers) if bonus_numbers else "",
+        "後追い最適化": optimization,
+        "選択モデル": selected_model,
+    }
+    model_analysis = [
+        {
+            key: value
+            for key, value in row.items()
+            if key in MODEL_IMPROVEMENT_HISTORY_COLUMNS or key in ("model_key",)
+        }
+        for row in model_rows
+    ]
+    hypothesis = (
+        f"次回は追加候補({numbers_to_text(should_include) if should_include else 'なし'})を拾えたモデル条件を比較し、"
+        f"除外候補({numbers_to_text(should_exclude) if should_exclude else 'なし'})の重みを下げる検証を行う。"
+        "これは研究・検証目的の仮説であり、将来の当選を保証するものではありません。"
+    )
+    main_row = {
+        "lottery_type": lottery_type,
+        "draw_no": int(draw_no),
+        "prediction_id": str(prediction_id),
+        "prediction_date": str(prediction_date or ""),
+        "predicted_numbers": numbers_to_text(predicted),
+        "actual_numbers": numbers_to_text(actual),
+        "matched_numbers": numbers_to_text(matched) if matched else "",
+        "missed_numbers": numbers_to_text(missed) if missed else "",
+        "should_have_included_numbers": numbers_to_text(should_include) if should_include else "",
+        "should_have_excluded_numbers": numbers_to_text(should_exclude) if should_exclude else "",
+        "matched_count": len(matched),
+        "failure_reason": failure_reason,
+        "winning_condition_analysis": json_text(winning_conditions),
+        "useful_models": " / ".join(optimization["useful_models"]),
+        "weak_models": " / ".join(optimization["weak_models"]),
+        "weight_up_models": " / ".join(optimization["weight_up_models"]),
+        "weight_down_models": " / ".join(optimization["weight_down_models"]),
+        "model_improvement_analysis": json_text(model_analysis),
+        "ensemble_analysis": json_text(optimization["ensemble_analysis"]),
+        "next_hypothesis": hypothesis,
+        "created_at": created_at,
+    }
+    return main_row, model_rows
+
+
+def read_history_csv(path, columns):
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    for encoding in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            return pd.read_csv(path, encoding=encoding).reindex(columns=columns)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path).reindex(columns=columns)
+
+
+def write_history_jsonl(df, path):
+    json_columns = {"winning_condition_analysis", "model_improvement_analysis", "ensemble_analysis"}
+    with Path(path).open("w", encoding="utf-8") as handle:
+        for record in df.to_dict("records"):
+            cleaned = {}
+            for key, value in record.items():
+                try:
+                    if pd.isna(value):
+                        value = ""
+                except TypeError:
+                    pass
+                if key in json_columns and value:
+                    cleaned[key] = parse_json_text(value, value)
+                else:
+                    cleaned[key] = value
+            handle.write(json.dumps(cleaned, ensure_ascii=False, default=str) + "\n")
+
+
+def append_winning_condition_history(history_dir, main_rows, model_rows):
+    if not main_rows and not model_rows:
+        return
+    history_dir = Path(history_dir)
+    history_dir.mkdir(parents=True, exist_ok=True)
+    main_path = history_dir / "winning_condition_history.csv"
+    model_path = history_dir / "model_improvement_history.csv"
+    jsonl_path = history_dir / "winning_condition_history.jsonl"
+
+    if main_rows:
+        existing = read_history_csv(main_path, WINNING_CONDITION_HISTORY_COLUMNS)
+        incoming = pd.DataFrame(main_rows, columns=WINNING_CONDITION_HISTORY_COLUMNS)
+        combined = pd.concat([existing, incoming], ignore_index=True).reindex(columns=WINNING_CONDITION_HISTORY_COLUMNS)
+        combined = combined.drop_duplicates(["lottery_type", "draw_no", "prediction_id"], keep="last")
+        combined.to_csv(main_path, index=False, encoding="utf-8-sig")
+        write_history_jsonl(combined, jsonl_path)
+
+    if model_rows:
+        existing_models = read_history_csv(model_path, MODEL_IMPROVEMENT_HISTORY_COLUMNS)
+        normalized_rows = [
+            {column: row.get(column, "") for column in MODEL_IMPROVEMENT_HISTORY_COLUMNS}
+            for row in model_rows
+        ]
+        incoming_models = pd.DataFrame(normalized_rows, columns=MODEL_IMPROVEMENT_HISTORY_COLUMNS)
+        combined_models = pd.concat([existing_models, incoming_models], ignore_index=True).reindex(columns=MODEL_IMPROVEMENT_HISTORY_COLUMNS)
+        combined_models = combined_models.drop_duplicates(["lottery_type", "draw_no", "prediction_id", "model_name"], keep="last")
+        combined_models.to_csv(model_path, index=False, encoding="utf-8-sig")
+
+
+def load_winning_condition_history(history_dir, lottery_type=None):
+    history_dir = Path(history_dir)
+    main_df = read_history_csv(history_dir / "winning_condition_history.csv", WINNING_CONDITION_HISTORY_COLUMNS)
+    model_df = read_history_csv(history_dir / "model_improvement_history.csv", MODEL_IMPROVEMENT_HISTORY_COLUMNS)
+    if lottery_type:
+        main_df = main_df[main_df["lottery_type"].astype(str) == str(lottery_type)] if not main_df.empty else main_df
+        model_df = model_df[model_df["lottery_type"].astype(str) == str(lottery_type)] if not model_df.empty else model_df
+    return main_df, model_df
 
 
 def primary_support(number, support_map):

@@ -18,11 +18,14 @@ from arl_research_engine import (
     build_contribution_ranking,
     build_model_dashboard,
     build_research_flow_table,
+    load_winning_condition_history,
+    parse_json_text,
 )
 from prl_maintenance import run_maintenance
 
 
 BASE_DIR = Path(__file__).resolve().parent
+AI_IMPROVEMENT_DIR = BASE_DIR / "data" / "ai_improvement"
 
 
 def read_csv(path, columns=None):
@@ -162,6 +165,63 @@ def render_model_catalog():
     display_dataframe(model_df, width="stretch", hide_index=True)
 
 
+def render_winning_condition_panel(lottery_type, name):
+    history, model_history = load_winning_condition_history(AI_IMPROVEMENT_DIR, lottery_type)
+    if history.empty:
+        st.info(f"{name}の当選条件分析は、予想と実結果を照合すると data/ai_improvement に保存されます。")
+        return
+
+    history = history.copy()
+    history["draw_no"] = pd.to_numeric(history["draw_no"], errors="coerce").fillna(0)
+    latest = history.sort_values(["draw_no", "created_at"], ascending=[False, False]).iloc[0]
+    analysis = parse_json_text(latest.get("winning_condition_analysis"), {})
+    ensemble = parse_json_text(latest.get("ensemble_analysis"), {})
+
+    cols = st.columns(4)
+    cols[0].metric("対象回", int(latest["draw_no"]))
+    cols[1].metric("一致数", latest.get("matched_count", "-"))
+    cols[2].metric("追加候補", latest.get("should_have_included_numbers", "") or "なし")
+    cols[3].metric("除外候補", latest.get("should_have_excluded_numbers", "") or "なし")
+
+    st.write(f"予測番号: {latest['predicted_numbers']} / 実際: {latest['actual_numbers']}")
+    st.write(f"外れた理由: {latest.get('failure_reason', '-')}")
+    st.write(f"的中に近づくために必要だった条件: {analysis.get('必要だった条件', '-')}")
+    st.write(f"今回有効だった分析手法: {latest.get('useful_models', '-')}")
+    st.write(f"今回弱かった分析手法: {latest.get('weak_models', '-')}")
+    st.write(f"次回上げるべき重み: {latest.get('weight_up_models', '-')}")
+    st.write(f"次回下げるべき重み: {latest.get('weight_down_models', '-')}")
+    st.write(f"次回の改善仮説: {latest.get('next_hypothesis', '-')}")
+
+    number_detail = analysis.get("数字別特徴", [])
+    if number_detail:
+        st.markdown("**数字別特徴**")
+        st.dataframe(pd.DataFrame(number_detail), width="stretch", hide_index=True)
+
+    if ensemble:
+        st.markdown("**後追い最適化: アンサンブル候補**")
+        st.dataframe(pd.DataFrame([ensemble]), width="stretch", hide_index=True)
+
+    if not model_history.empty:
+        latest_models = model_history[model_history["prediction_id"].astype(str) == str(latest["prediction_id"])]
+        if not latest_models.empty:
+            st.markdown("**モデル別改善ポイント**")
+            st.dataframe(
+                latest_models.reindex(
+                    columns=[
+                        "model_name",
+                        "predicted_numbers",
+                        "matched_count",
+                        "should_have_included_numbers",
+                        "should_have_excluded_numbers",
+                        "needed_conditions",
+                        "next_hypothesis",
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+
 def render_loto_lab(name, prediction_file, result_file, report_file, contribution_file, cycle_file, number_max, draw_size):
     predictions = read_csv(BASE_DIR / prediction_file)
     official = read_csv(BASE_DIR / result_file)
@@ -178,7 +238,8 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
     st.markdown("**研究フロー**")
     display_dataframe(build_research_flow_table(), width="stretch", hide_index=True)
 
-    tabs = st.tabs(["研究サイクル", "モデル別成績", "モデル貢献度", "条件別成功率", "AI改善レポート", "動画仮説"])
+    lottery_type = "loto6" if "ロト6" in name else "loto7"
+    tabs = st.tabs(["研究サイクル", "モデル別成績", "モデル貢献度", "条件別成功率", "AI改善レポート", "当選条件分析", "動画仮説"])
     with tabs[0]:
         if cycles.empty:
             st.info(f"{name}の研究サイクル履歴は、検証レポート作成後に保存されます。")
@@ -213,6 +274,8 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
         st.write(f"改善案: {summary['改善案']}")
         st.write(f"次回仮説: {summary['次回仮説']}")
     with tabs[5]:
+        render_winning_condition_panel(lottery_type, name)
+    with tabs[6]:
         video_logs = read_csv(BASE_DIR / "video_hypotheses.csv", VIDEO_HYPOTHESIS_COLUMNS)
         if video_logs.empty:
             st.info("動画仮説ログはまだありません。")
@@ -318,6 +381,9 @@ def render_ai_department():
             st.write(f"{name} 失敗要因: {summary['外れ要因']}")
             st.write(f"{name} 改善案: {summary['改善案']}")
             st.write(f"{name} 次回仮説: {summary['次回仮説']}")
+            lottery_type = "loto6" if name == "ロト6" else "loto7"
+            with st.expander(f"{name} 当選条件分析"):
+                render_winning_condition_panel(lottery_type, name)
 
 
 def render_verification_department():

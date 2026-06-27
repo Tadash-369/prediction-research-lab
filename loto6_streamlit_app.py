@@ -17,6 +17,7 @@ from arl_research_engine import (
     RESEARCH_CYCLE_COLUMNS,
     VIDEO_HYPOTHESIS_COLUMNS,
     add_verification_metrics,
+    append_winning_condition_history,
     build_ai_improvement_summary,
     build_condition_success_table,
     build_contribution_ranking,
@@ -29,10 +30,13 @@ from arl_research_engine import (
     build_model_scores,
     build_model_support_map,
     build_research_flow_table,
+    build_winning_condition_report,
     extract_video_hypothesis,
     format_contribution_detail,
+    load_winning_condition_history,
     merge_contribution_rows,
     merge_research_cycle_rows,
+    parse_json_text,
 )
 
 
@@ -47,6 +51,7 @@ MODEL_SETTINGS_CSV = BASE_DIR / "model_settings.csv"
 CONTRIBUTIONS_CSV = BASE_DIR / "loto6_model_contributions.csv"
 RESEARCH_CYCLES_CSV = BASE_DIR / "loto6_research_cycles.csv"
 VIDEO_HYPOTHESES_CSV = BASE_DIR / "video_hypotheses.csv"
+AI_IMPROVEMENT_DIR = BASE_DIR / "data" / "ai_improvement"
 MIZUHO_LOTO6_URL = "https://www.mizuhobank.co.jp/retail/takarakuji/check/loto/loto6/index.html"
 
 RESULT_COLUMNS = [
@@ -1335,19 +1340,47 @@ def verify_predictions_for_round(round_no=None):
 
     report_rows = []
     contribution_rows = []
+    winning_condition_rows = []
+    model_improvement_rows = []
     for _, prediction_row in predictions.iterrows():
         result_matches = official_results[official_results["開催回"] == to_int(prediction_row["開催回"])]
         if result_matches.empty:
             continue
         official_row = result_matches.tail(1).iloc[0]
+        draw_no = to_int(prediction_row["開催回"])
         predicted = parse_number_text(prediction_row["予想番号"])
         actual = parse_number_text(official_row["本数字"])
-        support_map = build_support_map_for_prediction(
+        bonus = parse_number_text(official_row["ボーナス数字"])
+        number_rows, bonus_rows = historical_context_before_round(draw_no)
+        support_map = build_model_support_map(
             predicted,
-            to_int(prediction_row["開催回"]),
+            number_rows,
+            number_max=43,
+            draw_size=6,
+            target_round=draw_no,
+            bonus_rows=bonus_rows,
             selected_model=prediction_row.get("使用モデル", ""),
         )
-        report_rows.append(build_verification_report_row(prediction_row, official_row, support_map))
+        report_row = build_verification_report_row(prediction_row, official_row, support_map)
+        report_rows.append(report_row)
+        winning_row, model_rows = build_winning_condition_report(
+            lottery_type="loto6",
+            draw_no=draw_no,
+            prediction_id=prediction_row["予想ID"],
+            prediction_date=prediction_row.get("予想日", ""),
+            predicted=predicted,
+            actual=actual,
+            bonus_numbers=bonus,
+            number_rows=number_rows,
+            bonus_rows=bonus_rows,
+            number_max=43,
+            draw_size=6,
+            selected_model=prediction_row.get("使用モデル", ""),
+            failure_reason=report_row["失敗要因"],
+            created_at=now_text(),
+        )
+        winning_condition_rows.append(winning_row)
+        model_improvement_rows.extend(model_rows)
         contribution_rows.extend(
             build_contribution_rows(
                 "ロト6研究所",
@@ -1378,6 +1411,8 @@ def verify_predictions_for_round(round_no=None):
         cycles = read_csv(RESEARCH_CYCLES_CSV, RESEARCH_CYCLE_COLUMNS)
         cycles = merge_research_cycle_rows(cycles, build_research_cycle_rows("ロト6研究所", report_rows, saved_at=now_text()))
         save_csv(cycles, RESEARCH_CYCLES_CSV, RESEARCH_CYCLE_COLUMNS)
+    if winning_condition_rows:
+        append_winning_condition_history(AI_IMPROVEMENT_DIR, winning_condition_rows, model_improvement_rows)
     return len(report_rows)
 
 
@@ -1513,6 +1548,62 @@ def render_prediction_picks(scores, results, target_round):
         st.write(f"理由：{pick['reason']}")
 
 
+def render_winning_condition_history():
+    history, model_history = load_winning_condition_history(AI_IMPROVEMENT_DIR, "loto6")
+    if history.empty:
+        st.info("当選条件分析は、予想と実結果を照合すると data/ai_improvement に保存されます。")
+        return
+
+    history = history.copy()
+    history["draw_no"] = pd.to_numeric(history["draw_no"], errors="coerce").fillna(0)
+    latest = history.sort_values(["draw_no", "created_at"], ascending=[False, False]).iloc[0]
+    analysis = parse_json_text(latest.get("winning_condition_analysis"), {})
+    ensemble = parse_json_text(latest.get("ensemble_analysis"), {})
+
+    cols = st.columns(4)
+    cols[0].metric("対象回", int(latest["draw_no"]))
+    cols[1].metric("一致数", int(pd.to_numeric(pd.Series([latest["matched_count"]]), errors="coerce").fillna(0).iloc[0]))
+    cols[2].metric("追加すべきだった数字", latest.get("should_have_included_numbers", "") or "なし")
+    cols[3].metric("除外すべきだった数字", latest.get("should_have_excluded_numbers", "") or "なし")
+
+    st.markdown("**予測と実結果の比較**")
+    st.write(f"予測番号: {latest['predicted_numbers']} / 実際の当選番号: {latest['actual_numbers']} / 一致: {latest.get('matched_numbers', '') or 'なし'}")
+    st.write(f"なぜ外れたか: {latest.get('failure_reason', '-')}")
+    st.write(f"どうなれば近づけたか: {analysis.get('必要だった条件', '-')}")
+    st.write(f"今回有効だった分析手法: {latest.get('useful_models', '-')}")
+    st.write(f"今回弱かった分析手法: {latest.get('weak_models', '-')}")
+    st.write(f"次回上げるべき重み: {latest.get('weight_up_models', '-')}")
+    st.write(f"次回下げるべき重み: {latest.get('weight_down_models', '-')}")
+    st.write(f"次回の改善仮説: {latest.get('next_hypothesis', '-')}")
+
+    number_detail = analysis.get("数字別特徴", [])
+    if number_detail:
+        st.markdown("**的中に近づくために必要だった条件分析**")
+        st.dataframe(pd.DataFrame(number_detail), width="stretch", hide_index=True)
+
+    if ensemble:
+        st.markdown("**後追い最適化: アンサンブル候補**")
+        st.dataframe(pd.DataFrame([ensemble]), width="stretch", hide_index=True)
+
+    if not model_history.empty:
+        latest_models = model_history[model_history["prediction_id"].astype(str) == str(latest["prediction_id"])]
+        if not latest_models.empty:
+            show_columns = [
+                "model_name",
+                "predicted_numbers",
+                "matched_count",
+                "should_have_included_numbers",
+                "should_have_excluded_numbers",
+                "needed_conditions",
+                "next_hypothesis",
+            ]
+            st.markdown("**モデル別の改善ポイント**")
+            st.dataframe(latest_models.reindex(columns=show_columns), width="stretch", hide_index=True)
+
+    with st.expander("当選条件分析の保存履歴"):
+        st.dataframe(history.sort_values(["draw_no", "created_at"], ascending=[False, False]), width="stretch", hide_index=True)
+
+
 def render_prediction_lab():
     st.subheader("予測研究所システム")
     st.caption("当選や利益を保証するものではなく、予測手法を検証するための研究開発ログです。")
@@ -1547,7 +1638,7 @@ def render_prediction_lab():
         except Exception as exc:
             st.error(str(exc))
 
-    lab_tabs = st.tabs(["バックテスト", "検証レポート", "モデル貢献度", "条件別成功率", "AI改善レポート", "動画仮説研究", "予想履歴", "公式結果"])
+    lab_tabs = st.tabs(["バックテスト", "検証レポート", "モデル貢献度", "条件別成功率", "AI改善レポート", "当選条件分析", "動画仮説研究", "予想履歴", "公式結果"])
     with lab_tabs[0]:
         st.markdown("**新フロー**")
         st.dataframe(build_research_flow_table(), width="stretch", hide_index=True)
@@ -1636,6 +1727,8 @@ def render_prediction_lab():
         st.write(f"改善案: {summary['改善案']}")
         st.write(f"次回仮説: {summary['次回仮説']}")
     with lab_tabs[5]:
+        render_winning_condition_history()
+    with lab_tabs[6]:
         video_logs = read_csv(VIDEO_HYPOTHESES_CSV, VIDEO_HYPOTHESIS_COLUMNS)
         with st.form("loto6_video_hypothesis_form"):
             video_name = st.text_input("動画名")
@@ -1651,12 +1744,12 @@ def render_prediction_lab():
             st.info("動画仮説ログはまだありません。")
         else:
             st.dataframe(video_logs.sort_values("保存日時", ascending=False), width="stretch", hide_index=True)
-    with lab_tabs[6]:
+    with lab_tabs[7]:
         if predictions.empty:
             st.info("次回予想買い目が表示されると predictions.csv に保存されます。")
         else:
             st.dataframe(predictions.sort_values(["開催回", "候補番号"], ascending=[False, True]), width="stretch", hide_index=True)
-    with lab_tabs[7]:
+    with lab_tabs[8]:
         if official_results.empty:
             st.info("当選結果を登録すると results.csv に研究所用の公式結果ログを保存します。")
         else:

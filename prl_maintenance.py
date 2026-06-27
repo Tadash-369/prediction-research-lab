@@ -11,11 +11,13 @@ from arl_research_engine import (
     CONTRIBUTION_COLUMNS,
     RESEARCH_CYCLE_COLUMNS,
     add_verification_metrics,
+    append_winning_condition_history,
     build_contribution_rows,
     build_effective_conditions,
     build_hit_factor_summary,
     build_missing_excess_conditions,
     build_model_support_map,
+    build_winning_condition_report,
     build_research_cycle_rows,
     format_contribution_detail,
     merge_contribution_rows,
@@ -28,6 +30,7 @@ from arl_research_engine import (
 
 BASE_DIR = Path(__file__).resolve().parent
 BACKUP_DIR = BASE_DIR / "分析研究所" / "data" / "backups"
+AI_IMPROVEMENT_DIR = BASE_DIR / "data" / "ai_improvement"
 
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 LOTO6_OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
@@ -507,25 +510,48 @@ def rebuild_loto7_artifacts(apply_changes):
 
     report_rows = []
     contribution_rows = []
+    winning_condition_rows = []
+    model_improvement_rows = []
     saved_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     for _, prediction in predictions.iterrows():
         matches = official[official["開催回"] == safe_int(prediction.get("開催回"))]
         if matches.empty:
             continue
         official_row = matches.tail(1).iloc[0]
+        draw_no = safe_int(prediction.get("開催回"))
         predicted = parse_numbers(prediction.get("予想番号", ""), 37)
         actual = parse_numbers(official_row.get("本数字", ""), 37)
-        number_rows, bonus_rows = historical_loto7_context_before_round(prediction.get("開催回"))
+        bonus = parse_numbers(official_row.get("ボーナス数字", ""), 37)
+        number_rows, bonus_rows = historical_loto7_context_before_round(draw_no)
         support_map = build_model_support_map(
             predicted,
             number_rows,
             37,
             7,
-            safe_int(prediction.get("開催回")),
+            draw_no,
             bonus_rows,
             selected_model=prediction.get("使用モデル", ""),
         )
-        report_rows.append(build_loto7_report_row(prediction, official_row, support_map))
+        report_row = build_loto7_report_row(prediction, official_row, support_map)
+        report_rows.append(report_row)
+        winning_row, model_rows = build_winning_condition_report(
+            lottery_type="loto7",
+            draw_no=draw_no,
+            prediction_id=prediction.get("予想ID", ""),
+            prediction_date=prediction.get("予想日", ""),
+            predicted=predicted,
+            actual=actual,
+            bonus_numbers=bonus,
+            number_rows=number_rows,
+            bonus_rows=bonus_rows,
+            number_max=37,
+            draw_size=7,
+            selected_model=prediction.get("使用モデル", ""),
+            failure_reason=report_row["失敗要因"],
+            created_at=saved_at,
+        )
+        winning_condition_rows.append(winning_row)
+        model_improvement_rows.extend(model_rows)
         contribution_rows.extend(
             build_contribution_rows(
                 "ロト7研究所",
@@ -564,6 +590,16 @@ def rebuild_loto7_artifacts(apply_changes):
             backup = backup_file(path)
             save_csv(ensure_columns(df, columns), path)
         results.append({"file": path.name, "status": "rebuilt" if apply_changes else "dry-run rebuild", "rows": len(df), "backup": backup})
+    if apply_changes and winning_condition_rows:
+        append_winning_condition_history(AI_IMPROVEMENT_DIR, winning_condition_rows, model_improvement_rows)
+        results.append(
+            {
+                "file": "data/ai_improvement/winning_condition_history.csv",
+                "status": "rebuilt",
+                "rows": len(winning_condition_rows),
+                "backup": "",
+            }
+        )
     return results
 
 
