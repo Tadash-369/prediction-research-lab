@@ -8,6 +8,16 @@ import subprocess
 import sys
 import urllib.request
 
+APP_DIR = Path(__file__).resolve().parent
+LOTO_LAB_DIR = APP_DIR.parent
+CORE_DIR = LOTO_LAB_DIR / "core"
+DATA_DIR = LOTO_LAB_DIR / "data"
+VERIFICATION_DIR = DATA_DIR / "verification"
+AI_IMPROVEMENT_DIR = DATA_DIR / "ai_improvement"
+
+if str(CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CORE_DIR))
+
 import pandas as pd
 import streamlit as st
 
@@ -40,18 +50,17 @@ from arl_research_engine import (
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
-RESULTS_CSV = BASE_DIR / "loto6.csv"
-SETS_CSV = BASE_DIR / "loto6_ball_sets.csv"
-SCORES_CSV = BASE_DIR / "loto6_next_number_scores.csv"
-PREDICTIONS_CSV = BASE_DIR / "predictions.csv"
-OFFICIAL_RESULTS_CSV = BASE_DIR / "results.csv"
-VERIFICATION_REPORTS_CSV = BASE_DIR / "verification_reports.csv"
-MODEL_SETTINGS_CSV = BASE_DIR / "model_settings.csv"
-CONTRIBUTIONS_CSV = BASE_DIR / "loto6_model_contributions.csv"
-RESEARCH_CYCLES_CSV = BASE_DIR / "loto6_research_cycles.csv"
-VIDEO_HYPOTHESES_CSV = BASE_DIR / "video_hypotheses.csv"
-AI_IMPROVEMENT_DIR = BASE_DIR / "data" / "ai_improvement"
+BASE_DIR = LOTO_LAB_DIR
+RESULTS_CSV = DATA_DIR / "loto6.csv"
+SETS_CSV = DATA_DIR / "loto6_ball_sets.csv"
+SCORES_CSV = DATA_DIR / "loto6_next_number_scores.csv"
+PREDICTIONS_CSV = DATA_DIR / "predictions.csv"
+OFFICIAL_RESULTS_CSV = DATA_DIR / "results.csv"
+VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "verification_reports.csv"
+MODEL_SETTINGS_CSV = DATA_DIR / "model_settings.csv"
+CONTRIBUTIONS_CSV = VERIFICATION_DIR / "loto6_model_contributions.csv"
+RESEARCH_CYCLES_CSV = VERIFICATION_DIR / "loto6_research_cycles.csv"
+VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
 MIZUHO_LOTO6_URL = "https://www.mizuhobank.co.jp/retail/takarakuji/check/loto/loto6/index.html"
 
 RESULT_COLUMNS = [
@@ -81,7 +90,11 @@ PRIZE_AMOUNT_COLUMNS = ["1等賞金", "2等賞金", "3等賞金", "4等賞金", 
 PRIZE_FILL_COLUMNS = [*PRIZE_COUNT_COLUMNS, *PRIZE_AMOUNT_COLUMNS, "キャリーオーバー"]
 SET_COLUMNS = ["開催回", "日付", "球セット", "信頼度", "根拠", "動画メタID", "メモ"]
 NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字"]
+:loto6_streamlit_app.py
 FILL_ONLY_COLUMNS = ["日付", *NUMBER_COLUMNS, "BONUS数字", *PRIZE_FILL_COLUMNS]
+
+SCORE_COLUMNS = ["順位", "数字", "スコア", "出現回数", "直近30回スコア", "未出現回数", "ボーナス出現回数", "根拠", "更新日時"]
+
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
@@ -201,25 +214,66 @@ def best_actionable_model_key(summary_df):
     return model_key_from_name(str(usable_rows.iloc[0]["モデル"]))
 
 
-def run_analysis():
-    scripts = ["analyze_loto6_ball_sets.py", "analyze_loto6_comprehensive.py"]
-    logs = []
-    for script in scripts:
-        completed = subprocess.run(
-            [sys.executable, str(BASE_DIR / script)],
-            cwd=BASE_DIR,
-            text=True,
-            capture_output=True,
+def build_next_number_scores(results):
+    if results.empty:
+        return pd.DataFrame(columns=SCORE_COLUMNS)
+
+    history = results.copy()
+    history["開催回"] = history["開催回"].map(to_int)
+    history = history.sort_values("開催回")
+    number_rows = [row_main_numbers(row) for _, row in history.iterrows()]
+    bonus_rows = [[to_int(row.get("BONUS数字"))] for _, row in history.iterrows()]
+    target_round = int(history["開催回"].max()) + 1
+
+    active_setting = read_active_model_setting()
+    active_model_key = active_setting["model_key"] if active_setting else "machine_learning"
+    active_model_name = active_setting["model_name"] if active_setting else BACKTEST_MODELS.get(active_model_key, active_model_key)
+    scores = build_model_scores(number_rows, active_model_key, 43, 6, target_round, bonus_rows)
+    recent_scores = build_model_scores(number_rows, "hot_analysis", 43, 6, target_round, bonus_rows)
+    normalized_scores = normalize_score_map(scores)
+    normalized_recent_scores = normalize_score_map(recent_scores)
+
+    rows = []
+    for number in range(1, 44):
+        last_seen_index = next(
+            (index for index in range(len(number_rows) - 1, -1, -1) if number in number_rows[index]),
+            None,
         )
-        logs.append(completed.stdout or completed.stderr)
-        if completed.returncode != 0:
-            raise RuntimeError(f"{script} の実行に失敗しました。\n{completed.stderr}")
-    return "\n".join(logs)
+        unseen_count = len(number_rows) if last_seen_index is None else len(number_rows) - last_seen_index - 1
+        rows.append(
+            {
+                "数字": number,
+                "スコア": round(normalized_scores.get(number, 0.0) * 100, 3),
+                "出現回数": sum(1 for row in number_rows if number in row),
+                "直近30回スコア": round(normalized_recent_scores.get(number, 0.0) * 100, 3),
+                "未出現回数": unseen_count,
+                "ボーナス出現回数": sum(1 for row in bonus_rows if number in row),
+                "根拠": f"{active_model_name}を使った第{target_round}回向け候補スコア",
+                "更新日時": now_text(),
+            }
+        )
+
+    score_df = pd.DataFrame(rows)
+    score_df = score_df.sort_values(["スコア", "出現回数", "数字"], ascending=[False, False, True]).reset_index(drop=True)
+    score_df.insert(0, "順位", range(1, len(score_df) + 1))
+    return score_df.reindex(columns=SCORE_COLUMNS)
+
+
+def run_analysis():
+    results = merge_official_results(read_csv(RESULTS_CSV, RESULT_COLUMNS))
+    scores = build_next_number_scores(results)
+    if scores.empty:
+        raise RuntimeError("loto6.csv に抽せん結果がないため、候補スコアを作成できません。")
+    save_csv(scores, SCORES_CSV, SCORE_COLUMNS)
+    return f"{SCORES_CSV.name} を更新しました。候補数字 {len(scores)}件。"
 
 
 def run_helper_script(script):
+    script_path = BASE_DIR / script
+    if not script_path.exists():
+        return f"{script}: スキップ（補助スクリプトなし）"
     completed = subprocess.run(
-        [sys.executable, str(BASE_DIR / script)],
+        [sys.executable, str(script_path)],
         cwd=BASE_DIR,
         text=True,
         capture_output=True,

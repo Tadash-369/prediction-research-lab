@@ -28,9 +28,14 @@ from arl_research_engine import (
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
-BACKUP_DIR = BASE_DIR / "分析研究所" / "data" / "backups"
-AI_IMPROVEMENT_DIR = BASE_DIR / "data" / "ai_improvement"
+CORE_DIR = Path(__file__).resolve().parent
+LOTO_LAB_DIR = CORE_DIR.parent
+PROJECT_ROOT = LOTO_LAB_DIR.parent
+DATA_DIR = LOTO_LAB_DIR / "data"
+VERIFICATION_DIR = DATA_DIR / "verification"
+BACKUP_DIR = DATA_DIR / "backups"
+AI_IMPROVEMENT_DIR = DATA_DIR / "ai_improvement"
+BASE_DIR = LOTO_LAB_DIR
 
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 LOTO6_OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
@@ -473,7 +478,7 @@ def build_loto7_report_row(prediction_row, official_row, support_map=None):
 
 
 def historical_loto7_context_before_round(round_no):
-    history = read_csv(BASE_DIR / "loto7.csv")
+    history = read_csv(DATA_DIR / "loto7.csv")
     if history.empty:
         return [], []
     history["開催回"] = history["開催回"].map(safe_int)
@@ -487,11 +492,11 @@ def historical_loto7_context_before_round(round_no):
 
 
 def rebuild_loto7_artifacts(apply_changes):
-    prediction_path = BASE_DIR / "loto7_predictions.csv"
-    official_path = BASE_DIR / "loto7_results.csv"
-    report_path = BASE_DIR / "loto7_verification_reports.csv"
-    contribution_path = BASE_DIR / "loto7_model_contributions.csv"
-    cycle_path = BASE_DIR / "loto7_research_cycles.csv"
+    prediction_path = DATA_DIR / "loto7_predictions.csv"
+    official_path = DATA_DIR / "loto7_results.csv"
+    report_path = VERIFICATION_DIR / "loto7_verification_reports.csv"
+    contribution_path = VERIFICATION_DIR / "loto7_model_contributions.csv"
+    cycle_path = VERIFICATION_DIR / "loto7_research_cycles.csv"
 
     predictions = read_csv(prediction_path, PREDICTION_COLUMNS)
     official = read_csv(official_path, LOTO7_OFFICIAL_RESULT_COLUMNS)
@@ -617,10 +622,25 @@ def rebuild_research_cycles(name, report_path, cycle_path, apply_changes):
     return {"file": cycle_path.name, "status": "updated" if apply_changes else "dry-run", "rows": len(cycles), "backup": backup}
 
 
+def resolve_loto_data_path(filename):
+    verification_files = {
+        "verification_reports.csv",
+        "loto6_model_contributions.csv",
+        "loto6_research_cycles.csv",
+        "loto7_verification_reports.csv",
+        "loto7_model_contributions.csv",
+        "loto7_research_cycles.csv",
+        "video_hypotheses.csv",
+    }
+    if filename in verification_files:
+        return VERIFICATION_DIR / filename
+    return DATA_DIR / filename
+
+
 def sync_project_files(apply_changes):
     results = []
     for source_name, destination_name in SYNC_TARGETS:
-        source = BASE_DIR / source_name
+        source = resolve_loto_data_path(source_name)
         destination = BASE_DIR / destination_name
         if not source.exists():
             results.append({"file": destination_name, "status": "missing source", "rows": 0, "backup": ""})
@@ -635,7 +655,7 @@ def sync_project_files(apply_changes):
 def run_maintenance(apply_changes=True):
     results = []
     for target in TARGETS:
-        prediction_path = BASE_DIR / target["prediction"]
+        prediction_path = DATA_DIR / target["prediction"]
         results.append(
             migrate_predictions(
                 prediction_path,
@@ -649,9 +669,9 @@ def run_maintenance(apply_changes=True):
             results.extend(rebuild_loto7_artifacts(apply_changes))
             continue
 
-        report_path = BASE_DIR / target["report"]
-        contribution_path = BASE_DIR / target["contribution"]
-        cycle_path = BASE_DIR / target["cycle"]
+        report_path = VERIFICATION_DIR / target["report"]
+        contribution_path = VERIFICATION_DIR / target["contribution"]
+        cycle_path = VERIFICATION_DIR / target["cycle"]
         results.append(migrate_report(report_path, target["draw_size"], apply_changes))
         results.append(migrate_contributions(contribution_path, apply_changes))
         results.append(rebuild_research_cycles(target["name"], report_path, cycle_path, apply_changes))

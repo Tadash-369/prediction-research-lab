@@ -1,4 +1,18 @@
 from pathlib import Path
+import sys
+
+APP_DIR = Path(__file__).resolve().parent
+LOTO_LAB_DIR = APP_DIR.parent
+PROJECT_ROOT = LOTO_LAB_DIR.parent
+CORE_DIR = LOTO_LAB_DIR / "core"
+DATA_DIR = LOTO_LAB_DIR / "data"
+VERIFICATION_DIR = DATA_DIR / "verification"
+AI_IMPROVEMENT_DIR = DATA_DIR / "ai_improvement"
+DOCS_DIR = LOTO_LAB_DIR / "docs"
+BACKUP_DIR = DATA_DIR / "backups"
+
+if str(CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CORE_DIR))
 
 import pandas as pd
 import streamlit as st
@@ -24,8 +38,7 @@ from arl_research_engine import (
 from prl_maintenance import run_maintenance
 
 
-BASE_DIR = Path(__file__).resolve().parent
-AI_IMPROVEMENT_DIR = BASE_DIR / "data" / "ai_improvement"
+BASE_DIR = LOTO_LAB_DIR
 
 
 def read_csv(path, columns=None):
@@ -101,12 +114,12 @@ def average_metric_text(df, column, suffix=""):
 
 
 def render_home():
-    loto6_predictions = read_csv(BASE_DIR / "predictions.csv")
-    loto6_reports = add_verification_metrics(read_csv(BASE_DIR / "verification_reports.csv"), draw_size=6)
-    loto7_predictions = read_csv(BASE_DIR / "loto7_predictions.csv")
-    loto7_reports = add_verification_metrics(read_csv(BASE_DIR / "loto7_verification_reports.csv"), draw_size=7)
-    docs = list((BASE_DIR / "分析研究所" / "docs").glob("*.md")) if (BASE_DIR / "分析研究所" / "docs").exists() else []
-    backups = list((BASE_DIR / "分析研究所" / "data" / "backups").glob("*.csv")) if (BASE_DIR / "分析研究所" / "data" / "backups").exists() else []
+    loto6_predictions = read_csv(DATA_DIR / "predictions.csv")
+    loto6_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "verification_reports.csv"), draw_size=6)
+    loto7_predictions = read_csv(DATA_DIR / "loto7_predictions.csv")
+    loto7_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "loto7_verification_reports.csv"), draw_size=7)
+    docs = list(DOCS_DIR.glob("*.md")) if DOCS_DIR.exists() else []
+    backups = list(BACKUP_DIR.glob("*.csv")) if BACKUP_DIR.exists() else []
 
     cols = st.columns(4)
     cols[0].metric("ロト6 最新検証回", latest_round_text(loto6_reports))
@@ -223,11 +236,11 @@ def render_winning_condition_panel(lottery_type, name):
 
 
 def render_loto_lab(name, prediction_file, result_file, report_file, contribution_file, cycle_file, number_max, draw_size):
-    predictions = read_csv(BASE_DIR / prediction_file)
-    official = read_csv(BASE_DIR / result_file)
-    reports = add_verification_metrics(read_csv(BASE_DIR / report_file), draw_size=draw_size)
-    contributions = read_csv(BASE_DIR / contribution_file, CONTRIBUTION_COLUMNS)
-    cycles = read_csv(BASE_DIR / cycle_file, RESEARCH_CYCLE_COLUMNS)
+    predictions = read_csv(DATA_DIR / prediction_file)
+    official = read_csv(DATA_DIR / result_file)
+    reports = add_verification_metrics(read_csv(VERIFICATION_DIR / report_file), draw_size=draw_size)
+    contributions = read_csv(VERIFICATION_DIR / contribution_file, CONTRIBUTION_COLUMNS)
+    cycles = read_csv(VERIFICATION_DIR / cycle_file, RESEARCH_CYCLE_COLUMNS)
 
     cols = st.columns(4)
     cols[0].metric("予想履歴", len(predictions))
@@ -276,7 +289,7 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
     with tabs[5]:
         render_winning_condition_panel(lottery_type, name)
     with tabs[6]:
-        video_logs = read_csv(BASE_DIR / "video_hypotheses.csv", VIDEO_HYPOTHESIS_COLUMNS)
+        video_logs = read_csv(VERIFICATION_DIR / "video_hypotheses.csv", VIDEO_HYPOTHESIS_COLUMNS)
         if video_logs.empty:
             st.info("動画仮説ログはまだありません。")
         else:
@@ -284,7 +297,7 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
 
 
 def render_investment_lab():
-    investment_dir = BASE_DIR / "分析研究所" / "投資"
+    investment_dir = PROJECT_ROOT / "investment_lab" / "data"
     portfolio_columns = ["銘柄コード", "銘柄名", "分類", "保有数", "取得単価", "現在値", "配当単価", "メモ"]
     dividend_columns = ["日付", "銘柄コード", "銘柄名", "受取配当", "税引後", "メモ"]
     watch_columns = ["対象", "分類", "現在値", "移動平均", "RSI", "MACD", "配当利回り", "PER", "PBR", "EPS成長率", "判定"]
@@ -366,8 +379,8 @@ def render_investment_lab():
 
 
 def render_ai_department():
-    loto6_reports = add_verification_metrics(read_csv(BASE_DIR / "verification_reports.csv"), draw_size=6)
-    loto7_reports = add_verification_metrics(read_csv(BASE_DIR / "loto7_verification_reports.csv"), draw_size=7)
+    loto6_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "verification_reports.csv"), draw_size=6)
+    loto7_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "loto7_verification_reports.csv"), draw_size=7)
     st.info("AI改善部門は、外れても失敗扱いせず、成功要因・失敗要因・改善案・次回仮説を研究資産として保存します。")
     tabs = st.tabs(["ロト6", "ロト7"])
     for tab, name, reports in [(tabs[0], "ロト6", loto6_reports), (tabs[1], "ロト7", loto7_reports)]:
@@ -389,7 +402,7 @@ def render_ai_department():
 def render_verification_department():
     rows = []
     for name, report_file, draw_size in [("ロト6", "verification_reports.csv", 6), ("ロト7", "loto7_verification_reports.csv", 7)]:
-        reports = add_verification_metrics(read_csv(BASE_DIR / report_file), draw_size=draw_size)
+        reports = add_verification_metrics(read_csv(VERIFICATION_DIR / report_file), draw_size=draw_size)
         if reports.empty:
             rows.append({"対象": name, "予測保存数": 0, "平均一致数": "-", "平均的中率": "-", "平均勝率": "-", "平均期待値": "-"})
             continue
@@ -411,7 +424,7 @@ def render_verification_department():
 
 
 def render_hospital_system():
-    hospital_dir = BASE_DIR / "分析研究所" / "病院業務改善"
+    hospital_dir = PROJECT_ROOT / "hospital_tools" / "documents" / "data"
     staff_columns = ["職員ID", "氏名", "職種", "常勤換算", "夜勤可否", "委員会", "メモ"]
     shift_columns = ["日付", "勤務帯", "必要人数", "配置人数", "不足人数", "メモ"]
     committee_columns = ["委員会名", "担当者", "開催頻度", "負担度", "改善メモ"]
@@ -505,6 +518,11 @@ def render_launch_guide():
             {"画面": "分析研究所トップ", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run analysis_research_lab.py --server.port 8501"},
             {"画面": "ロト6専用画面", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run loto6_streamlit_app.py --server.port 8502"},
             {"画面": "ロト7専用画面", "起動コマンド": ".\\.venv\\Scripts\\streamlit.exe run loto7_streamlit_app.py --server.port 8503"},
+
+            {"画面": "分析研究所トップ", "起動コマンド": "python -m streamlit run loto_lab/apps/analysis_research_lab.py --server.port 8501", "URL": "http://localhost:8501"},
+            {"画面": "ロト6分析", "起動コマンド": "python -m streamlit run loto_lab/apps/loto6_streamlit_app.py --server.port 8502", "URL": "http://localhost:8502"},
+            {"画面": "ロト7分析", "起動コマンド": "python -m streamlit run loto_lab/apps/loto7_streamlit_app.py --server.port 8503", "URL": "http://localhost:8503"},
+launcher):loto_lab/apps/analysis_research_lab.py
         ]
     )
     display_dataframe(guide, width="stretch", hide_index=True)

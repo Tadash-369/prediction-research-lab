@@ -1,9 +1,20 @@
 from datetime import date, datetime
 from itertools import combinations
 from pathlib import Path
+import sys
 
 import pandas as pd
 import streamlit as st
+
+APP_DIR = Path(__file__).resolve().parent
+LOTO_LAB_DIR = APP_DIR.parent
+CORE_DIR = LOTO_LAB_DIR / "core"
+DATA_DIR = LOTO_LAB_DIR / "data"
+VERIFICATION_DIR = DATA_DIR / "verification"
+AI_IMPROVEMENT_DIR = DATA_DIR / "ai_improvement"
+
+if str(CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CORE_DIR))
 
 from arl_research_engine import (
     ARL_MODEL_LABELS,
@@ -34,16 +45,15 @@ from arl_research_engine import (
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
-RESULTS_CSV = BASE_DIR / "loto7.csv"
-PREDICTIONS_CSV = BASE_DIR / "loto7_predictions.csv"
-OFFICIAL_RESULTS_CSV = BASE_DIR / "loto7_results.csv"
-VERIFICATION_REPORTS_CSV = BASE_DIR / "loto7_verification_reports.csv"
-MODEL_SETTINGS_CSV = BASE_DIR / "loto7_model_settings.csv"
-CONTRIBUTIONS_CSV = BASE_DIR / "loto7_model_contributions.csv"
-RESEARCH_CYCLES_CSV = BASE_DIR / "loto7_research_cycles.csv"
-VIDEO_HYPOTHESES_CSV = BASE_DIR / "video_hypotheses.csv"
-AI_IMPROVEMENT_DIR = BASE_DIR / "data" / "ai_improvement"
+BASE_DIR = LOTO_LAB_DIR
+RESULTS_CSV = DATA_DIR / "loto7.csv"
+PREDICTIONS_CSV = DATA_DIR / "loto7_predictions.csv"
+OFFICIAL_RESULTS_CSV = DATA_DIR / "loto7_results.csv"
+VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
+MODEL_SETTINGS_CSV = DATA_DIR / "loto7_model_settings.csv"
+CONTRIBUTIONS_CSV = VERIFICATION_DIR / "loto7_model_contributions.csv"
+RESEARCH_CYCLES_CSV = VERIFICATION_DIR / "loto7_research_cycles.csv"
+VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
 
 NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字", "第7数字"]
 BONUS_COLUMNS = ["BONUS数字1", "BONUS数字2"]
