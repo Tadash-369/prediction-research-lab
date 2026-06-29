@@ -47,6 +47,7 @@ from arl_research_engine import (
 
 BASE_DIR = LOTO_LAB_DIR
 RESULTS_CSV = DATA_DIR / "loto7.csv"
+SCORES_CSV = DATA_DIR / "loto7_next_number_scores.csv"
 PREDICTIONS_CSV = DATA_DIR / "loto7_predictions.csv"
 OFFICIAL_RESULTS_CSV = DATA_DIR / "loto7_results.csv"
 VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
@@ -57,6 +58,7 @@ VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
 
 NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字", "第7数字"]
 BONUS_COLUMNS = ["BONUS数字1", "BONUS数字2"]
+SCORE_COLUMNS = ["順位", "数字", "スコア", "出現回数", "直近30回スコア", "未出現回数", "ボーナス出現回数", "根拠", "更新日時"]
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
@@ -357,6 +359,53 @@ def build_candidate_scores(results, model_key="recent_trend"):
             score = frequency[number] * 35 + recent[number] * 30 + overdue[number] * 20 + model[number] * 15
         rows.append({"数字": number, "スコア": round(score, 3)})
     return pd.DataFrame(rows).sort_values("スコア", ascending=False)
+
+
+def build_next_number_scores(results, model_key="machine_learning"):
+    if results.empty:
+        return pd.DataFrame(columns=SCORE_COLUMNS)
+
+    history = results.copy()
+    history["開催回"] = history["開催回"].map(to_int)
+    history = history.sort_values("開催回")
+    number_rows = [row_numbers(row) for _, row in history.iterrows()]
+    bonus_rows = [row_bonus_numbers(row) for _, row in history.iterrows()]
+    target_round = int(history["開催回"].max()) + 1
+    score_rows = build_candidate_scores(history, model_key).set_index("数字")
+    recent_scores = normalize_score_map(build_historical_scores(history, "hot_analysis", target_round))
+
+    rows = []
+    for number in range(1, 38):
+        last_seen_index = next(
+            (index for index in range(len(number_rows) - 1, -1, -1) if number in number_rows[index]),
+            None,
+        )
+        unseen_count = len(number_rows) if last_seen_index is None else len(number_rows) - last_seen_index - 1
+        rows.append(
+            {
+                "数字": number,
+                "スコア": round(float(score_rows.at[number, "スコア"]) if number in score_rows.index else 0.0, 3),
+                "出現回数": sum(1 for row in number_rows if number in row),
+                "直近30回スコア": round(recent_scores.get(number, 0.0) * 100, 3),
+                "未出現回数": unseen_count,
+                "ボーナス出現回数": sum(1 for row in bonus_rows if number in row),
+                "根拠": f"{MODEL_LABELS.get(model_key, model_key)}を使った第{target_round}回向け候補スコア",
+                "更新日時": now_text(),
+            }
+        )
+
+    score_df = pd.DataFrame(rows)
+    score_df = score_df.sort_values(["スコア", "出現回数", "数字"], ascending=[False, False, True]).reset_index(drop=True)
+    score_df.insert(0, "順位", range(1, len(score_df) + 1))
+    return score_df.reindex(columns=SCORE_COLUMNS)
+
+
+def save_next_number_scores(results, model_key="machine_learning"):
+    scores = build_next_number_scores(results, model_key)
+    if scores.empty:
+        raise RuntimeError("loto7.csv に抽せん結果がないため、候補スコアを作成できません。")
+    save_csv(scores, SCORES_CSV, SCORE_COLUMNS)
+    return f"{SCORES_CSV.name} を更新しました。候補数字 {len(scores)}件。"
 
 
 def build_pick_reason(numbers, target_sum, model_name):
@@ -951,6 +1000,11 @@ def render_prediction_area(results):
     elif active_setting:
         st.caption(f"反映中の研究モデル: {active_setting['model_name']}（{active_setting['reason']}）")
     scores = build_candidate_scores(results, model_key)
+    if st.button("候補スコアCSVを更新", key="loto7_score_csv_update"):
+        try:
+            st.success(save_next_number_scores(results, model_key))
+        except Exception as exc:
+            st.error(str(exc))
     st.dataframe(scores.head(20), width="stretch", hide_index=True)
 
     target_round = int(results["開催回"].max()) + 1

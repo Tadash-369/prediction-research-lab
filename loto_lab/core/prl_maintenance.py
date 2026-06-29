@@ -155,6 +155,7 @@ SYNC_TARGETS = [
     ("loto6_next_number_scores.csv", "分析研究所/data/loto6_next_number_scores.csv"),
     ("loto6_ball_sets.csv", "分析研究所/data/loto6_ball_sets.csv"),
     ("loto7.csv", "分析研究所/ロト7/loto7.csv"),
+    ("loto7_next_number_scores.csv", "分析研究所/data/loto7_next_number_scores.csv"),
     ("loto7_results.csv", "分析研究所/ロト7/loto7_results.csv"),
     ("loto7_predictions.csv", "分析研究所/ロト7/loto7_predictions.csv"),
     ("loto7_verification_reports.csv", "分析研究所/検証/verification_reports_loto7.csv"),
