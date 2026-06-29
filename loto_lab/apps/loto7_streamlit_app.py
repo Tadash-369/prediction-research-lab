@@ -59,6 +59,20 @@ VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
 NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字", "第7数字"]
 BONUS_COLUMNS = ["BONUS数字1", "BONUS数字2"]
 SCORE_COLUMNS = ["順位", "数字", "スコア", "出現回数", "直近30回スコア", "未出現回数", "ボーナス出現回数", "根拠", "更新日時"]
+SCORE_NUMERIC_COLUMNS = ["順位", "数字", "スコア", "出現回数", "直近30回スコア", "未出現回数", "ボーナス出現回数"]
+SCORE_DISPLAY_COLUMNS = [
+    "順位",
+    "数字",
+    "総合スコア",
+    "出現頻度スコア",
+    "直近傾向スコア",
+    "未出現期間スコア",
+    "ボーナス傾向スコア",
+    "出現回数",
+    "未出現回数",
+    "ボーナス出現回数",
+    "更新日時",
+]
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
@@ -268,6 +282,66 @@ def normalize_score_map(score_map):
     if max_value == min_value:
         return {number: 0.0 for number in score_map}
     return {number: (value - min_value) / (max_value - min_value) for number, value in score_map.items()}
+
+
+def normalize_series(values):
+    numeric = pd.to_numeric(values, errors="coerce").fillna(0)
+    if numeric.empty:
+        return numeric
+    low = float(numeric.min())
+    high = float(numeric.max())
+    if high == low:
+        return pd.Series([0.0] * len(numeric), index=numeric.index)
+    return ((numeric - low) / (high - low) * 100).round(3)
+
+
+def load_next_score_csv(path=SCORES_CSV, number_max=37):
+    warnings = []
+    if not path.exists():
+        return pd.DataFrame(columns=SCORE_DISPLAY_COLUMNS), [f"{path.name} がありません。候補スコアCSVを更新してください。"]
+    try:
+        score_df = read_csv(path)
+    except Exception as exc:
+        return pd.DataFrame(columns=SCORE_DISPLAY_COLUMNS), [f"{path.name} を読み込めませんでした: {exc}"]
+    if score_df.empty:
+        return pd.DataFrame(columns=SCORE_DISPLAY_COLUMNS), [f"{path.name} は空です。候補スコアCSVを更新してください。"]
+    missing_required = [column for column in ("数字", "スコア") if column not in score_df.columns]
+    if missing_required:
+        return pd.DataFrame(columns=SCORE_DISPLAY_COLUMNS), [f"{path.name} に必要な列がありません: {', '.join(missing_required)}"]
+
+    score_df = score_df.copy()
+    for column in SCORE_NUMERIC_COLUMNS:
+        if column not in score_df.columns:
+            score_df[column] = 0
+            warnings.append(f"{path.name} に {column} 列がないため 0 として扱います。")
+        score_df[column] = pd.to_numeric(score_df[column], errors="coerce").fillna(0)
+
+    score_df["数字"] = score_df["数字"].astype(int)
+    score_df = score_df[(score_df["数字"] >= 1) & (score_df["数字"] <= number_max)]
+    if score_df.empty:
+        return pd.DataFrame(columns=SCORE_DISPLAY_COLUMNS), [f"{path.name} に有効な数字がありません。"]
+
+    score_df = score_df.sort_values(["スコア", "出現回数", "数字"], ascending=[False, False, True]).reset_index(drop=True)
+    if "順位" not in score_df.columns or not score_df["順位"].any():
+        score_df["順位"] = range(1, len(score_df) + 1)
+    else:
+        score_df["順位"] = pd.to_numeric(score_df["順位"], errors="coerce").fillna(0).astype(int)
+
+    score_df["総合スコア"] = pd.to_numeric(score_df["スコア"], errors="coerce").fillna(0).round(3)
+    score_df["出現頻度スコア"] = normalize_series(score_df["出現回数"])
+    score_df["直近傾向スコア"] = pd.to_numeric(score_df["直近30回スコア"], errors="coerce").fillna(0).round(3)
+    score_df["未出現期間スコア"] = normalize_series(score_df["未出現回数"])
+    score_df["ボーナス傾向スコア"] = normalize_series(score_df["ボーナス出現回数"])
+    if "更新日時" not in score_df.columns:
+        score_df["更新日時"] = ""
+        warnings.append(f"{path.name} に 更新日時 列がありません。")
+    return score_df, warnings
+
+
+def score_display_df(score_df):
+    if score_df.empty:
+        return pd.DataFrame(columns=SCORE_DISPLAY_COLUMNS)
+    return score_df.reindex(columns=SCORE_DISPLAY_COLUMNS)
 
 
 def build_near_correction_scores():
@@ -528,6 +602,111 @@ def generate_prediction_picks(results, model_key="recent_trend", pick_count=3, c
     return picks
 
 
+def build_score_number_reasons(numbers, score_df, low_threshold=18):
+    rows = []
+    row_map = {int(row["数字"]): row for _, row in score_df.iterrows()}
+    odd_count = sum(number % 2 for number in numbers)
+    low_count = sum(number <= low_threshold for number in numbers)
+    for number in numbers:
+        row = row_map.get(int(number), {})
+        rank = int(row.get("順位", 0) or 0)
+        reasons = []
+        if rank and rank <= 10:
+            reasons.append("総合スコア上位")
+        if float(row.get("出現頻度スコア", 0) or 0) >= 70:
+            reasons.append("出現頻度スコアが高い")
+        if float(row.get("直近傾向スコア", 0) or 0) >= 70:
+            reasons.append("直近傾向スコアが高い")
+        if float(row.get("未出現期間スコア", 0) or 0) >= 70:
+            reasons.append("未出現期間スコアが高い")
+        if float(row.get("ボーナス傾向スコア", 0) or 0) >= 70:
+            reasons.append("ボーナス傾向で評価")
+        if rank > 7 and odd_count in (3, 4):
+            reasons.append("奇数偶数バランス調整のため採用")
+        if rank > 7 and low_count in (2, 3, 4):
+            reasons.append("高低バランス調整のため採用")
+        if not reasons:
+            reasons.append("候補スコアと全体バランスで採用")
+        rows.append(
+            {
+                "数字": f"{int(number):02d}",
+                "順位": rank if rank else "-",
+                "総合スコア": round(float(row.get("総合スコア", 0) or 0), 3),
+                "主な理由": " / ".join(reasons),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def generate_next_score_prediction_picks(score_df, results, draw_size=7, pick_count=3):
+    if score_df.empty or results.empty:
+        return []
+    score_df = score_df.copy().sort_values(["総合スコア", "出現回数", "数字"], ascending=[False, False, True]).reset_index(drop=True)
+    pool = score_df.head(22)
+    row_map = {int(row["数字"]): row for _, row in score_df.iterrows()}
+    candidate_numbers = [int(number) for number in pool["数字"].tolist()]
+    top_10 = set(int(number) for number in score_df.head(10)["数字"].tolist())
+
+    sums = results[NUMBER_COLUMNS].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+    target_sum = float(sums.mean())
+    sum_std = float(sums.std()) if len(sums) > 1 else 30.0
+    if pd.isna(sum_std) or sum_std <= 0:
+        sum_std = 30.0
+
+    candidates = []
+    for combo in combinations(candidate_numbers, draw_size):
+        numbers = tuple(sorted(combo))
+        summary = balance_summary(numbers)
+        low = sum(number <= 18 for number in numbers)
+        consecutive = count_consecutive_pairs(numbers)
+        top_count = len(set(numbers) & top_10)
+        if summary["odd"] not in (3, 4) or low not in (2, 3, 4) or consecutive > 2:
+            continue
+        if top_count >= draw_size:
+            continue
+        score_total = sum(float(row_map[number].get("総合スコア", 0) or 0) for number in numbers)
+        feature_total = sum(
+            float(row_map[number].get("出現頻度スコア", 0) or 0) * 0.08
+            + float(row_map[number].get("直近傾向スコア", 0) or 0) * 0.08
+            + float(row_map[number].get("未出現期間スコア", 0) or 0) * 0.05
+            + float(row_map[number].get("ボーナス傾向スコア", 0) or 0) * 0.04
+            for number in numbers
+        )
+        sum_penalty = abs(sum(numbers) - target_sum) / max(sum_std, 1) * 10
+        balance_penalty = abs(summary["odd"] - 3.5) * 4 + abs(low - 3) * 4 + consecutive * 5
+        diversity_bonus = min(draw_size - top_count, 2) * 5
+        candidates.append((score_total + feature_total + diversity_bonus - sum_penalty - balance_penalty, numbers))
+
+    if not candidates:
+        fallback = tuple(sorted(candidate_numbers[:draw_size]))
+        candidates = [(0, fallback)]
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    picks = []
+    used_numbers = set()
+    for _, numbers in candidates:
+        if picks and len(set(numbers) & used_numbers) > 4:
+            continue
+        reason_table = build_score_number_reasons(numbers, score_df)
+        summary = balance_summary(numbers)
+        low = sum(number <= 18 for number in numbers)
+        picks.append(
+            {
+                "numbers": numbers,
+                "reason": (
+                    "候補スコアCSVの総合スコアと特徴スコアを使い、"
+                    f"奇数{summary['odd']}・偶数{summary['even']}、低数字{low}・高数字{draw_size - low}、"
+                    f"合計{summary['sum']}を過去平均{target_sum:.1f}付近に調整。"
+                ),
+                "number_reasons": reason_table,
+            }
+        )
+        used_numbers.update(numbers)
+        if len(picks) == pick_count:
+            break
+    return picks
+
+
 def run_backtest(results, lookback_rounds=30, min_training_rounds=40):
     if results.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -687,6 +866,24 @@ def save_prediction_picks(picks, target_round, model_key, model_name):
         predictions["候補番号"] = predictions["候補番号"].map(to_int)
         save_csv(predictions.sort_values(["開催回", "候補番号", "使用モデル", "保存日時"]), PREDICTIONS_CSV, PREDICTION_COLUMNS)
     return len(rows)
+
+
+def render_next_score_prediction(score_df, results, target_round):
+    st.subheader("候補スコア活用予測")
+    picks = generate_next_score_prediction_picks(score_df, results)
+    if not picks:
+        st.info("候補スコアCSVと抽せん履歴が揃うと、スコアベース次回予測を表示します。")
+        return
+    if st.button("候補スコア活用予測を保存", key="loto7_next_score_prediction_save"):
+        saved_count = save_prediction_picks(picks, target_round, "next_score_prediction", "候補スコア活用予測")
+        if saved_count:
+            st.success(f"候補スコア活用予測を loto7_predictions.csv に {saved_count}件保存しました。")
+        else:
+            st.info("候補スコア活用予測の同一予想は保存済みです。")
+    for index, pick in enumerate(picks, start=1):
+        st.markdown(f"**候補スコア活用予測 {index}: {numbers_to_text(pick['numbers'])}**")
+        st.write(f"理由: {pick['reason']}")
+        st.dataframe(pick["number_reasons"], width="stretch", hide_index=True)
 
 
 def determine_grade(match_count, bonus_count):
@@ -999,13 +1196,25 @@ def render_prediction_area(results):
         )
     elif active_setting:
         st.caption(f"反映中の研究モデル: {active_setting['model_name']}（{active_setting['reason']}）")
+    score_csv, score_warnings = load_next_score_csv(SCORES_CSV, 37)
     scores = build_candidate_scores(results, model_key)
     if st.button("候補スコアCSVを更新", key="loto7_score_csv_update"):
         try:
             st.success(save_next_number_scores(results, model_key))
+            score_csv, score_warnings = load_next_score_csv(SCORES_CSV, 37)
         except Exception as exc:
             st.error(str(exc))
-    st.dataframe(scores.head(20), width="stretch", hide_index=True)
+    for warning in score_warnings:
+        st.warning(warning)
+    top_count = st.selectbox("CSVランキング表示件数", [10, 20, 30, 37], index=1, key="loto7_score_top_count")
+    if score_csv.empty:
+        st.info("候補スコアCSVがありません。上の「候補スコアCSVを更新」から作成できます。")
+    else:
+        st.dataframe(score_display_df(score_csv).head(top_count), width="stretch", hide_index=True)
+        render_next_score_prediction(score_csv, results, int(results["開催回"].max()) + 1)
+
+    with st.expander("選択モデルの即時計算スコア"):
+        st.dataframe(scores.head(20), width="stretch", hide_index=True)
 
     target_round = int(results["開催回"].max()) + 1
     picks = generate_prediction_picks(results, model_key=model_key)

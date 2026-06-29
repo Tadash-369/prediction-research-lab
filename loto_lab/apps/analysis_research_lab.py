@@ -113,6 +113,54 @@ def average_metric_text(df, column, suffix=""):
     return f"{round(float(values.mean()), 3)}{suffix}"
 
 
+def score_csv_overview(label, path, number_max, top_n=10):
+    if not path.exists():
+        return {
+            "対象": label,
+            "CSV": "なし",
+            "上位候補数字": "-",
+            "最終更新": "-",
+            "状態": f"{path.name} がありません",
+        }
+    try:
+        score_df = read_csv(path)
+    except Exception as exc:
+        return {
+            "対象": label,
+            "CSV": "読込不可",
+            "上位候補数字": "-",
+            "最終更新": "-",
+            "状態": f"読み込みエラー: {exc}",
+        }
+    if score_df.empty:
+        return {"対象": label, "CSV": "あり", "上位候補数字": "-", "最終更新": "-", "状態": "CSVが空です"}
+    missing = [column for column in ("数字", "スコア") if column not in score_df.columns]
+    if missing:
+        return {
+            "対象": label,
+            "CSV": "あり",
+            "上位候補数字": "-",
+            "最終更新": "-",
+            "状態": f"必要な列がありません: {', '.join(missing)}",
+        }
+    score_df = score_df.copy()
+    score_df["数字"] = pd.to_numeric(score_df["数字"], errors="coerce")
+    score_df["スコア"] = pd.to_numeric(score_df["スコア"], errors="coerce")
+    score_df = score_df.dropna(subset=["数字", "スコア"])
+    score_df = score_df[(score_df["数字"] >= 1) & (score_df["数字"] <= number_max)]
+    if score_df.empty:
+        return {"対象": label, "CSV": "あり", "上位候補数字": "-", "最終更新": "-", "状態": "有効な数字がありません"}
+    score_df = score_df.sort_values("スコア", ascending=False)
+    top_numbers = " ".join(f"{int(number):02d}" for number in score_df.head(top_n)["数字"].tolist())
+    updated = "-"
+    if "更新日時" in score_df.columns:
+        updated_values = score_df["更新日時"].dropna().astype(str)
+        updated_values = updated_values[updated_values.str.strip() != ""]
+        if not updated_values.empty:
+            updated = updated_values.iloc[0]
+    return {"対象": label, "CSV": "あり", "上位候補数字": top_numbers, "最終更新": updated, "状態": "OK"}
+
+
 def render_home():
     loto6_predictions = read_csv(DATA_DIR / "predictions.csv")
     loto6_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "verification_reports.csv"), draw_size=6)
@@ -154,6 +202,15 @@ def render_home():
         summary[column] = summary[column].astype(str)
     st.markdown("**研究所サマリー**")
     display_dataframe(summary, width="stretch", hide_index=True)
+
+    score_overview = pd.DataFrame(
+        [
+            score_csv_overview("ロト6", DATA_DIR / "loto6_next_number_scores.csv", 43),
+            score_csv_overview("ロト7", DATA_DIR / "loto7_next_number_scores.csv", 37),
+        ]
+    )
+    st.markdown("**候補スコア概要**")
+    st.dataframe(score_overview, width="stretch", hide_index=True)
 
     next_actions = pd.DataFrame(
         [
