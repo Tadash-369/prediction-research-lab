@@ -27,6 +27,7 @@ from arl_research_engine import (
     RESEARCH_CYCLE_COLUMNS,
     VIDEO_HYPOTHESIS_COLUMNS,
     add_verification_metrics,
+    build_ai_improvement_weight_summary,
     build_ai_improvement_summary,
     build_condition_success_table,
     build_contribution_ranking,
@@ -34,6 +35,7 @@ from arl_research_engine import (
     build_research_flow_table,
     load_winning_condition_history,
     parse_json_text,
+    weighted_model_text,
 )
 from prl_maintenance import run_maintenance
 
@@ -161,6 +163,26 @@ def score_csv_overview(label, path, number_max, top_n=10):
     return {"対象": label, "CSV": "あり", "上位候補数字": top_numbers, "最終更新": updated, "状態": "OK"}
 
 
+def ai_weight_overview(label, lottery_type):
+    summary = build_ai_improvement_weight_summary(AI_IMPROVEMENT_DIR, lottery_type)
+    warnings = summary.get("warnings", [])
+    status = "OK" if summary.get("available") else "候補スコア予測へフォールバック"
+    if warnings:
+        status = warnings[0]
+    hypothesis = str(summary.get("latest_hypothesis", "-") or "-")
+    if len(hypothesis) > 80:
+        hypothesis = hypothesis[:77] + "..."
+    return {
+        "対象": label,
+        "AI改善履歴": f"{int(summary.get('history_count', 0))}件",
+        "重み上げモデル": weighted_model_text(summary.get("model_weights", {}), True),
+        "重み下げモデル": weighted_model_text(summary.get("model_weights", {}), False),
+        "直近仮説": hypothesis,
+        "最終更新": summary.get("latest_created_at", "-"),
+        "状態": status,
+    }
+
+
 def render_home():
     loto6_predictions = read_csv(DATA_DIR / "predictions.csv")
     loto6_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "verification_reports.csv"), draw_size=6)
@@ -211,6 +233,15 @@ def render_home():
     )
     st.markdown("**候補スコア概要**")
     st.dataframe(score_overview, width="stretch", hide_index=True)
+
+    ai_overview = pd.DataFrame(
+        [
+            ai_weight_overview("ロト6", "loto6"),
+            ai_weight_overview("ロト7", "loto7"),
+        ]
+    )
+    st.markdown("**AI改善重み概要**")
+    st.dataframe(ai_overview, width="stretch", hide_index=True)
 
     next_actions = pd.DataFrame(
         [

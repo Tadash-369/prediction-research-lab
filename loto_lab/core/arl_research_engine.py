@@ -62,6 +62,25 @@ MODEL_ALIASES = {
     "bonus_promotion": "bonus_analysis",
 }
 
+AI_MODEL_SCORE_COLUMNS = {
+    "frequency_analysis": ["出現頻度スコア"],
+    "hot_analysis": ["直近傾向スコア"],
+    "cold_analysis": ["未出現期間スコア"],
+    "bonus_analysis": ["ボーナス傾向スコア"],
+    "machine_learning": ["総合スコア", "出現頻度スコア", "直近傾向スコア", "未出現期間スコア", "ボーナス傾向スコア"],
+    "bayesian_estimation": ["総合スコア", "出現頻度スコア", "直近傾向スコア"],
+    "markov_chain": ["総合スコア", "直近傾向スコア"],
+    "pair_analysis": ["総合スコア"],
+    "triple_analysis": ["総合スコア"],
+    "odd_even_analysis": ["総合スコア"],
+    "high_low_analysis": ["総合スコア"],
+    "sum_value_analysis": ["総合スコア"],
+    "consecutive_analysis": ["総合スコア"],
+    "last_digit_analysis": ["総合スコア"],
+    "monte_carlo": ["総合スコア"],
+    "random_baseline": ["総合スコア"],
+}
+
 CONTRIBUTION_COLUMNS = [
     "研究所",
     "予想ID",
@@ -789,6 +808,25 @@ def read_history_csv(path, columns):
     return pd.read_csv(path).reindex(columns=columns)
 
 
+def read_history_jsonl(path, columns):
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    rows = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                rows.append(json.loads(text))
+            except Exception:
+                continue
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows).reindex(columns=columns)
+
+
 def write_history_jsonl(df, path):
     json_columns = {"winning_condition_analysis", "model_improvement_analysis", "ensemble_analysis"}
     with Path(path).open("w", encoding="utf-8") as handle:
@@ -838,12 +876,335 @@ def append_winning_condition_history(history_dir, main_rows, model_rows):
 
 def load_winning_condition_history(history_dir, lottery_type=None):
     history_dir = Path(history_dir)
-    main_df = read_history_csv(history_dir / "winning_condition_history.csv", WINNING_CONDITION_HISTORY_COLUMNS)
-    model_df = read_history_csv(history_dir / "model_improvement_history.csv", MODEL_IMPROVEMENT_HISTORY_COLUMNS)
+    try:
+        main_df = read_history_csv(history_dir / "winning_condition_history.csv", WINNING_CONDITION_HISTORY_COLUMNS)
+    except Exception:
+        main_df = read_history_jsonl(history_dir / "winning_condition_history.jsonl", WINNING_CONDITION_HISTORY_COLUMNS)
+    if main_df.empty:
+        main_df = read_history_jsonl(history_dir / "winning_condition_history.jsonl", WINNING_CONDITION_HISTORY_COLUMNS)
+    try:
+        model_df = read_history_csv(history_dir / "model_improvement_history.csv", MODEL_IMPROVEMENT_HISTORY_COLUMNS)
+    except Exception:
+        model_df = pd.DataFrame(columns=MODEL_IMPROVEMENT_HISTORY_COLUMNS)
     if lottery_type:
         main_df = main_df[main_df["lottery_type"].astype(str) == str(lottery_type)] if not main_df.empty else main_df
         model_df = model_df[model_df["lottery_type"].astype(str) == str(lottery_type)] if not model_df.empty else model_df
     return main_df, model_df
+
+
+def canonical_model_from_name(model_name):
+    text = str(model_name or "").strip()
+    if not text or text.lower() in {"nan", "none", "-"}:
+        return None, ""
+    if text.startswith("custom:"):
+        return text, text.split("custom:", 1)[1]
+    key = canonical_model_key(text)
+    if key in ARL_MODEL_LABELS:
+        return key, ARL_MODEL_LABELS[key]
+    for model_key, label in ARL_MODEL_LABELS.items():
+        if text == label:
+            return model_key, label
+    for alias, model_key in MODEL_ALIASES.items():
+        if text == alias:
+            return model_key, ARL_MODEL_LABELS.get(model_key, text)
+    return f"custom:{text}", text
+
+
+def split_model_names(value):
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+    if isinstance(value, (list, tuple, set)):
+        raw_names = list(value)
+    else:
+        parsed = parse_json_text(value, None)
+        if isinstance(parsed, (list, tuple, set)):
+            raw_names = list(parsed)
+        else:
+            text = str(value or "")
+            for separator in (" / ", "/", "、", ",", "\n", "\t"):
+                text = text.replace(separator, "|")
+            raw_names = text.split("|")
+    names = []
+    for name in raw_names:
+        text = str(name or "").strip()
+        if text and text.lower() not in {"nan", "none", "-"}:
+            names.append(text)
+    return names
+
+
+def model_counter_from_column(df, column):
+    counter = Counter()
+    if df is None or df.empty or column not in df:
+        return counter
+    for value in df[column].fillna("").tolist():
+        for name in split_model_names(value):
+            key, _ = canonical_model_from_name(name)
+            if key:
+                counter[key] += 1
+    return counter
+
+
+def sorted_improvement_history(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=WINNING_CONDITION_HISTORY_COLUMNS)
+    sorted_df = df.copy()
+    sorted_df["_draw_sort"] = pd.to_numeric(sorted_df.get("draw_no"), errors="coerce").fillna(0)
+    sorted_df["_created_sort"] = pd.to_datetime(sorted_df.get("created_at"), errors="coerce")
+    return sorted_df.sort_values(["_draw_sort", "_created_sort"], ascending=[True, True])
+
+
+def effective_model_counters(model_df, limit=5):
+    useful = Counter()
+    weak = Counter()
+    if model_df is None or model_df.empty or "model_name" not in model_df:
+        return useful, weak
+    model_scores = model_df.copy()
+    model_scores["matched_count"] = pd.to_numeric(model_scores.get("matched_count"), errors="coerce").fillna(0)
+    grouped = (
+        model_scores.groupby("model_name", dropna=False)["matched_count"]
+        .agg(["mean", "count"])
+        .reset_index()
+    )
+    if grouped.empty:
+        return useful, weak
+    top = grouped.sort_values(["mean", "count"], ascending=[False, False]).head(limit)
+    bottom = grouped.sort_values(["mean", "count"], ascending=[True, False]).head(limit)
+    for _, row in top.iterrows():
+        key, _ = canonical_model_from_name(row["model_name"])
+        if key:
+            useful[key] += int(row["count"])
+    for _, row in bottom.iterrows():
+        key, _ = canonical_model_from_name(row["model_name"])
+        if key:
+            weak[key] += int(row["count"])
+    return useful, weak
+
+
+def clamp_float(value, lower, upper):
+    return max(lower, min(upper, float(value)))
+
+
+def counter_to_records(counter, limit=6):
+    rows = []
+    for key, count in counter.most_common(limit):
+        _, label = canonical_model_from_name(key)
+        rows.append({"model_key": key, "model_name": label or model_label(key), "count": int(count)})
+    return rows
+
+
+def format_model_counter(counter, limit=5):
+    if not counter:
+        return "-"
+    parts = []
+    for key, count in counter.most_common(limit):
+        _, label = canonical_model_from_name(key)
+        parts.append(f"{label or model_label(key)}({int(count)})")
+    return " / ".join(parts) if parts else "-"
+
+
+def build_ai_improvement_weight_summary(history_dir, lottery_type=None):
+    warnings = []
+    try:
+        history, model_history = load_winning_condition_history(history_dir, lottery_type)
+    except Exception as exc:
+        return {
+            "lottery_type": lottery_type or "",
+            "available": False,
+            "warnings": [f"AI改善履歴を読み込めませんでした: {exc}"],
+            "history_count": 0,
+            "model_history_count": 0,
+            "latest_draw_no": "-",
+            "latest_created_at": "-",
+            "latest_hypothesis": "-",
+            "model_weights": {},
+            "recent5_weight_up": Counter(),
+            "recent10_weight_up": Counter(),
+            "recent5_weight_down": Counter(),
+            "recent10_weight_down": Counter(),
+            "long_useful": Counter(),
+            "long_weak": Counter(),
+        }
+
+    if history.empty and model_history.empty:
+        warnings.append("AI改善履歴がまだありません。通常の候補スコア活用予測にフォールバックします。")
+
+    history = sorted_improvement_history(history)
+    recent5 = history.tail(5)
+    recent10 = history.tail(10)
+
+    recent5_weight_up = model_counter_from_column(recent5, "weight_up_models")
+    recent10_weight_up = model_counter_from_column(recent10, "weight_up_models")
+    recent5_weight_down = model_counter_from_column(recent5, "weight_down_models")
+    recent10_weight_down = model_counter_from_column(recent10, "weight_down_models")
+    recent5_useful = model_counter_from_column(recent5, "useful_models")
+    recent10_useful = model_counter_from_column(recent10, "useful_models")
+    recent5_weak = model_counter_from_column(recent5, "weak_models")
+    recent10_weak = model_counter_from_column(recent10, "weak_models")
+    all_useful = model_counter_from_column(history, "useful_models")
+    all_weak = model_counter_from_column(history, "weak_models")
+    effective_useful, effective_weak = effective_model_counters(model_history)
+
+    long_useful = all_useful + effective_useful
+    long_weak = all_weak + effective_weak
+    weight_scores = Counter()
+    for key, count in recent5_weight_up.items():
+        weight_scores[key] += count * 0.055
+    for key, count in recent10_weight_up.items():
+        weight_scores[key] += count * 0.025
+    for key, count in recent5_useful.items():
+        weight_scores[key] += count * 0.02
+    for key, count in recent10_useful.items():
+        weight_scores[key] += count * 0.01
+    for key, count in long_useful.items():
+        weight_scores[key] += count * 0.004
+    for key, count in recent5_weight_down.items():
+        weight_scores[key] -= count * 0.055
+    for key, count in recent10_weight_down.items():
+        weight_scores[key] -= count * 0.025
+    for key, count in recent5_weak.items():
+        weight_scores[key] -= count * 0.02
+    for key, count in recent10_weak.items():
+        weight_scores[key] -= count * 0.01
+    for key, count in long_weak.items():
+        weight_scores[key] -= count * 0.004
+
+    model_weights = {
+        key: round(clamp_float(score, -0.28, 0.28), 4)
+        for key, score in weight_scores.items()
+        if abs(score) >= 0.005
+    }
+    if history.empty:
+        latest = {}
+    else:
+        latest = history.iloc[-1].to_dict()
+    return {
+        "lottery_type": lottery_type or "",
+        "available": bool(model_weights),
+        "warnings": warnings,
+        "history_count": int(len(history)),
+        "model_history_count": int(len(model_history)),
+        "latest_draw_no": latest.get("draw_no", "-") if latest else "-",
+        "latest_created_at": latest.get("created_at", "-") if latest else "-",
+        "latest_hypothesis": latest.get("next_hypothesis", "-") if latest else "-",
+        "model_weights": model_weights,
+        "recent5_weight_up": recent5_weight_up,
+        "recent10_weight_up": recent10_weight_up,
+        "recent5_weight_down": recent5_weight_down,
+        "recent10_weight_down": recent10_weight_down,
+        "long_useful": long_useful,
+        "long_weak": long_weak,
+        "weight_up_records": counter_to_records(recent10_weight_up),
+        "weight_down_records": counter_to_records(recent10_weight_down),
+    }
+
+
+def ai_improvement_weight_rows(summary):
+    summary = summary or {}
+    return pd.DataFrame(
+        [
+            {
+                "区分": "重み上げ候補",
+                "直近5回": format_model_counter(summary.get("recent5_weight_up", Counter())),
+                "直近10回": format_model_counter(summary.get("recent10_weight_up", Counter())),
+                "長期": format_model_counter(summary.get("long_useful", Counter())),
+            },
+            {
+                "区分": "重み下げ候補",
+                "直近5回": format_model_counter(summary.get("recent5_weight_down", Counter())),
+                "直近10回": format_model_counter(summary.get("recent10_weight_down", Counter())),
+                "長期": format_model_counter(summary.get("long_weak", Counter())),
+            },
+        ]
+    )
+
+
+def weighted_model_text(model_weights, positive=True, limit=5):
+    if not model_weights:
+        return "-"
+    items = [
+        (key, weight)
+        for key, weight in model_weights.items()
+        if (weight > 0 if positive else weight < 0)
+    ]
+    items = sorted(items, key=lambda item: abs(item[1]), reverse=True)[:limit]
+    if not items:
+        return "-"
+    parts = []
+    for key, weight in items:
+        _, label = canonical_model_from_name(key)
+        parts.append(f"{label or model_label(key)}({weight:+.3f})")
+    return " / ".join(parts)
+
+
+def score_row_model_adjustment(row, model_key, model_weight):
+    columns = AI_MODEL_SCORE_COLUMNS.get(canonical_model_key(model_key), ["総合スコア"])
+    values = []
+    for column in columns:
+        if column in row:
+            try:
+                values.append(float(row.get(column, 0) or 0))
+            except Exception:
+                values.append(0.0)
+    if not values:
+        return 0.0
+    return (sum(values) / len(values)) * float(model_weight)
+
+
+def apply_ai_improvement_weights(score_df, weight_summary):
+    if score_df is None or score_df.empty:
+        return pd.DataFrame()
+    weighted = score_df.copy()
+    if "総合スコア" not in weighted.columns:
+        weighted["総合スコア"] = pd.to_numeric(weighted.get("スコア", 0), errors="coerce").fillna(0)
+    model_weights = (weight_summary or {}).get("model_weights", {})
+    if not model_weights:
+        weighted["AI改善加点"] = 0.0
+        weighted["AI改善後スコア"] = pd.to_numeric(weighted["総合スコア"], errors="coerce").fillna(0).round(3)
+        weighted["AI改善理由"] = ""
+        weighted["AI改善関連モデル"] = ""
+        weighted["AI改善抑制モデル"] = ""
+        return weighted
+
+    adjustments = []
+    reasons = []
+    positive_models = []
+    negative_models = []
+    for _, row in weighted.iterrows():
+        raw_adjustment = 0.0
+        positive = []
+        negative = []
+        for model_key, model_weight in model_weights.items():
+            contribution = score_row_model_adjustment(row, model_key, model_weight)
+            raw_adjustment += contribution
+            _, label = canonical_model_from_name(model_key)
+            label = label or model_label(model_key)
+            if contribution >= 0.4:
+                positive.append(label)
+            elif contribution <= -0.4:
+                negative.append(label)
+        adjustment = round(clamp_float(raw_adjustment, -15.0, 15.0), 3)
+        adjustments.append(adjustment)
+        positive_models.append(" / ".join(dict.fromkeys(positive[:4])))
+        negative_models.append(" / ".join(dict.fromkeys(negative[:4])))
+        reason_parts = []
+        if positive:
+            reason_parts.append("加点: " + " / ".join(dict.fromkeys(positive[:4])))
+        if negative:
+            reason_parts.append("減点: " + " / ".join(dict.fromkeys(negative[:4])))
+        reasons.append("、".join(reason_parts))
+    weighted["AI改善加点"] = adjustments
+    weighted["AI改善後スコア"] = (
+        pd.to_numeric(weighted["総合スコア"], errors="coerce").fillna(0) + weighted["AI改善加点"]
+    ).clip(lower=0, upper=120).round(3)
+    weighted["AI改善理由"] = reasons
+    weighted["AI改善関連モデル"] = positive_models
+    weighted["AI改善抑制モデル"] = negative_models
+    weighted = weighted.sort_values(["AI改善後スコア", "総合スコア", "数字"], ascending=[False, False, True]).reset_index(drop=True)
+    weighted["AI改善順位"] = range(1, len(weighted) + 1)
+    return weighted
 
 
 def primary_support(number, support_map):

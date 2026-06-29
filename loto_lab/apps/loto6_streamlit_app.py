@@ -28,8 +28,11 @@ from arl_research_engine import (
     RESEARCH_CYCLE_COLUMNS,
     VIDEO_HYPOTHESIS_COLUMNS,
     add_verification_metrics,
+    ai_improvement_weight_rows,
+    apply_ai_improvement_weights,
     append_winning_condition_history,
     build_ai_improvement_summary,
+    build_ai_improvement_weight_summary,
     build_condition_success_table,
     build_contribution_ranking,
     build_contribution_rows,
@@ -48,6 +51,7 @@ from arl_research_engine import (
     merge_contribution_rows,
     merge_research_cycle_rows,
     parse_json_text,
+    weighted_model_text,
 )
 
 
@@ -108,6 +112,18 @@ SCORE_DISPLAY_COLUMNS = [
     "未出現回数",
     "ボーナス出現回数",
     "更新日時",
+]
+AI_SCORE_DISPLAY_COLUMNS = [
+    "AI改善順位",
+    "数字",
+    "AI改善後スコア",
+    "AI改善加点",
+    "総合スコア",
+    "出現頻度スコア",
+    "直近傾向スコア",
+    "未出現期間スコア",
+    "ボーナス傾向スコア",
+    "AI改善理由",
 ]
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
@@ -240,6 +256,12 @@ def score_display_df(score_df):
     if score_df.empty:
         return pd.DataFrame(columns=SCORE_DISPLAY_COLUMNS)
     return score_df.reindex(columns=SCORE_DISPLAY_COLUMNS)
+
+
+def ai_score_display_df(score_df):
+    if score_df.empty:
+        return pd.DataFrame(columns=AI_SCORE_DISPLAY_COLUMNS)
+    return score_df.reindex(columns=AI_SCORE_DISPLAY_COLUMNS)
 
 
 def read_active_model_setting():
@@ -1045,6 +1067,52 @@ def build_score_number_reasons(numbers, score_df, low_threshold=21):
     return pd.DataFrame(rows)
 
 
+def build_ai_weighted_number_reasons(numbers, score_df, low_threshold=21):
+    rows = []
+    row_map = {int(row["数字"]): row for _, row in score_df.iterrows()}
+    odd_count = sum(number % 2 for number in numbers)
+    low_count = sum(number <= low_threshold for number in numbers)
+    for number in numbers:
+        row = row_map.get(int(number), {})
+        rank = int(row.get("順位", 0) or 0)
+        ai_rank = int(row.get("AI改善順位", 0) or 0)
+        reasons = []
+        if ai_rank and ai_rank <= 10:
+            reasons.append("AI改善反映後の候補上位")
+        if rank and rank <= 10:
+            reasons.append("候補スコア上位")
+        if float(row.get("直近傾向スコア", 0) or 0) >= 70:
+            reasons.append("直近傾向スコアが高い")
+        if float(row.get("未出現期間スコア", 0) or 0) >= 70:
+            reasons.append("未出現期間スコアが高い")
+        positive_models = str(row.get("AI改善関連モデル", "") or "").strip()
+        negative_models = str(row.get("AI改善抑制モデル", "") or "").strip()
+        ai_adjustment = float(row.get("AI改善加点", 0) or 0)
+        if positive_models:
+            reasons.append(f"AI改善履歴で{positive_models}の重みが上がっているため採用")
+        if negative_models and ai_adjustment <= -0.1:
+            reasons.append(f"AI改善履歴で{negative_models}は抑制対象だが、全体バランスで残す")
+        if ai_adjustment > 0.1:
+            reasons.append("直近の当選条件分析で有効モデルに関連")
+        if ai_rank > 6 and odd_count in (2, 3, 4):
+            reasons.append("奇数偶数バランス調整のため採用")
+        if ai_rank > 6 and low_count in (2, 3, 4):
+            reasons.append("高低バランス調整のため採用")
+        if not reasons:
+            reasons.append("候補スコアとAI改善重みの総合評価で採用")
+        rows.append(
+            {
+                "数字": f"{int(number):02d}",
+                "候補順位": rank if rank else "-",
+                "AI改善順位": ai_rank if ai_rank else "-",
+                "AI改善後スコア": round(float(row.get("AI改善後スコア", 0) or 0), 3),
+                "AI改善加点": round(ai_adjustment, 3),
+                "主な理由": " / ".join(dict.fromkeys(reasons)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def generate_next_score_prediction_picks(score_df, results, draw_size=6, pick_count=3):
     if score_df.empty or results.empty:
         return []
@@ -1102,6 +1170,84 @@ def generate_next_score_prediction_picks(score_df, results, draw_size=6, pick_co
                 "numbers": numbers,
                 "reason": (
                     "候補スコアCSVの総合スコアと特徴スコアを使い、"
+                    f"奇数{summary['odd']}・偶数{summary['even']}、低数字{summary['low']}・高数字{summary['high']}、"
+                    f"合計{summary['sum']}を過去平均{target_sum:.1f}付近に調整。"
+                ),
+                "number_reasons": reason_table,
+            }
+        )
+        used_numbers.update(numbers)
+        if len(picks) == pick_count:
+            break
+    return picks
+
+
+def generate_ai_weighted_prediction_picks(score_df, results, weight_summary, draw_size=6, pick_count=3):
+    if score_df.empty or results.empty:
+        return []
+    weighted_df = apply_ai_improvement_weights(score_df, weight_summary)
+    if weighted_df.empty or not (weight_summary or {}).get("available"):
+        picks = generate_next_score_prediction_picks(score_df, results, draw_size, pick_count)
+        for pick in picks:
+            pick["reason"] = "AI改善履歴が不足しているため、通常の候補スコア活用予測にフォールバックしています。" + pick["reason"]
+        return picks
+
+    weighted_df = weighted_df.copy().sort_values(["AI改善後スコア", "総合スコア", "数字"], ascending=[False, False, True]).reset_index(drop=True)
+    pool = weighted_df.head(22)
+    row_map = {int(row["数字"]): row for _, row in weighted_df.iterrows()}
+    candidate_numbers = [int(number) for number in pool["数字"].tolist()]
+    top_10 = set(int(number) for number in weighted_df.head(10)["数字"].tolist())
+
+    sums = results[NUMBER_COLUMNS].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+    target_sum = float(sums.mean())
+    sum_std = float(sums.std()) if len(sums) > 1 else 25.0
+    if pd.isna(sum_std) or sum_std <= 0:
+        sum_std = 25.0
+
+    candidates = []
+    for combo in combinations(candidate_numbers, draw_size):
+        numbers = tuple(sorted(combo))
+        odd = sum(number % 2 for number in numbers)
+        low = sum(number <= 21 for number in numbers)
+        consecutive = count_consecutive_pairs(numbers)
+        top_count = len(set(numbers) & top_10)
+        if odd not in (2, 3, 4) or low not in (2, 3, 4) or consecutive > 1:
+            continue
+        if top_count >= draw_size:
+            continue
+        total = sum(numbers)
+        score_total = sum(float(row_map[number].get("AI改善後スコア", 0) or 0) for number in numbers)
+        feature_total = sum(
+            float(row_map[number].get("出現頻度スコア", 0) or 0) * 0.05
+            + float(row_map[number].get("直近傾向スコア", 0) or 0) * 0.06
+            + float(row_map[number].get("未出現期間スコア", 0) or 0) * 0.05
+            + max(float(row_map[number].get("AI改善加点", 0) or 0), 0) * 0.8
+            for number in numbers
+        )
+        sum_penalty = abs(total - target_sum) / max(sum_std, 1) * 10
+        balance_penalty = abs(odd - 3) * 4 + abs(low - 3) * 4 + consecutive * 6
+        diversity_bonus = min(draw_size - top_count, 2) * 5
+        candidates.append((score_total + feature_total + diversity_bonus - sum_penalty - balance_penalty, numbers))
+
+    if not candidates:
+        fallback = tuple(sorted(candidate_numbers[:draw_size]))
+        candidates = [(0, fallback)]
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    picks = []
+    used_numbers = set()
+    for _, numbers in candidates:
+        if picks and len(set(numbers) & used_numbers) > 3:
+            continue
+        reason_table = build_ai_weighted_number_reasons(numbers, weighted_df)
+        summary = balance_summary(numbers)
+        picks.append(
+            {
+                "numbers": numbers,
+                "reason": (
+                    "候補スコアCSVにAI改善履歴のモデル重みを反映し、"
+                    f"重み上げ: {weighted_model_text(weight_summary.get('model_weights', {}), True)}、"
+                    f"重み下げ: {weighted_model_text(weight_summary.get('model_weights', {}), False)}を加味。"
                     f"奇数{summary['odd']}・偶数{summary['even']}、低数字{summary['low']}・高数字{summary['high']}、"
                     f"合計{summary['sum']}を過去平均{target_sum:.1f}付近に調整。"
                 ),
@@ -1810,6 +1956,45 @@ def render_next_score_prediction(score_df, results, target_round):
         st.dataframe(pick["number_reasons"], width="stretch", hide_index=True)
 
 
+def render_ai_improvement_weight_summary(weight_summary):
+    st.subheader("AI改善重み")
+    for warning in (weight_summary or {}).get("warnings", []):
+        st.warning(warning)
+    cols = st.columns(4)
+    cols[0].metric("AI改善履歴", f"{int((weight_summary or {}).get('history_count', 0))}件")
+    cols[1].metric("モデル履歴", f"{int((weight_summary or {}).get('model_history_count', 0))}件")
+    cols[2].metric("対象回", str((weight_summary or {}).get("latest_draw_no", "-")))
+    cols[3].metric("最終更新", str((weight_summary or {}).get("latest_created_at", "-")))
+    st.dataframe(ai_improvement_weight_rows(weight_summary), width="stretch", hide_index=True)
+    hypothesis = str((weight_summary or {}).get("latest_hypothesis", "-") or "-")
+    st.write(f"直近の改善仮説: {hypothesis}")
+    if not (weight_summary or {}).get("available"):
+        st.info("AI改善重みが十分でないため、AI改善反映予測は通常の候補スコア活用予測にフォールバックします。")
+
+
+def render_ai_weighted_prediction(score_df, results, target_round, weight_summary):
+    st.subheader("AI改善反映予測")
+    weighted_df = apply_ai_improvement_weights(score_df, weight_summary)
+    if not weighted_df.empty:
+        st.markdown("**AI改善反映後の候補上位**")
+        st.dataframe(ai_score_display_df(weighted_df).head(10), width="stretch", hide_index=True)
+    picks = generate_ai_weighted_prediction_picks(score_df, results, weight_summary)
+    if not picks:
+        st.info("候補スコアCSVと抽せん履歴が揃うと、AI改善反映予測を表示します。")
+        return
+    if st.button("AI改善反映予測を保存", key="loto6_ai_weighted_prediction_save"):
+        saved_count = save_prediction_picks(picks, target_round, "AI改善反映予測")
+        if saved_count:
+            st.success(f"AI改善反映予測を predictions.csv に {saved_count}件保存しました。")
+        else:
+            st.info("AI改善反映予測の同一予想は保存済みです。")
+    for index, pick in enumerate(picks, start=1):
+        numbers = " - ".join(f"{number:02d}" for number in pick["numbers"])
+        st.markdown(f"**AI改善反映予測 {index}: {numbers}**")
+        st.write(f"理由: {pick['reason']}")
+        st.dataframe(pick["number_reasons"], width="stretch", hide_index=True)
+
+
 def render_winning_condition_history():
     history, model_history = load_winning_condition_history(AI_IMPROVEMENT_DIR, "loto6")
     if history.empty:
@@ -2073,6 +2258,7 @@ if st.session_state.get("loto6_manual_prize_message"):
 results = merge_official_results(read_csv(RESULTS_CSV, RESULT_COLUMNS))
 sets = read_csv(SETS_CSV, SET_COLUMNS)
 scores, score_warnings = load_next_score_csv(SCORES_CSV, 43)
+ai_weight_summary = build_ai_improvement_weight_summary(AI_IMPROVEMENT_DIR, "loto6")
 
 if results.empty:
     st.info("抽せん結果CSVがまだありません。サイドバーから新しい当選結果を登録してください。")
@@ -2101,12 +2287,14 @@ st.subheader("次回候補スコア 上位")
 top_count = st.selectbox("表示件数", [10, 20, 30, 43], index=1)
 for warning in score_warnings:
     st.warning(warning)
+render_ai_improvement_weight_summary(ai_weight_summary)
 if scores.empty:
     st.info("候補スコアCSVがありません。上の「手元のCSVで再分析」から作成できます。")
 else:
     st.dataframe(score_display_df(scores).head(top_count), width="stretch", hide_index=True)
     render_prediction_picks(scores, results, latest_round + 1)
     render_next_score_prediction(scores, results, latest_round + 1)
+    render_ai_weighted_prediction(scores, results, latest_round + 1, ai_weight_summary)
 
 render_prediction_lab()
 
