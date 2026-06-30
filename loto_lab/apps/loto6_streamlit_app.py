@@ -2147,16 +2147,25 @@ def render_prediction_lab():
             st.write(f"次回の仮説: {latest_report['次回の仮説']}")
     with lab_tabs[2]:
         ranking = build_contribution_ranking(contributions)
-        dashboard = build_model_dashboard(reports)
+        _, model_history = load_winning_condition_history(AI_IMPROVEMENT_DIR, "loto6")
+        dashboard = build_model_dashboard(
+            reports,
+            draw_size=6,
+            model_history=model_history,
+            include_target_models=True,
+        )
         if ranking.empty and dashboard.empty:
             st.info("モデル貢献度は、予想と結果を照合すると作成されます。")
         else:
-            st.markdown("**モデル貢献度ランキング**")
-            st.dataframe(ranking, width="stretch", hide_index=True)
-            st.markdown("**モデル別成績**")
+            st.markdown("**モデル成績ランキング**")
             st.dataframe(dashboard, width="stretch", hide_index=True)
-            with st.expander("数字別モデル貢献度ログ"):
-                st.dataframe(contributions.sort_values(["開催回", "予想ID"], ascending=[False, True]), width="stretch", hide_index=True)
+            st.markdown("**モデル貢献度ランキング**")
+            if ranking.empty:
+                st.info("貢献度ランキングは、的中数字の要因分析後に表示されます。")
+            else:
+                st.dataframe(ranking, width="stretch", hide_index=True)
+                with st.expander("数字別モデル貢献度ログ"):
+                    st.dataframe(contributions.sort_values(["開催回", "予想ID"], ascending=[False, True]), width="stretch", hide_index=True)
     with lab_tabs[3]:
         condition_df = build_condition_success_table(reports, number_max=43)
         if condition_df.empty:

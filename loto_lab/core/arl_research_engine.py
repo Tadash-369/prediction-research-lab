@@ -1403,9 +1403,110 @@ def add_verification_metrics(reports, draw_size):
     return df
 
 
-def build_model_dashboard(reports, match_column="本数字一致数", model_column="使用モデル", draw_size=None):
+def ranking_target_models():
+    labels = list(ARL_MODEL_LABELS.values())
+    for label in ("候補スコア活用予測", "AI改善反映予測"):
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def ranking_model_type(model_name):
+    if model_name in ("候補スコア活用予測", "AI改善反映予測"):
+        return "予測方式"
+    if model_name == ARL_MODEL_LABELS.get("random_baseline"):
+        return "基準モデル"
+    if model_name in ARL_MODEL_LABELS.values():
+        return "分析モデル"
+    return "保存済み予測"
+
+
+def safe_mean(series):
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.mean())
+
+
+def safe_max(series):
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.max())
+
+
+def rounded_or_none(value, digits=3):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return round(float(value), digits)
+
+
+def model_history_ai_scores(model_history):
+    if model_history is None or model_history.empty or "model_name" not in model_history or "matched_count" not in model_history:
+        return {}
+    df = model_history.copy()
+    df["matched_count"] = pd.to_numeric(df["matched_count"], errors="coerce")
+    grouped = df.dropna(subset=["matched_count"]).groupby("model_name")["matched_count"].mean()
+    return {str(model): float(score) for model, score in grouped.items()}
+
+
+def build_model_dashboard(
+    reports,
+    match_column="本数字一致数",
+    model_column="使用モデル",
+    draw_size=None,
+    model_history=None,
+    include_target_models=False,
+):
+    columns = [
+        "順位",
+        "モデル",
+        "種別",
+        "検証数",
+        "平均一致数",
+        "最大一致数",
+        "直近5回成績",
+        "直近10回成績",
+        "長期成績",
+        "安定性",
+        "AI改善後成績",
+        "改善前後の差",
+        "勝率",
+        "期待値",
+        "総合評価",
+        "状態",
+    ]
+    target_models = ranking_target_models() if include_target_models else []
     if reports is None or reports.empty or match_column not in reports:
-        return pd.DataFrame(columns=["モデル", "平均一致数", "安定性", "直近成績", "長期成績", "期待値", "最大一致数", "全期間"])
+        if not target_models:
+            return pd.DataFrame(columns=columns)
+        rows = [
+            {
+                "順位": "-",
+                "モデル": model,
+                "種別": ranking_model_type(model),
+                "検証数": 0,
+                "平均一致数": None,
+                "最大一致数": None,
+                "直近5回成績": None,
+                "直近10回成績": None,
+                "長期成績": None,
+                "安定性": None,
+                "AI改善後成績": None,
+                "改善前後の差": None,
+                "勝率": None,
+                "期待値": None,
+                "総合評価": None,
+                "状態": "検証待ち",
+            }
+            for model in target_models
+        ]
+        return pd.DataFrame(rows, columns=columns)
     if draw_size is None:
         lengths = reports["予想番号"].map(lambda value: len(parse_numbers(value))) if "予想番号" in reports else pd.Series([0])
         draw_size = int(lengths.max()) if len(lengths) and int(lengths.max()) > 0 else 1
@@ -1418,23 +1519,98 @@ def build_model_dashboard(reports, match_column="本数字一致数", model_colu
     if "開催回" in df:
         df["開催回"] = pd.to_numeric(df["開催回"], errors="coerce").fillna(0)
         df = df.sort_values("開催回")
+    ai_scores = model_history_ai_scores(model_history)
+    if "AI改善反映予測" in set(df[model_column].astype(str)):
+        ai_scores["AI改善反映予測"] = float(df[df[model_column].astype(str) == "AI改善反映予測"][match_column].mean())
+    base_score_method_mean = None
+    if "候補スコア活用予測" in set(df[model_column].astype(str)):
+        base_score_method_mean = float(df[df[model_column].astype(str) == "候補スコア活用予測"][match_column].mean())
     rows = []
-    for model, model_rows in df.groupby(model_column):
-        match_std = float(model_rows[match_column].std()) if len(model_rows) > 1 else 0.0
-        stability = round(max(0.0, 100.0 - match_std * 25), 1)
+    all_models = list(dict.fromkeys(target_models + sorted(df[model_column].astype(str).unique().tolist())))
+    for model in all_models:
+        model_rows = df[df[model_column].astype(str) == str(model)].copy()
+        if model_rows.empty:
+            rows.append(
+                {
+                    "順位": "-",
+                    "モデル": model,
+                    "種別": ranking_model_type(model),
+                    "検証数": 0,
+                    "平均一致数": None,
+                    "最大一致数": None,
+                    "直近5回成績": None,
+                    "直近10回成績": None,
+                    "長期成績": None,
+                    "安定性": None,
+                    "AI改善後成績": rounded_or_none(ai_scores.get(str(model))),
+                    "改善前後の差": None,
+                    "勝率": None,
+                    "期待値": None,
+                    "総合評価": None,
+                    "状態": "検証待ち",
+                }
+            )
+            continue
+        matches = pd.to_numeric(model_rows[match_column], errors="coerce").fillna(0)
+        match_std = float(matches.std()) if len(model_rows) > 1 else 0.0
+        stability = max(0.0, 100.0 - (match_std / max(draw_size, 1) * 100))
+        avg_match = float(matches.mean())
+        recent5 = float(matches.tail(5).mean())
+        recent10 = float(matches.tail(10).mean())
+        long_score = avg_match
+        ai_after = ai_scores.get(str(model))
+        previous_rows = matches.iloc[:-5]
+        previous_avg = float(previous_rows.mean()) if len(previous_rows) else None
+        if model == "AI改善反映予測" and base_score_method_mean is not None:
+            improvement_delta = avg_match - base_score_method_mean
+        elif ai_after is not None:
+            improvement_delta = ai_after - long_score
+        elif previous_avg is not None:
+            improvement_delta = recent5 - previous_avg
+        else:
+            improvement_delta = 0.0
+        win_rate = safe_mean(model_rows["勝率"]) if "勝率" in model_rows else None
+        expected_value = safe_mean(model_rows["期待値"]) if "期待値" in model_rows else None
+        evaluation_score = (
+            avg_match * 35
+            + recent5 * 12
+            + recent10 * 8
+            + stability / 100 * 12
+            + (win_rate or 0) / 100 * 10
+            + (expected_value or 0) * 12
+            + max(improvement_delta, -1.0) * 6
+        )
         rows.append(
             {
+                "順位": 0,
                 "モデル": model,
-                "平均一致数": round(float(model_rows[match_column].mean()), 3),
-                "安定性": stability,
-                "直近成績": round(float(model_rows.tail(10)[match_column].mean()), 3),
-                "長期成績": round(float(model_rows[match_column].mean()), 3),
-                "期待値": round(float(model_rows["期待値"].mean()), 3),
-                "最大一致数": int(model_rows[match_column].max()),
-                "全期間": int(len(model_rows)),
+                "種別": ranking_model_type(model),
+                "検証数": int(len(model_rows)),
+                "平均一致数": rounded_or_none(avg_match),
+                "最大一致数": int(safe_max(matches) or 0),
+                "直近5回成績": rounded_or_none(recent5),
+                "直近10回成績": rounded_or_none(recent10),
+                "長期成績": rounded_or_none(long_score),
+                "安定性": rounded_or_none(stability, 1),
+                "AI改善後成績": rounded_or_none(ai_after),
+                "改善前後の差": rounded_or_none(improvement_delta),
+                "勝率": rounded_or_none(win_rate, 1),
+                "期待値": rounded_or_none(expected_value),
+                "総合評価": rounded_or_none(evaluation_score, 3),
+                "状態": "評価中",
             }
         )
-    return pd.DataFrame(rows).sort_values(["平均一致数", "安定性", "期待値"], ascending=False)
+    dashboard = pd.DataFrame(rows, columns=columns)
+    if dashboard.empty:
+        return dashboard
+    dashboard["_sort_score"] = pd.to_numeric(dashboard["総合評価"], errors="coerce").fillna(-1)
+    dashboard["_sort_avg"] = pd.to_numeric(dashboard["平均一致数"], errors="coerce").fillna(-1)
+    dashboard["_sort_stability"] = pd.to_numeric(dashboard["安定性"], errors="coerce").fillna(-1)
+    dashboard = dashboard.sort_values(["_sort_score", "_sort_avg", "_sort_stability", "モデル"], ascending=[False, False, False, True]).reset_index(drop=True)
+    ranked_mask = dashboard["検証数"].fillna(0).astype(int) > 0
+    dashboard.loc[ranked_mask, "順位"] = range(1, int(ranked_mask.sum()) + 1)
+    dashboard.loc[~ranked_mask, "順位"] = "-"
+    return dashboard.drop(columns=["_sort_score", "_sort_avg", "_sort_stability"])
 
 
 def build_condition_success_table(reports, number_max, match_column="本数字一致数", success_threshold=3):

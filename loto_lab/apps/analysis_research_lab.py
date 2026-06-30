@@ -340,6 +340,7 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
     display_dataframe(build_research_flow_table(), width="stretch", hide_index=True)
 
     lottery_type = "loto6" if "ロト6" in name else "loto7"
+    _, model_history = load_winning_condition_history(AI_IMPROVEMENT_DIR, lottery_type)
     tabs = st.tabs(["研究サイクル", "モデル別成績", "モデル貢献度", "条件別成功率", "AI改善レポート", "当選条件分析", "動画仮説"])
     with tabs[0]:
         if cycles.empty:
@@ -347,7 +348,12 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
         else:
             display_dataframe(cycles.sort_values(["開催回", "予想ID"], ascending=[False, True]), width="stretch", hide_index=True)
     with tabs[1]:
-        dashboard = build_model_dashboard(reports, draw_size=draw_size)
+        dashboard = build_model_dashboard(
+            reports,
+            draw_size=draw_size,
+            model_history=model_history,
+            include_target_models=True,
+        )
         if dashboard.empty:
             st.info(f"{name}のモデル別成績は、予想と結果の照合後に表示されます。")
         else:
