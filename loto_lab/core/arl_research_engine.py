@@ -151,6 +151,44 @@ MODEL_IMPROVEMENT_HISTORY_COLUMNS = [
     "created_at",
 ]
 
+PURCHASE_COLUMNS = [
+    "lottery_type",
+    "draw_no",
+    "purchase_date",
+    "numbers",
+    "prediction_method",
+    "model_name",
+    "ticket_count",
+    "cost",
+    "result_numbers",
+    "bonus_numbers",
+    "matched_count",
+    "bonus_matched_count",
+    "prize_rank",
+    "payout",
+    "profit_loss",
+    "status",
+    "notes",
+    "created_at",
+]
+
+PURCHASE_DISPLAY_COLUMNS = [
+    "開催回",
+    "購入日",
+    "購入番号",
+    "予測方式",
+    "モデル名",
+    "口数",
+    "購入金額",
+    "一致数",
+    "BONUS一致数",
+    "当選等級",
+    "払戻金",
+    "収支",
+    "状態",
+    "メモ",
+]
+
 
 def canonical_model_key(model_key):
     return MODEL_ALIASES.get(str(model_key), str(model_key))
@@ -180,6 +218,31 @@ def parse_numbers(value, number_max=None):
         if number_max is None or 1 <= number <= number_max:
             numbers.append(number)
     return sorted(numbers)
+
+
+def validate_purchase_numbers(value, draw_size, number_max):
+    raw_text = str(value or "").strip()
+    if not raw_text:
+        return [], ["購入番号を入力してください。"]
+    tokens = [part for part in raw_text.replace(",", "-").replace(" ", "-").replace("　", "-").split("-") if part != ""]
+    numbers = []
+    errors = []
+    for token in tokens:
+        number = safe_int(token, None)
+        if number is None:
+            errors.append(f"{token} は数字として読み取れません。")
+            continue
+        if not 1 <= number <= number_max:
+            errors.append(f"{number:02d} は範囲外です。1〜{number_max}で入力してください。")
+            continue
+        numbers.append(number)
+    duplicates = sorted(number for number, count in Counter(numbers).items() if count >= 2)
+    if duplicates:
+        errors.append("重複している数字があります: " + numbers_to_text(duplicates))
+    unique_numbers = sorted(set(numbers))
+    if len(unique_numbers) != draw_size:
+        errors.append(f"{draw_size}個の数字を入力してください。現在は{len(unique_numbers)}個です。")
+    return unique_numbers, errors
 
 
 def clean_number_rows(number_rows, number_max):
@@ -1401,6 +1464,243 @@ def add_verification_metrics(reports, draw_size):
         existing = pd.to_numeric(df[column], errors="coerce") if column in df else pd.Series([pd.NA] * len(df), index=df.index)
         df[column] = existing.fillna(values)
     return df
+
+
+def ensure_purchase_columns(purchases):
+    if purchases is None or purchases.empty:
+        return pd.DataFrame(columns=PURCHASE_COLUMNS)
+    df = purchases.copy()
+    for column in PURCHASE_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+    return df.reindex(columns=PURCHASE_COLUMNS)
+
+
+def purchase_grade(lottery_type, matched_count, bonus_matched_count):
+    lottery_type = str(lottery_type)
+    matched_count = safe_int(matched_count)
+    bonus_matched_count = safe_int(bonus_matched_count)
+    if lottery_type == "loto7":
+        if matched_count == 7:
+            return "1等"
+        if matched_count == 6 and bonus_matched_count >= 1:
+            return "2等"
+        if matched_count == 6:
+            return "3等"
+        if matched_count == 5:
+            return "4等"
+        if matched_count == 4:
+            return "5等"
+        if matched_count == 3 and bonus_matched_count >= 1:
+            return "6等"
+        return "該当なし"
+    if matched_count == 6:
+        return "1等"
+    if matched_count == 5 and bonus_matched_count >= 1:
+        return "2等"
+    if matched_count == 5:
+        return "3等"
+    if matched_count == 4:
+        return "4等"
+    if matched_count == 3:
+        return "5等"
+    return "該当なし"
+
+
+def result_numbers_from_row(result_row, lottery_type):
+    if result_row is None:
+        return [], []
+    if lottery_type == "loto7":
+        main_columns = [f"第{index}数字" for index in range(1, 8)]
+        bonus_columns = ["BONUS数字1", "BONUS数字2"]
+        number_max = 37
+    else:
+        main_columns = [f"第{index}数字" for index in range(1, 7)]
+        bonus_columns = ["BONUS数字"]
+        number_max = 43
+    main_numbers = [safe_int(result_row.get(column), None) for column in main_columns if safe_int(result_row.get(column), None) is not None]
+    bonus_numbers = [safe_int(result_row.get(column), None) for column in bonus_columns if safe_int(result_row.get(column), None) is not None]
+    if not main_numbers and "本数字" in result_row:
+        main_numbers = parse_numbers(result_row.get("本数字"), number_max)
+    if not bonus_numbers and "ボーナス数字" in result_row:
+        bonus_numbers = parse_numbers(result_row.get("ボーナス数字"), number_max)
+    return sorted(main_numbers), sorted(bonus_numbers)
+
+
+def numeric_money(value, default=None):
+    try:
+        text = str(value).replace(",", "").replace("円", "").strip()
+        if text == "" or text.lower() in {"nan", "none"}:
+            return default
+        return float(text)
+    except Exception:
+        return default
+
+
+def prize_payout_from_result(result_row, prize_rank, ticket_count=1, manual_payout=None):
+    if prize_rank in ("", "-", "該当なし", "結果待ち"):
+        return 0.0, True
+    manual_value = numeric_money(manual_payout, None)
+    column = f"{prize_rank}賞金"
+    prize_value = numeric_money(result_row.get(column, "") if result_row is not None else "", None)
+    if prize_value is None:
+        return (manual_value, True) if manual_value is not None else ("", False)
+    return float(prize_value) * max(safe_int(ticket_count, 1), 1), True
+
+
+def evaluate_purchase_history(purchases, results, lottery_type, draw_size, number_max):
+    purchases = ensure_purchase_columns(purchases)
+    if purchases.empty:
+        return purchases
+    game_rows = purchases[purchases["lottery_type"].astype(str) == str(lottery_type)].copy()
+    other_rows = purchases[purchases["lottery_type"].astype(str) != str(lottery_type)].copy()
+    if game_rows.empty:
+        return purchases
+
+    result_df = results.copy() if results is not None else pd.DataFrame()
+    if not result_df.empty and "開催回" in result_df.columns:
+        result_df["開催回"] = pd.to_numeric(result_df["開催回"], errors="coerce").fillna(0).astype(int)
+
+    evaluated_rows = []
+    for _, row in game_rows.iterrows():
+        updated = row.to_dict()
+        draw_no = safe_int(updated.get("draw_no"))
+        ticket_numbers = parse_numbers(updated.get("numbers"), number_max)
+        ticket_count = max(safe_int(updated.get("ticket_count"), 1), 1)
+        cost = numeric_money(updated.get("cost"), 0.0) or 0.0
+        result_row = None
+        if not result_df.empty and "開催回" in result_df.columns:
+            matches = result_df[result_df["開催回"] == int(draw_no)]
+            if not matches.empty:
+                result_row = matches.tail(1).iloc[0]
+        if result_row is None:
+            updated.update(
+                {
+                    "result_numbers": "",
+                    "bonus_numbers": "",
+                    "matched_count": "",
+                    "bonus_matched_count": "",
+                    "prize_rank": "結果待ち",
+                    "payout": "",
+                    "profit_loss": "",
+                    "status": "結果待ち",
+                }
+            )
+            evaluated_rows.append(updated)
+            continue
+        result_numbers, bonus_numbers = result_numbers_from_row(result_row, lottery_type)
+        matched = sorted(set(ticket_numbers) & set(result_numbers))
+        bonus_matched = sorted(set(ticket_numbers) & set(bonus_numbers))
+        prize_rank = purchase_grade(lottery_type, len(matched), len(bonus_matched))
+        payout, payout_confirmed = prize_payout_from_result(result_row, prize_rank, ticket_count, updated.get("payout"))
+        if payout_confirmed:
+            payout_value = numeric_money(payout, 0.0) or 0.0
+            profit_loss = payout_value - cost
+            status = "未当選" if prize_rank == "該当なし" else "照合済み"
+        else:
+            payout_value = ""
+            profit_loss = ""
+            status = "払戻未確定"
+        updated.update(
+            {
+                "result_numbers": numbers_to_text(result_numbers),
+                "bonus_numbers": numbers_to_text(bonus_numbers),
+                "matched_count": len(matched),
+                "bonus_matched_count": len(bonus_matched),
+                "prize_rank": prize_rank,
+                "payout": payout_value,
+                "profit_loss": profit_loss,
+                "status": status,
+            }
+        )
+        evaluated_rows.append(updated)
+    combined = pd.concat([other_rows, pd.DataFrame(evaluated_rows)], ignore_index=True)
+    return ensure_purchase_columns(combined)
+
+
+def purchase_display_df(purchases, lottery_type=None):
+    purchases = ensure_purchase_columns(purchases)
+    if lottery_type:
+        purchases = purchases[purchases["lottery_type"].astype(str) == str(lottery_type)].copy()
+    if purchases.empty:
+        return pd.DataFrame(columns=PURCHASE_DISPLAY_COLUMNS)
+    display = pd.DataFrame(
+        {
+            "開催回": pd.to_numeric(purchases["draw_no"], errors="coerce").fillna(0).astype(int),
+            "購入日": purchases["purchase_date"],
+            "購入番号": purchases["numbers"],
+            "予測方式": purchases["prediction_method"],
+            "モデル名": purchases["model_name"],
+            "口数": pd.to_numeric(purchases["ticket_count"], errors="coerce").fillna(0).astype(int),
+            "購入金額": pd.to_numeric(purchases["cost"], errors="coerce").fillna(0).round(0).astype(int),
+            "一致数": purchases["matched_count"],
+            "BONUS一致数": purchases["bonus_matched_count"],
+            "当選等級": purchases["prize_rank"],
+            "払戻金": purchases["payout"],
+            "収支": purchases["profit_loss"],
+            "状態": purchases["status"].replace("", "未照合"),
+            "メモ": purchases["notes"],
+        }
+    )
+    return display.sort_values(["開催回", "購入日"], ascending=[False, False]).reset_index(drop=True)
+
+
+def build_purchase_summary(purchases, lottery_type=None):
+    purchases = ensure_purchase_columns(purchases)
+    if lottery_type:
+        purchases = purchases[purchases["lottery_type"].astype(str) == str(lottery_type)].copy()
+    total_cost = float(pd.to_numeric(purchases.get("cost", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not purchases.empty else 0.0
+    total_payout = float(pd.to_numeric(purchases.get("payout", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not purchases.empty else 0.0
+    profit_loss = total_payout - total_cost
+    return_rate = round(total_payout / total_cost * 100, 1) if total_cost else 0.0
+    hit_count = 0
+    max_payout = 0.0
+    best_method = "-"
+    if not purchases.empty:
+        prize = purchases["prize_rank"].astype(str)
+        hit_count = int((~prize.isin(["", "nan", "該当なし", "結果待ち"])).sum())
+        max_payout = float(pd.to_numeric(purchases["payout"], errors="coerce").fillna(0).max())
+        method_summary = build_purchase_group_summary(purchases, "prediction_method", "予測方式")
+        if not method_summary.empty:
+            best_method = str(method_summary.iloc[0]["予測方式"])
+    return {
+        "総購入金額": total_cost,
+        "総払戻金": total_payout,
+        "累計収支": profit_loss,
+        "回収率": return_rate,
+        "的中回数": hit_count,
+        "最高払戻金": max_payout,
+        "実戦成績が良い予測方式": best_method,
+    }
+
+
+def build_purchase_group_summary(purchases, group_column, label_column):
+    purchases = ensure_purchase_columns(purchases)
+    columns = [label_column, "件数", "総購入金額", "総払戻金", "収支", "回収率", "的中回数", "最高払戻金"]
+    if purchases.empty or group_column not in purchases.columns:
+        return pd.DataFrame(columns=columns)
+    df = purchases.copy()
+    df[group_column] = df[group_column].fillna("").replace("", "未記録")
+    df["cost"] = pd.to_numeric(df["cost"], errors="coerce").fillna(0)
+    df["payout"] = pd.to_numeric(df["payout"], errors="coerce").fillna(0)
+    hit_mask = ~df["prize_rank"].astype(str).isin(["", "nan", "該当なし", "結果待ち"])
+    rows = []
+    for value, group in df.groupby(group_column):
+        cost = float(group["cost"].sum())
+        payout = float(group["payout"].sum())
+        rows.append(
+            {
+                label_column: value,
+                "件数": int(len(group)),
+                "総購入金額": int(round(cost)),
+                "総払戻金": int(round(payout)),
+                "収支": int(round(payout - cost)),
+                "回収率": round(payout / cost * 100, 1) if cost else 0.0,
+                "的中回数": int(hit_mask.loc[group.index].sum()),
+                "最高払戻金": int(round(float(group["payout"].max()))),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns).sort_values(["収支", "回収率", "総払戻金"], ascending=False).reset_index(drop=True)
 
 
 def ranking_target_models():

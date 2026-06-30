@@ -21,6 +21,7 @@ from arl_research_engine import (
     CONTRIBUTION_COLUMNS,
     FUTURE_LOTO_MODEL_LABELS,
     LOTO_MODEL_LABELS,
+    PURCHASE_COLUMNS,
     PROJECT_ENGLISH_NAME,
     PROJECT_JAPANESE_NAME,
     PROJECT_SHORT_NAME,
@@ -32,7 +33,9 @@ from arl_research_engine import (
     build_condition_success_table,
     build_contribution_ranking,
     build_model_dashboard,
+    build_purchase_summary,
     build_research_flow_table,
+    evaluate_purchase_history,
     load_winning_condition_history,
     parse_json_text,
     weighted_model_text,
@@ -41,6 +44,7 @@ from prl_maintenance import run_maintenance
 
 
 BASE_DIR = LOTO_LAB_DIR
+PURCHASES_CSV = DATA_DIR / "purchases.csv"
 
 
 def read_csv(path, columns=None):
@@ -183,11 +187,45 @@ def ai_weight_overview(label, lottery_type):
     }
 
 
+def purchase_summary_row(label, summary):
+    return {
+        "対象": label,
+        "総購入金額": int(round(summary["総購入金額"])),
+        "総払戻金": int(round(summary["総払戻金"])),
+        "累計収支": int(round(summary["累計収支"])),
+        "回収率": f"{summary['回収率']}%",
+        "的中回数": int(summary["的中回数"]),
+        "最高払戻金": int(round(summary["最高払戻金"])),
+        "実戦成績が良い予測方式": summary["実戦成績が良い予測方式"],
+    }
+
+
+def load_purchase_tracking_overview():
+    warnings = []
+    try:
+        purchases = read_csv(PURCHASES_CSV, PURCHASE_COLUMNS)
+    except Exception as exc:
+        warnings.append(f"purchases.csv を読み込めませんでした: {exc}")
+        return pd.DataFrame(columns=PURCHASE_COLUMNS), warnings
+    if purchases.empty:
+        return purchases, warnings
+    try:
+        purchases = evaluate_purchase_history(purchases, read_csv(DATA_DIR / "loto6.csv"), "loto6", 6, 43)
+    except Exception as exc:
+        warnings.append(f"ロト6購入履歴の照合をスキップしました: {exc}")
+    try:
+        purchases = evaluate_purchase_history(purchases, read_csv(DATA_DIR / "loto7.csv"), "loto7", 7, 37)
+    except Exception as exc:
+        warnings.append(f"ロト7購入履歴の照合をスキップしました: {exc}")
+    return purchases, warnings
+
+
 def render_home():
     loto6_predictions = read_csv(DATA_DIR / "predictions.csv")
     loto6_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "verification_reports.csv"), draw_size=6)
     loto7_predictions = read_csv(DATA_DIR / "loto7_predictions.csv")
     loto7_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "loto7_verification_reports.csv"), draw_size=7)
+    purchases, purchase_warnings = load_purchase_tracking_overview()
     docs = list(DOCS_DIR.glob("*.md")) if DOCS_DIR.exists() else []
     backups = list(BACKUP_DIR.glob("*.csv")) if BACKUP_DIR.exists() else []
 
@@ -242,6 +280,18 @@ def render_home():
     )
     st.markdown("**AI改善重み概要**")
     st.dataframe(ai_overview, width="stretch", hide_index=True)
+
+    for warning in purchase_warnings:
+        st.warning(warning)
+    purchase_overview = pd.DataFrame(
+        [
+            purchase_summary_row("ロト6", build_purchase_summary(purchases, "loto6")),
+            purchase_summary_row("ロト7", build_purchase_summary(purchases, "loto7")),
+            purchase_summary_row("全体", build_purchase_summary(purchases)),
+        ]
+    )
+    st.markdown("**購入・払戻概要**")
+    st.dataframe(purchase_overview, width="stretch", hide_index=True)
 
     next_actions = pd.DataFrame(
         [

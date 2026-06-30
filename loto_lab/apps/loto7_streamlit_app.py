@@ -19,6 +19,7 @@ if str(CORE_DIR) not in sys.path:
 from arl_research_engine import (
     ARL_MODEL_LABELS,
     CONTRIBUTION_COLUMNS,
+    PURCHASE_COLUMNS,
     RESEARCH_CYCLE_COLUMNS,
     VIDEO_HYPOTHESIS_COLUMNS,
     add_verification_metrics,
@@ -37,14 +38,19 @@ from arl_research_engine import (
     build_model_dashboard,
     build_model_scores,
     build_model_support_map,
+    build_purchase_group_summary,
+    build_purchase_summary,
     build_research_flow_table,
     build_winning_condition_report,
+    evaluate_purchase_history,
     extract_video_hypothesis,
     format_contribution_detail,
     load_winning_condition_history,
     merge_contribution_rows,
     merge_research_cycle_rows,
     parse_json_text,
+    purchase_display_df,
+    validate_purchase_numbers,
     weighted_model_text,
 )
 
@@ -53,6 +59,7 @@ BASE_DIR = LOTO_LAB_DIR
 RESULTS_CSV = DATA_DIR / "loto7.csv"
 SCORES_CSV = DATA_DIR / "loto7_next_number_scores.csv"
 PREDICTIONS_CSV = DATA_DIR / "loto7_predictions.csv"
+PURCHASES_CSV = DATA_DIR / "purchases.csv"
 OFFICIAL_RESULTS_CSV = DATA_DIR / "loto7_results.csv"
 VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
 MODEL_SETTINGS_CSV = DATA_DIR / "loto7_model_settings.csv"
@@ -1472,6 +1479,153 @@ def render_winning_condition_history():
         st.dataframe(history.sort_values(["draw_no", "created_at"], ascending=[False, False]), width="stretch", hide_index=True)
 
 
+def purchase_method_options():
+    options = [
+        "AI改善反映予測",
+        "候補スコア活用予測",
+        *MODEL_LABELS.values(),
+        "手入力",
+        "その他",
+    ]
+    return list(dict.fromkeys(options))
+
+
+def render_purchase_summary(purchases, lottery_type):
+    summary = build_purchase_summary(purchases, lottery_type)
+    cols = st.columns(4)
+    cols[0].metric("総購入金額", f"{int(round(summary['総購入金額'])):,}円")
+    cols[1].metric("総払戻金", f"{int(round(summary['総払戻金'])):,}円")
+    cols[2].metric("累計収支", f"{int(round(summary['累計収支'])):,}円")
+    cols[3].metric("回収率", f"{summary['回収率']}%")
+
+    cols = st.columns(3)
+    cols[0].metric("的中回数", int(summary["的中回数"]))
+    cols[1].metric("最高払戻金", f"{int(round(summary['最高払戻金'])):,}円")
+    cols[2].metric("実戦上位方式", summary["実戦成績が良い予測方式"])
+
+
+def render_purchase_group_tables(game_purchases):
+    method_summary = build_purchase_group_summary(game_purchases, "prediction_method", "予測方式")
+    model_summary = build_purchase_group_summary(game_purchases, "model_name", "モデル名")
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.markdown("**予測方式別の収支**")
+        if method_summary.empty:
+            st.info("予測方式別の集計はまだありません。")
+        else:
+            st.dataframe(method_summary, width="stretch", hide_index=True)
+    with col_right:
+        st.markdown("**モデル別の収支**")
+        if model_summary.empty:
+            st.info("モデル別の集計はまだありません。")
+        else:
+            st.dataframe(model_summary, width="stretch", hide_index=True)
+
+
+def render_purchase_manager(result_history):
+    st.subheader("買い目管理")
+    st.caption("実際に購入した買い目、購入額、当選結果、払戻金、収支を記録します。")
+    try:
+        purchases = read_csv(PURCHASES_CSV, PURCHASE_COLUMNS)
+    except Exception as exc:
+        st.warning(f"purchases.csv を読み込めませんでした。空の購入履歴として表示します: {exc}")
+        purchases = pd.DataFrame(columns=PURCHASE_COLUMNS)
+    try:
+        evaluated = evaluate_purchase_history(purchases, result_history, "loto7", 7, 37)
+    except Exception as exc:
+        st.warning(f"購入履歴の照合中に問題がありました。未照合の一覧として表示します: {exc}")
+        evaluated = purchases.copy()
+        for column in PURCHASE_COLUMNS:
+            if column not in evaluated:
+                evaluated[column] = ""
+        evaluated = evaluated.reindex(columns=PURCHASE_COLUMNS)
+
+    game_purchases = evaluated[evaluated["lottery_type"].astype(str) == "loto7"].copy() if not evaluated.empty else evaluated
+    render_purchase_summary(evaluated, "loto7")
+
+    latest_round = 1
+    if result_history is not None and not result_history.empty and "開催回" in result_history:
+        rounds = pd.to_numeric(result_history["開催回"], errors="coerce").dropna()
+        if not rounds.empty:
+            latest_round = int(rounds.max()) + 1
+
+    with st.form("loto7_purchase_form"):
+        st.markdown("**購入履歴を追加**")
+        col_left, col_right = st.columns(2)
+        with col_left:
+            draw_no = st.number_input("開催回", min_value=1, value=latest_round, step=1)
+            purchase_date = st.date_input("購入日", value=date.today())
+            numbers_text = st.text_input("購入番号（7個）", placeholder="01-02-03-04-05-06-07")
+            prediction_method = st.selectbox("予測方式", purchase_method_options(), index=0)
+        with col_right:
+            model_name = st.text_input("モデル名", value=prediction_method)
+            ticket_count = st.number_input("口数", min_value=1, value=1, step=1)
+            cost = st.number_input("購入金額", min_value=0, value=300, step=100)
+            manual_payout = st.number_input("払戻金（賞金未入力時のみ任意）", min_value=0, value=0, step=100)
+        notes = st.text_area("メモ", height=80)
+        submitted = st.form_submit_button("購入履歴を保存")
+
+    if submitted:
+        numbers, errors = validate_purchase_numbers(numbers_text, 7, 37)
+        if errors:
+            for error in errors:
+                st.warning(error)
+        else:
+            row = {
+                "lottery_type": "loto7",
+                "draw_no": int(draw_no),
+                "purchase_date": purchase_date.strftime("%Y/%m/%d"),
+                "numbers": numbers_to_text(numbers),
+                "prediction_method": prediction_method,
+                "model_name": model_name.strip() or prediction_method,
+                "ticket_count": int(ticket_count),
+                "cost": int(cost),
+                "result_numbers": "",
+                "bonus_numbers": "",
+                "matched_count": "",
+                "bonus_matched_count": "",
+                "prize_rank": "",
+                "payout": int(manual_payout) if int(manual_payout) > 0 else "",
+                "profit_loss": "",
+                "status": "未照合",
+                "notes": notes,
+                "created_at": now_text(),
+            }
+            try:
+                updated = pd.concat([purchases, pd.DataFrame([row])], ignore_index=True)
+                updated = evaluate_purchase_history(updated, result_history, "loto7", 7, 37)
+                save_csv(updated, PURCHASES_CSV, PURCHASE_COLUMNS)
+                st.success("購入履歴を保存しました。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"購入履歴を保存できませんでした: {exc}")
+
+    st.markdown("**購入履歴一覧**")
+    display = purchase_display_df(evaluated, "loto7")
+    if display.empty:
+        st.info("ロト7の購入履歴はまだありません。")
+    else:
+        st.dataframe(display, width="stretch", hide_index=True)
+        if st.button("照合結果を purchases.csv に反映", key="loto7_purchase_sync"):
+            try:
+                save_csv(evaluated, PURCHASES_CSV, PURCHASE_COLUMNS)
+                st.success("購入履歴の照合結果を保存しました。")
+            except Exception as exc:
+                st.error(f"照合結果を保存できませんでした: {exc}")
+
+    render_purchase_group_tables(game_purchases)
+    ai_rows = game_purchases[
+        game_purchases["prediction_method"].astype(str).str.contains("AI改善反映予測", na=False)
+        | game_purchases["model_name"].astype(str).str.contains("AI改善反映予測", na=False)
+    ] if not game_purchases.empty else pd.DataFrame(columns=PURCHASE_COLUMNS)
+    st.markdown("**AI改善反映予測の実戦成績**")
+    ai_summary = build_purchase_group_summary(ai_rows, "prediction_method", "予測方式")
+    if ai_summary.empty:
+        st.info("AI改善反映予測の購入履歴はまだありません。")
+    else:
+        st.dataframe(ai_summary, width="stretch", hide_index=True)
+
+
 def render_ai_improvement_report():
     st.subheader("AI改善レポート")
     st.caption("予想、結果、検証、改善をセットで保存する研究開発メモです。当選や利益を保証するものではありません。")
@@ -1515,20 +1669,20 @@ def render_lab():
         reports = read_csv(VERIFICATION_REPORTS_CSV, VERIFICATION_COLUMNS)
         reports = add_verification_metrics(reports, draw_size=7)
         contributions = read_csv(CONTRIBUTIONS_CSV, CONTRIBUTION_COLUMNS)
-    tabs = st.tabs(["バックテスト", "検証レポート", "モデル貢献度", "条件別成功率", "AI改善レポート", "当選条件分析", "動画仮説研究", "予想履歴", "公式結果"])
+    result_history = merge_official_results(read_csv(RESULTS_CSV))
+    tabs = st.tabs(["バックテスト", "検証レポート", "モデル貢献度", "条件別成功率", "AI改善レポート", "当選条件分析", "動画仮説研究", "予想履歴", "公式結果", "買い目管理"])
     with tabs[0]:
         st.markdown("**新フロー**")
         st.dataframe(build_research_flow_table(), width="stretch", hide_index=True)
-        results = merge_official_results(read_csv(RESULTS_CSV))
-        if len(results) <= 40:
+        if len(result_history) <= 40:
             st.info("バックテストには最低41回分以上の抽せん結果が必要です。")
         else:
-            max_rounds = max(10, min(30, len(results) - 40))
+            max_rounds = max(10, min(30, len(result_history) - 40))
             default_rounds = min(10, max_rounds)
             lookback_rounds = st.slider("バックテスト対象回数", 10, max_rounds, default_rounds, key="loto7_backtest_rounds")
             if st.button("ロト7バックテストを実行"):
                 with st.spinner("機械学習モデルを含めてロト7モデルを検証しています..."):
-                    summary_df, detail_df = run_backtest(results, lookback_rounds=lookback_rounds)
+                    summary_df, detail_df = run_backtest(result_history, lookback_rounds=lookback_rounds)
                 st.session_state["loto7_backtest_summary"] = summary_df
                 st.session_state["loto7_backtest_detail"] = detail_df
                 best_key = best_actionable_model_key(summary_df)
@@ -1643,6 +1797,8 @@ def render_lab():
             st.info("公式結果ログはまだありません。")
         else:
             st.dataframe(official.sort_values("開催回", ascending=False), width="stretch", hide_index=True)
+    with tabs[9]:
+        render_purchase_manager(result_history)
 
 
 render_registration_form()
