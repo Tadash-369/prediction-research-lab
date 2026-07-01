@@ -8,10 +8,15 @@ __pycache__/
 .venv/
 venv/
 env/
+.tmp_*/
 .tmp_run_deps/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Python cache
+**/__pycache__/
+*.pyc
 
 # OS files
 .DS_Store
@@ -30,3 +35,6 @@ loto7_*_frames/
 
 # Local data backups
 分析研究所/data/backups/
+
+# Regeneratable lottery score outputs
+loto_lab/data/*_next_number_scores.csv

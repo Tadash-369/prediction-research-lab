@@ -1,0 +1,2 @@
+loto_lab/data/**/*.csv -whitespace
+loto_lab/data/**/*.jsonl -whitespace
