@@ -188,6 +188,121 @@ PURCHASE_DISPLAY_COLUMNS = [
     "状態",
     "メモ",
 ]
+HIGH_PRIZE_TICKET_ROLES = [
+    "本命・安定型",
+    "直近トレンド型",
+    "高額当選狙い・低人気型",
+]
+
+ENSEMBLE_PREDICTION_COLUMNS = [
+    "lottery_type",
+    "target_draw",
+    "prediction_date",
+    "ticket_no",
+    "ticket_role",
+    "numbers",
+    "adopted_models",
+    "selection_reason",
+    "prediction_score",
+    "expected_score",
+    "low_popularity_score",
+    "past_similarity",
+    "risk_level",
+    "created_at",
+]
+
+TICKET_STRATEGY_COLUMNS = [
+    "lottery_type",
+    "target_draw",
+    "prediction_date",
+    "ticket_no",
+    "ticket_role",
+    "numbers",
+    "adopted_models",
+    "selection_reason",
+    "expected_score",
+    "low_popularity_score",
+    "past_similarity",
+    "risk_level",
+    "created_at",
+]
+
+POPULARITY_SCORE_COLUMNS = [
+    "lottery_type",
+    "target_draw",
+    "prediction_date",
+    "ticket_no",
+    "numbers",
+    "low_popularity_score",
+    "birthday_bias_score",
+    "consecutive_score",
+    "regularity_score",
+    "last_digit_score",
+    "sum_balance_score",
+    "past_similarity_score",
+    "visual_neatness_score",
+    "risk_level",
+    "created_at",
+]
+
+CONTINUOUS_WIN_RESEARCH_COLUMNS = [
+    "prediction_date",
+    "target_draw",
+    "lottery_type",
+    "numbers",
+    "ticket_role",
+    "adopted_models",
+    "prediction_score",
+    "low_popularity_score",
+    "actual_numbers",
+    "bonus_numbers",
+    "matched_count",
+    "bonus_matched_count",
+    "missed_numbers",
+    "hit_numbers",
+    "expected_value",
+    "failure_reason",
+    "improvement_plan",
+    "next_hypothesis",
+    "created_at",
+]
+
+BACKTEST_SUMMARY_COLUMNS = [
+    "lottery_type",
+    "period",
+    "model_name",
+    "model_type",
+    "evaluated_draws",
+    "average_match",
+    "max_match",
+    "match3_rate",
+    "match4_rate",
+    "bonus_match_rate",
+    "stability",
+    "recent_score",
+    "long_score",
+    "random_delta",
+    "expected_value",
+    "created_at",
+]
+
+MODEL_WEIGHT_HISTORY_COLUMNS = [
+    "lottery_type",
+    "created_at",
+    "model_key",
+    "model_name",
+    "evaluation_count",
+    "average_match",
+    "recent5_score",
+    "recent10_score",
+    "long_score",
+    "stability",
+    "expected_value",
+    "bonus_match_rate",
+    "raw_score",
+    "applied_weight",
+    "status",
+]
 
 
 def canonical_model_key(model_key):
@@ -1911,6 +2026,743 @@ def build_model_dashboard(
     dashboard.loc[ranked_mask, "順位"] = range(1, int(ranked_mask.sum()) + 1)
     dashboard.loc[~ranked_mask, "順位"] = "-"
     return dashboard.drop(columns=["_sort_score", "_sort_avg", "_sort_stability"])
+
+
+def _clamp(value, low=0.0, high=100.0):
+    try:
+        return max(low, min(high, float(value)))
+    except Exception:
+        return low
+
+
+def _safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    try:
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return default
+
+
+def _column_at(df, index):
+    if df is None or df.empty or len(df.columns) <= index:
+        return None
+    return df.columns[index]
+
+
+def _numeric_series(df, column):
+    if df is None or df.empty or column is None or column not in df:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+
+
+def _bonus_match_series(df, column):
+    if df is None or df.empty or column is None or column not in df:
+        return pd.Series([0.0] * len(df), index=df.index)
+    numeric = pd.to_numeric(df[column], errors="coerce")
+    if numeric.notna().any():
+        return numeric.fillna(0.0)
+
+    def text_to_score(value):
+        text = str(value).strip().lower()
+        if text in ("", "nan", "none", "-", "0", "0.0", "false", "no", "なし"):
+            return 0.0
+        return 1.0
+
+    return df[column].map(text_to_score).astype(float)
+
+
+def _verification_column_set(reports):
+    return {
+        "draw": _column_at(reports, 1),
+        "model": _column_at(reports, 3),
+        "prediction": _column_at(reports, 4),
+        "actual": _column_at(reports, 5),
+        "bonus": _column_at(reports, 6),
+        "match": _column_at(reports, 7),
+        "bonus_match": _column_at(reports, 9),
+        "failure": _column_at(reports, 30),
+        "improvement": _column_at(reports, 32),
+        "hypothesis": _column_at(reports, 33),
+    }
+
+
+def build_model_performance_weights(reports, draw_size, lottery_type="", model_history=None):
+    created_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    if reports is None or reports.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "lottery_type": lottery_type,
+                    "created_at": created_at,
+                    "model_key": model_key,
+                    "model_name": label,
+                    "evaluation_count": 0,
+                    "average_match": None,
+                    "recent5_score": None,
+                    "recent10_score": None,
+                    "long_score": None,
+                    "stability": None,
+                    "expected_value": None,
+                    "bonus_match_rate": None,
+                    "raw_score": 0.0,
+                    "applied_weight": 1.0,
+                    "status": "検証待ち",
+                }
+                for model_key, label in ARL_MODEL_LABELS.items()
+            ],
+            columns=MODEL_WEIGHT_HISTORY_COLUMNS,
+        )
+
+    df = add_verification_metrics(reports, draw_size)
+    columns = _verification_column_set(df)
+    model_column = columns["model"]
+    match_column = columns["match"]
+    bonus_column = columns["bonus_match"]
+    if model_column is None or match_column is None:
+        return build_model_performance_weights(pd.DataFrame(), draw_size, lottery_type, model_history)
+
+    df = df.copy()
+    df[model_column] = df[model_column].fillna("").astype(str)
+    ai_scores = model_history_ai_scores(model_history)
+    weight_rows = []
+    for model_key, label in ARL_MODEL_LABELS.items():
+        model_rows = df[df[model_column] == str(label)].copy()
+        if model_rows.empty:
+            ai_after = ai_scores.get(str(label))
+            raw_score = (ai_after or 0.0) * 18
+            weight_rows.append(
+                {
+                    "lottery_type": lottery_type,
+                    "created_at": created_at,
+                    "model_key": model_key,
+                    "model_name": label,
+                    "evaluation_count": 0,
+                    "average_match": None,
+                    "recent5_score": None,
+                    "recent10_score": None,
+                    "long_score": None,
+                    "stability": None,
+                    "expected_value": rounded_or_none((ai_after or 0) / max(draw_size, 1), 3) if ai_after is not None else None,
+                    "bonus_match_rate": None,
+                    "raw_score": rounded_or_none(raw_score, 3),
+                    "applied_weight": 1.0,
+                    "status": "検証待ち",
+                }
+            )
+            continue
+        matches = _numeric_series(model_rows, match_column)
+        bonus_matches = _bonus_match_series(model_rows, bonus_column)
+        avg_match = float(matches.mean()) if not matches.empty else 0.0
+        recent5 = float(matches.tail(5).mean()) if not matches.empty else 0.0
+        recent10 = float(matches.tail(10).mean()) if not matches.empty else 0.0
+        long_score = avg_match
+        std = float(matches.std()) if len(matches) > 1 else 0.0
+        stability = _clamp(100.0 - (std / max(draw_size, 1) * 100.0))
+        expected_value = float(((matches + bonus_matches * 0.25) / max(draw_size, 1)).mean())
+        bonus_rate = float((bonus_matches > 0).mean() * 100.0) if len(bonus_matches) else 0.0
+        ai_after = ai_scores.get(str(label), 0.0)
+        raw_score = (
+            avg_match * 30
+            + recent5 * 18
+            + recent10 * 10
+            + long_score * 8
+            + stability / 100 * 10
+            + expected_value * 18
+            + bonus_rate / 100 * 6
+            + ai_after * 6
+        )
+        weight_rows.append(
+            {
+                "lottery_type": lottery_type,
+                "created_at": created_at,
+                "model_key": model_key,
+                "model_name": label,
+                "evaluation_count": int(len(model_rows)),
+                "average_match": rounded_or_none(avg_match, 3),
+                "recent5_score": rounded_or_none(recent5, 3),
+                "recent10_score": rounded_or_none(recent10, 3),
+                "long_score": rounded_or_none(long_score, 3),
+                "stability": rounded_or_none(stability, 1),
+                "expected_value": rounded_or_none(expected_value, 3),
+                "bonus_match_rate": rounded_or_none(bonus_rate, 1),
+                "raw_score": rounded_or_none(raw_score, 3),
+                "applied_weight": 1.0,
+                "status": "評価中",
+            }
+        )
+
+    scored = [row for row in weight_rows if safe_int(row["evaluation_count"]) > 0 or _safe_float(row["raw_score"], 0.0) > 0]
+    raw_values = [_safe_float(row["raw_score"], 0.0) for row in scored]
+    low = min(raw_values) if raw_values else 0.0
+    high = max(raw_values) if raw_values else 0.0
+    for row in weight_rows:
+        if not scored or high == low:
+            weight = 1.0 if safe_int(row["evaluation_count"]) > 0 else 0.9
+        else:
+            normalized = (_safe_float(row["raw_score"], 0.0) - low) / (high - low)
+            weight = 0.65 + normalized * 0.95
+        if safe_int(row["evaluation_count"]) == 0 and _safe_float(row["raw_score"], 0.0) == 0:
+            weight = 0.85
+        weight = _clamp(weight, 0.45, 1.75)
+        row["applied_weight"] = rounded_or_none(weight, 3)
+        if row["status"] != "検証待ち":
+            if weight >= 1.22:
+                row["status"] = "強める"
+            elif weight <= 0.82:
+                row["status"] = "弱める"
+            else:
+                row["status"] = "標準"
+    return pd.DataFrame(weight_rows, columns=MODEL_WEIGHT_HISTORY_COLUMNS)
+
+
+def build_weighted_ensemble_score_map(number_rows, bonus_rows, number_max, draw_size, target_round=0, reports=None, model_history=None, lottery_type=""):
+    rows = clean_number_rows(number_rows, number_max)
+    bonus_rows = clean_number_rows(bonus_rows or [], number_max)
+    weight_df = build_model_performance_weights(reports, draw_size, lottery_type, model_history)
+    weight_by_key = {
+        str(row["model_key"]): _safe_float(row["applied_weight"], 1.0)
+        for _, row in weight_df.iterrows()
+    }
+    combined = {number: 0.0 for number in range(1, number_max + 1)}
+    model_score_maps = {}
+    for model_key in ARL_MODEL_LABELS:
+        raw_scores = build_model_scores(rows, model_key, number_max, draw_size, target_round, bonus_rows)
+        normalized = normalize_scores(raw_scores, number_max)
+        model_score_maps[model_key] = normalized
+        weight = weight_by_key.get(model_key, 1.0)
+        for number, score in normalized.items():
+            combined[number] += score * weight
+    return combined, weight_df, model_score_maps
+
+
+def _history_sum_stats(number_rows, draw_size, number_max, precleaned=False):
+    rows = number_rows if precleaned else clean_number_rows(number_rows, number_max)
+    sums = [sum(row) for row in rows]
+    if not sums:
+        average = (number_max + 1) / 2 * draw_size
+        return average, max(18.0, average * 0.18)
+    average = sum(sums) / len(sums)
+    if len(sums) <= 1:
+        return average, max(18.0, average * 0.18)
+    variance = sum((value - average) ** 2 for value in sums) / (len(sums) - 1)
+    return average, max(variance ** 0.5, 1.0)
+
+
+def _balance_score(numbers, number_rows, number_max, draw_size, sum_stats=None):
+    summary = game_balance(numbers, number_max)
+    target_odd = draw_size / 2
+    target_low = draw_size / 2
+    sum_average, sum_std = sum_stats or _history_sum_stats(number_rows, draw_size, number_max)
+    odd_penalty = abs(summary["odd"] - target_odd) * 11
+    low_penalty = abs(summary["low"] - target_low) * 9
+    sum_penalty = min(abs(summary["sum"] - sum_average) / max(sum_std, 1) * 14, 28)
+    consecutive_penalty = max(0, summary["consecutive"] - 1) * 12
+    tail_penalty = max(0, summary["same_tail"] - 2) * 8
+    return _clamp(100 - odd_penalty - low_penalty - sum_penalty - consecutive_penalty - tail_penalty)
+
+
+def evaluate_low_popularity(numbers, number_rows, number_max, draw_size, precleaned=False, sum_stats=None, similarity_rows=None):
+    numbers = sorted({safe_int(number) for number in numbers if 1 <= safe_int(number) <= number_max})
+    rows = number_rows if precleaned else clean_number_rows(number_rows, number_max)
+    if len(numbers) != draw_size:
+        return {
+            "low_popularity_score": 0.0,
+            "birthday_bias_score": 0.0,
+            "consecutive_score": 0.0,
+            "regularity_score": 0.0,
+            "last_digit_score": 0.0,
+            "sum_balance_score": 0.0,
+            "past_similarity_score": 0.0,
+            "visual_neatness_score": 0.0,
+            "past_similarity": 100.0,
+            "risk_level": "高",
+        }
+    birthday_count = sum(number <= 31 for number in numbers)
+    over_birthday = draw_size - birthday_count
+    birthday_heavy = max(0, birthday_count - max(draw_size - 2, 1))
+    birthday_score = _clamp(62 + over_birthday * (38 / max(draw_size, 1)) - birthday_heavy * 11)
+
+    consecutive = count_consecutive_pairs(numbers)
+    consecutive_score = _clamp(100 - max(0, consecutive - 1) * 28)
+
+    gaps = [right - left for left, right in zip(numbers, numbers[1:])]
+    repeated_gap_count = max(Counter(gaps).values()) if gaps else 0
+    regular_penalty = 0
+    if repeated_gap_count >= max(2, draw_size - 3):
+        regular_penalty += 26
+    regular_penalty += sum(12 for gap in gaps if gap in (5, 7))
+    if len(set(gaps)) == 1 and gaps:
+        regular_penalty += 32
+    regularity_score = _clamp(100 - regular_penalty)
+
+    tail_counts = Counter(number % 10 for number in numbers)
+    max_tail = max(tail_counts.values()) if tail_counts else 0
+    last_digit_score = _clamp(100 - max(0, max_tail - 2) * 24)
+
+    sum_average, sum_std = sum_stats or _history_sum_stats(rows, draw_size, number_max, precleaned=True)
+    z_score = abs(sum(numbers) - sum_average) / max(sum_std, 1)
+    sum_balance_score = _clamp(100 - max(0.0, z_score - 0.8) * 28)
+
+    similarity_rows = similarity_rows if similarity_rows is not None else (rows[-300:] if len(rows) > 300 else rows)
+    max_overlap = max((len(set(numbers) & set(row)) for row in similarity_rows), default=0)
+    past_similarity = max_overlap / max(draw_size, 1) * 100
+    past_similarity_score = _clamp(100 - past_similarity * 0.92)
+
+    tens_counts = Counter(number // 10 for number in numbers)
+    neat_penalty = max(0, max(tens_counts.values()) - 3) * 16 if tens_counts else 0
+    if all(number % 5 == 0 for number in numbers[: max(2, min(3, len(numbers)))]) and len(numbers) >= 3:
+        neat_penalty += 18
+    if len(set(gaps)) <= 2 and len(gaps) >= 4:
+        neat_penalty += 20
+    visual_neatness_score = _clamp(100 - neat_penalty)
+
+    total_score = (
+        birthday_score * 0.16
+        + consecutive_score * 0.14
+        + regularity_score * 0.15
+        + last_digit_score * 0.12
+        + sum_balance_score * 0.17
+        + past_similarity_score * 0.16
+        + visual_neatness_score * 0.10
+    )
+    if total_score >= 72 and z_score <= 1.8 and consecutive <= 1:
+        risk_level = "低"
+    elif total_score >= 52 and z_score <= 2.5:
+        risk_level = "中"
+    else:
+        risk_level = "高"
+    return {
+        "low_popularity_score": rounded_or_none(total_score, 3),
+        "birthday_bias_score": rounded_or_none(birthday_score, 3),
+        "consecutive_score": rounded_or_none(consecutive_score, 3),
+        "regularity_score": rounded_or_none(regularity_score, 3),
+        "last_digit_score": rounded_or_none(last_digit_score, 3),
+        "sum_balance_score": rounded_or_none(sum_balance_score, 3),
+        "past_similarity_score": rounded_or_none(past_similarity_score, 3),
+        "visual_neatness_score": rounded_or_none(visual_neatness_score, 3),
+        "past_similarity": rounded_or_none(past_similarity, 1),
+        "risk_level": risk_level,
+    }
+
+
+def _top_models_for_numbers(numbers, model_score_maps, weight_df, limit=4):
+    rows = []
+    weight_by_key = {
+        str(row["model_key"]): _safe_float(row["applied_weight"], 1.0)
+        for _, row in weight_df.iterrows()
+    } if weight_df is not None and not weight_df.empty else {}
+    for model_key, label in ARL_MODEL_LABELS.items():
+        score_map = model_score_maps.get(model_key, {})
+        average_score = sum(score_map.get(number, 0.0) for number in numbers) / max(len(numbers), 1)
+        rows.append((average_score * weight_by_key.get(model_key, 1.0), label))
+    return [label for _, label in sorted(rows, reverse=True)[:limit]]
+
+
+def _role_reason(role):
+    if role == "本命・安定型":
+        return "過去成績の重みが高いモデルを中心に、奇数偶数・高低・合計値の安定性を優先"
+    if role == "直近トレンド型":
+        return "直近傾向、マルコフ系の移り変わり、ホット傾向を重めに評価"
+    return "予測スコアを維持しつつ、誕生日数字偏りや規則的な並びを避ける低人気評価を加点"
+
+
+def build_high_prize_ticket_strategy(number_rows, bonus_rows, number_max, draw_size, target_round=0, reports=None, model_history=None, lottery_type="", candidate_pool_limit=None):
+    rows = clean_number_rows(number_rows, number_max)
+    bonus_rows = clean_number_rows(bonus_rows or [], number_max)
+    if not rows:
+        return [], build_model_performance_weights(reports, draw_size, lottery_type, model_history)
+    sum_stats = _history_sum_stats(rows, draw_size, number_max, precleaned=True)
+    similarity_rows = rows[-300:] if len(rows) > 300 else rows
+    ensemble_scores, weight_df, model_score_maps = build_weighted_ensemble_score_map(
+        rows,
+        bonus_rows,
+        number_max,
+        draw_size,
+        target_round,
+        reports,
+        model_history,
+        lottery_type,
+    )
+    ensemble_norm = normalize_scores(ensemble_scores, number_max)
+    hot_norm = normalize_scores(build_model_scores(rows, "hot_analysis", number_max, draw_size, target_round, bonus_rows), number_max)
+    cold_norm = normalize_scores(build_model_scores(rows, "cold_analysis", number_max, draw_size, target_round, bonus_rows), number_max)
+    markov_norm = normalize_scores(build_model_scores(rows, "markov_chain", number_max, draw_size, target_round, bonus_rows), number_max)
+
+    ranked = sorted(ensemble_scores.items(), key=lambda item: (item[1], -item[0]), reverse=True)
+    pool_limit = candidate_pool_limit or max(14, draw_size + 8)
+    initial_limit = min(pool_limit, max(12, draw_size + 5))
+    pool = [number for number, _ in ranked[:initial_limit]]
+    for source in (hot_norm, cold_norm, markov_norm):
+        for number, _ in sorted(source.items(), key=lambda item: (item[1], -item[0]), reverse=True)[: draw_size]:
+            if number not in pool:
+                pool.append(number)
+    pool = sorted(pool, key=lambda number: ensemble_scores.get(number, 0.0), reverse=True)[: min(number_max, pool_limit)]
+    if len(pool) < draw_size:
+        pool = list(range(1, min(number_max, draw_size) + 1))
+
+    candidates = []
+    for combo in combinations(sorted(pool), draw_size):
+        numbers = tuple(sorted(combo))
+        popularity = evaluate_low_popularity(numbers, rows, number_max, draw_size, precleaned=True, sum_stats=sum_stats, similarity_rows=similarity_rows)
+        prediction_score = sum(ensemble_norm.get(number, 0.0) for number in numbers) / draw_size * 100
+        balance = _balance_score(numbers, rows, number_max, draw_size, sum_stats=sum_stats)
+        trend_score = sum((hot_norm.get(number, 0.0) + markov_norm.get(number, 0.0)) / 2 for number in numbers) / draw_size * 100
+        cold_score = sum(cold_norm.get(number, 0.0) for number in numbers) / draw_size * 100
+        low_popularity = _safe_float(popularity["low_popularity_score"], 0.0)
+        stable_score = prediction_score * 0.62 + balance * 0.26 + low_popularity * 0.12
+        trend_role_score = prediction_score * 0.50 + trend_score * 0.33 + balance * 0.10 + low_popularity * 0.07
+        jackpot_score = prediction_score * 0.38 + low_popularity * 0.40 + cold_score * 0.14 + balance * 0.08
+        candidates.append(
+            {
+                "numbers": numbers,
+                "prediction_score": prediction_score,
+                "balance_score": balance,
+                "trend_score": trend_score,
+                "cold_score": cold_score,
+                "popularity": popularity,
+                "stable_score": stable_score,
+                "trend_role_score": trend_role_score,
+                "jackpot_score": jackpot_score,
+            }
+        )
+    if not candidates:
+        numbers = tuple(sorted(number for number, _ in ranked[:draw_size]))
+        popularity = evaluate_low_popularity(numbers, rows, number_max, draw_size, precleaned=True, sum_stats=sum_stats, similarity_rows=similarity_rows)
+        candidates.append(
+            {
+                "numbers": numbers,
+                "prediction_score": 0.0,
+                "balance_score": 0.0,
+                "trend_score": 0.0,
+                "cold_score": 0.0,
+                "popularity": popularity,
+                "stable_score": 0.0,
+                "trend_role_score": 0.0,
+                "jackpot_score": 0.0,
+            }
+        )
+
+    role_keys = {
+        "本命・安定型": "stable_score",
+        "直近トレンド型": "trend_role_score",
+        "高額当選狙い・低人気型": "jackpot_score",
+    }
+    selected = []
+    selected_sets = []
+    for ticket_no, role in enumerate(HIGH_PRIZE_TICKET_ROLES, start=1):
+        sorted_candidates = sorted(candidates, key=lambda row: row[role_keys[role]], reverse=True)
+        chosen = None
+        for candidate in sorted_candidates:
+            candidate_set = set(candidate["numbers"])
+            if any(candidate_set == existing for existing in selected_sets):
+                continue
+            if selected_sets and all(len(candidate_set & existing) > draw_size - 2 for existing in selected_sets):
+                continue
+            chosen = candidate
+            break
+        if chosen is None:
+            chosen = sorted_candidates[0]
+        selected_sets.append(set(chosen["numbers"]))
+        models = _top_models_for_numbers(chosen["numbers"], model_score_maps, weight_df, 4)
+        popularity = chosen["popularity"]
+        selected.append(
+            {
+                "ticket_no": ticket_no,
+                "ticket_role": role,
+                "numbers": tuple(chosen["numbers"]),
+                "adopted_models": models,
+                "selection_reason": _role_reason(role),
+                "prediction_score": rounded_or_none(chosen["prediction_score"], 3),
+                "expected_score": rounded_or_none(chosen[role_keys[role]], 3),
+                "low_popularity_score": rounded_or_none(popularity["low_popularity_score"], 3),
+                "past_similarity": rounded_or_none(popularity["past_similarity"], 1),
+                "risk_level": popularity["risk_level"],
+                "popularity_detail": popularity,
+            }
+        )
+    return selected, weight_df
+
+
+def ticket_strategy_display_frame(tickets):
+    rows = []
+    for ticket in tickets or []:
+        rows.append(
+            {
+                "買い目番号": ticket.get("ticket_no"),
+                "役割": ticket.get("ticket_role"),
+                "買い目": numbers_to_text(ticket.get("numbers", [])),
+                "採用モデル": " / ".join(ticket.get("adopted_models", [])),
+                "選定理由": ticket.get("selection_reason", ""),
+                "予測スコア": ticket.get("prediction_score"),
+                "期待スコア": ticket.get("expected_score"),
+                "低人気スコア": ticket.get("low_popularity_score"),
+                "過去類似度": ticket.get("past_similarity"),
+                "リスク評価": ticket.get("risk_level"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_ensemble_prediction_rows(tickets, lottery_type, target_round, prediction_date=None, created_at=None):
+    prediction_date = prediction_date or datetime.now().strftime("%Y/%m/%d")
+    created_at = created_at or datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    rows = []
+    for ticket in tickets or []:
+        rows.append(
+            {
+                "lottery_type": lottery_type,
+                "target_draw": safe_int(target_round),
+                "prediction_date": prediction_date,
+                "ticket_no": safe_int(ticket.get("ticket_no")),
+                "ticket_role": ticket.get("ticket_role", ""),
+                "numbers": numbers_to_text(ticket.get("numbers", [])),
+                "adopted_models": " / ".join(ticket.get("adopted_models", [])),
+                "selection_reason": ticket.get("selection_reason", ""),
+                "prediction_score": ticket.get("prediction_score", ""),
+                "expected_score": ticket.get("expected_score", ""),
+                "low_popularity_score": ticket.get("low_popularity_score", ""),
+                "past_similarity": ticket.get("past_similarity", ""),
+                "risk_level": ticket.get("risk_level", ""),
+                "created_at": created_at,
+            }
+        )
+    return rows
+
+
+def build_ticket_strategy_rows(tickets, lottery_type, target_round, prediction_date=None, created_at=None):
+    prediction_rows = build_ensemble_prediction_rows(tickets, lottery_type, target_round, prediction_date, created_at)
+    return [{column: row.get(column, "") for column in TICKET_STRATEGY_COLUMNS} for row in prediction_rows]
+
+
+def build_popularity_score_rows(tickets, lottery_type, target_round, prediction_date=None, created_at=None):
+    prediction_date = prediction_date or datetime.now().strftime("%Y/%m/%d")
+    created_at = created_at or datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    rows = []
+    for ticket in tickets or []:
+        detail = ticket.get("popularity_detail", {}) or {}
+        rows.append(
+            {
+                "lottery_type": lottery_type,
+                "target_draw": safe_int(target_round),
+                "prediction_date": prediction_date,
+                "ticket_no": safe_int(ticket.get("ticket_no")),
+                "numbers": numbers_to_text(ticket.get("numbers", [])),
+                "low_popularity_score": detail.get("low_popularity_score", ticket.get("low_popularity_score", "")),
+                "birthday_bias_score": detail.get("birthday_bias_score", ""),
+                "consecutive_score": detail.get("consecutive_score", ""),
+                "regularity_score": detail.get("regularity_score", ""),
+                "last_digit_score": detail.get("last_digit_score", ""),
+                "sum_balance_score": detail.get("sum_balance_score", ""),
+                "past_similarity_score": detail.get("past_similarity_score", ""),
+                "visual_neatness_score": detail.get("visual_neatness_score", ""),
+                "risk_level": ticket.get("risk_level", detail.get("risk_level", "")),
+                "created_at": created_at,
+            }
+        )
+    return rows
+
+
+def build_continuous_win_research_rows(tickets, lottery_type, target_round, actual_numbers=None, bonus_numbers=None, prediction_date=None, created_at=None):
+    prediction_date = prediction_date or datetime.now().strftime("%Y/%m/%d")
+    created_at = created_at or datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    actual_numbers = sorted(actual_numbers or [])
+    bonus_numbers = sorted(bonus_numbers or [])
+    rows = []
+    for ticket in tickets or []:
+        numbers = sorted(ticket.get("numbers", []))
+        hit_numbers = sorted(set(numbers) & set(actual_numbers)) if actual_numbers else []
+        missed_numbers = sorted(set(numbers) - set(actual_numbers)) if actual_numbers else []
+        bonus_hit = sorted(set(numbers) & set(bonus_numbers)) if bonus_numbers else []
+        if actual_numbers:
+            failure_reason = "一致数と外れた数字を次回検証へ回す"
+            improvement_plan = "弱いモデルを下げ、近かったモデルと不足条件を次回重みに反映"
+        else:
+            failure_reason = "結果待ち"
+            improvement_plan = "抽選結果登録後に自動検証"
+        rows.append(
+            {
+                "prediction_date": prediction_date,
+                "target_draw": safe_int(target_round),
+                "lottery_type": lottery_type,
+                "numbers": numbers_to_text(numbers),
+                "ticket_role": ticket.get("ticket_role", ""),
+                "adopted_models": " / ".join(ticket.get("adopted_models", [])),
+                "prediction_score": ticket.get("prediction_score", ""),
+                "low_popularity_score": ticket.get("low_popularity_score", ""),
+                "actual_numbers": numbers_to_text(actual_numbers) if actual_numbers else "",
+                "bonus_numbers": numbers_to_text(bonus_numbers) if bonus_numbers else "",
+                "matched_count": len(hit_numbers) if actual_numbers else "",
+                "bonus_matched_count": len(bonus_hit) if bonus_numbers else "",
+                "missed_numbers": numbers_to_text(missed_numbers) if missed_numbers else "",
+                "hit_numbers": numbers_to_text(hit_numbers) if hit_numbers else "",
+                "expected_value": rounded_or_none((_safe_float(ticket.get("expected_score"), 0.0) / 100.0), 3),
+                "failure_reason": failure_reason,
+                "improvement_plan": improvement_plan,
+                "next_hypothesis": f"{ticket.get('ticket_role', '')}の重みと低人気条件を次回も検証",
+                "created_at": created_at,
+            }
+        )
+    return rows
+
+
+def build_high_prize_backtest_summary(number_rows, bonus_rows, number_max, draw_size, lottery_type="", periods=None, reports=None, model_history=None, min_training_rounds=20):
+    rows = clean_number_rows(number_rows, number_max)
+    bonus_rows = clean_number_rows(bonus_rows or [], number_max)
+    if periods is None:
+        periods = [30, 50, 100, "all"]
+    if len(rows) <= min_training_rounds:
+        return pd.DataFrame(columns=BACKTEST_SUMMARY_COLUMNS)
+    created_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    detail_rows = []
+    model_defs = [(model_key, label, "既存分析モデル") for model_key, label in ARL_MODEL_LABELS.items()]
+    special_defs = [
+        ("ensemble", "アンサンブルモデル", "強化モデル"),
+        ("high_prize", "高額当選狙いモデル", "強化モデル"),
+        ("continuous_win", "連続当選狙いモデル", "強化モデル"),
+    ]
+    for period in periods:
+        period_label = str(period)
+        start_index = min_training_rounds if period == "all" else max(min_training_rounds, len(rows) - int(period))
+        for target_index in range(start_index, len(rows)):
+            training_rows = rows[:target_index]
+            training_bonus = bonus_rows[:target_index] if bonus_rows else []
+            actual = set(rows[target_index])
+            bonus_actual = set(bonus_rows[target_index]) if target_index < len(bonus_rows) else set()
+            target_round = target_index + 1
+            special_tickets, _ = build_high_prize_ticket_strategy(
+                training_rows,
+                training_bonus,
+                number_max,
+                draw_size,
+                target_round,
+                reports,
+                model_history,
+                lottery_type,
+                candidate_pool_limit=max(draw_size + 5, 12),
+            )
+            special_by_role = {ticket["ticket_role"]: ticket["numbers"] for ticket in special_tickets}
+            for model_key, model_name, model_type in model_defs:
+                scores = build_model_scores(training_rows, model_key, number_max, draw_size, target_round, training_bonus)
+                predicted = model_candidate_numbers(scores, draw_size)
+                matched = len(set(predicted) & actual)
+                bonus_hit = len(set(predicted) & bonus_actual)
+                detail_rows.append(
+                    {
+                        "period": period_label,
+                        "model_name": model_name,
+                        "model_type": model_type if model_key != "random_baseline" else "ランダム予測モデル",
+                        "matched": matched,
+                        "bonus_hit": bonus_hit,
+                    }
+                )
+            for special_key, model_name, model_type in special_defs:
+                if special_key == "ensemble":
+                    predicted = special_by_role.get("本命・安定型", [])
+                elif special_key == "high_prize":
+                    predicted = special_by_role.get("高額当選狙い・低人気型", [])
+                else:
+                    predicted = special_by_role.get("直近トレンド型", [])
+                matched = len(set(predicted) & actual)
+                bonus_hit = len(set(predicted) & bonus_actual)
+                detail_rows.append(
+                    {
+                        "period": period_label,
+                        "model_name": model_name,
+                        "model_type": model_type,
+                        "matched": matched,
+                        "bonus_hit": bonus_hit,
+                    }
+                )
+    if not detail_rows:
+        return pd.DataFrame(columns=BACKTEST_SUMMARY_COLUMNS)
+    detail_df = pd.DataFrame(detail_rows)
+    summary_rows = []
+    for (period, model_name), group in detail_df.groupby(["period", "model_name"], sort=False):
+        matches = pd.to_numeric(group["matched"], errors="coerce").fillna(0)
+        bonus_hits = pd.to_numeric(group["bonus_hit"], errors="coerce").fillna(0)
+        random_group = detail_df[(detail_df["period"] == period) & (detail_df["model_type"] == "ランダム予測モデル")]
+        random_avg = float(pd.to_numeric(random_group["matched"], errors="coerce").mean()) if not random_group.empty else 0.0
+        std = float(matches.std()) if len(matches) > 1 else 0.0
+        stability = _clamp(100.0 - (std / max(draw_size, 1) * 100.0))
+        summary_rows.append(
+            {
+                "lottery_type": lottery_type,
+                "period": period,
+                "model_name": model_name,
+                "model_type": str(group.iloc[0]["model_type"]),
+                "evaluated_draws": int(len(group)),
+                "average_match": rounded_or_none(float(matches.mean()), 3),
+                "max_match": int(matches.max()) if not matches.empty else 0,
+                "match3_rate": rounded_or_none(float((matches >= 3).mean() * 100), 1),
+                "match4_rate": rounded_or_none(float((matches >= 4).mean() * 100), 1),
+                "bonus_match_rate": rounded_or_none(float((bonus_hits > 0).mean() * 100), 1),
+                "stability": rounded_or_none(stability, 1),
+                "recent_score": rounded_or_none(float(matches.tail(5).mean()), 3),
+                "long_score": rounded_or_none(float(matches.mean()), 3),
+                "random_delta": rounded_or_none(float(matches.mean()) - random_avg, 3),
+                "expected_value": rounded_or_none(float(((matches + bonus_hits * 0.25) / max(draw_size, 1)).mean()), 3),
+                "created_at": created_at,
+            }
+        )
+    return pd.DataFrame(summary_rows, columns=BACKTEST_SUMMARY_COLUMNS).sort_values(
+        ["period", "expected_value", "average_match", "stability"],
+        ascending=[True, False, False, False],
+    ).reset_index(drop=True)
+
+
+def build_enhanced_ai_improvement_report(reports, weight_df=None, draw_size=None):
+    columns = ["項目", "内容"]
+    if reports is None or reports.empty:
+        return pd.DataFrame(
+            [
+                {"項目": "なぜ外れたか", "内容": "検証レポートがまだないため、結果登録後に分析します"},
+                {"項目": "次回の仮説", "内容": "予想、結果、検証、改善の履歴を蓄積して重みを調整します"},
+            ],
+            columns=columns,
+        )
+    df = reports.copy()
+    report_cols = _verification_column_set(df)
+    draw_column = report_cols["draw"]
+    if draw_column and draw_column in df:
+        df[draw_column] = pd.to_numeric(df[draw_column], errors="coerce").fillna(0)
+        df = df.sort_values(draw_column, ascending=False)
+    latest = df.iloc[0]
+    match_count = _safe_float(latest.get(report_cols["match"], 0) if report_cols["match"] else 0)
+    failure_text = latest.get(report_cols["failure"], "") if report_cols["failure"] else ""
+    improvement_text = latest.get(report_cols["improvement"], "") if report_cols["improvement"] else ""
+    hypothesis_text = latest.get(report_cols["hypothesis"], "") if report_cols["hypothesis"] else ""
+    if weight_df is not None and not weight_df.empty:
+        sorted_weights = weight_df.copy()
+        sorted_weights["applied_weight"] = pd.to_numeric(sorted_weights["applied_weight"], errors="coerce").fillna(1.0)
+        close_models = sorted_weights.sort_values("applied_weight", ascending=False)["model_name"].head(5).tolist()
+        weak_models = sorted_weights.sort_values("applied_weight", ascending=True)["model_name"].head(5).tolist()
+        weight_up = sorted_weights[sorted_weights["applied_weight"] >= 1.15]["model_name"].head(5).tolist()
+        weight_down = sorted_weights[sorted_weights["applied_weight"] <= 0.85]["model_name"].head(5).tolist()
+    else:
+        close_models = []
+        weak_models = []
+        weight_up = []
+        weight_down = []
+    if draw_size and match_count >= draw_size:
+        miss_reason = "全一致のため、次回は過学習しないよう同じ条件を継続検証"
+    elif failure_text:
+        miss_reason = str(failure_text)
+    else:
+        miss_reason = "当選番号の高低、合計値、直近トレンドのいずれかが予想条件から外れた可能性を検証"
+    rows = [
+        {"項目": "なぜ外れたか", "内容": miss_reason},
+        {"項目": "弱かったモデル", "内容": " / ".join(weak_models) if weak_models else "検証待ち"},
+        {"項目": "比較的近かったモデル", "内容": " / ".join(close_models) if close_models else "検証待ち"},
+        {"項目": "次回重みを上げるモデル", "内容": " / ".join(weight_up) if weight_up else "該当なし"},
+        {"項目": "次回重みを下げるモデル", "内容": " / ".join(weight_down) if weight_down else "該当なし"},
+        {"項目": "数字選定ルールの改善案", "内容": str(improvement_text or "低人気条件、合計値帯、直近トレンドの重みを分けて検証")},
+        {"項目": "次回の仮説", "内容": str(hypothesis_text or "成績上位モデルを軸に、低人気スコアを補助指標として使う")},
+    ]
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_condition_success_table(reports, number_max, match_column="本数字一致数", success_threshold=3):

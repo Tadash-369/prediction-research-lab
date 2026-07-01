@@ -18,9 +18,15 @@ if str(CORE_DIR) not in sys.path:
 
 from arl_research_engine import (
     ARL_MODEL_LABELS,
+    BACKTEST_SUMMARY_COLUMNS,
+    CONTINUOUS_WIN_RESEARCH_COLUMNS,
     CONTRIBUTION_COLUMNS,
+    ENSEMBLE_PREDICTION_COLUMNS,
+    MODEL_WEIGHT_HISTORY_COLUMNS,
+    POPULARITY_SCORE_COLUMNS,
     PURCHASE_COLUMNS,
     RESEARCH_CYCLE_COLUMNS,
+    TICKET_STRATEGY_COLUMNS,
     VIDEO_HYPOTHESIS_COLUMNS,
     add_verification_metrics,
     ai_improvement_weight_rows,
@@ -31,6 +37,11 @@ from arl_research_engine import (
     build_condition_success_table,
     build_contribution_ranking,
     build_contribution_rows,
+    build_continuous_win_research_rows,
+    build_enhanced_ai_improvement_report,
+    build_ensemble_prediction_rows,
+    build_high_prize_backtest_summary,
+    build_high_prize_ticket_strategy,
     build_research_cycle_rows,
     build_effective_conditions,
     build_hit_factor_summary,
@@ -38,9 +49,11 @@ from arl_research_engine import (
     build_model_dashboard,
     build_model_scores,
     build_model_support_map,
+    build_popularity_score_rows,
     build_purchase_group_summary,
     build_purchase_summary,
     build_research_flow_table,
+    build_ticket_strategy_rows,
     build_winning_condition_report,
     evaluate_purchase_history,
     extract_video_hypothesis,
@@ -50,6 +63,7 @@ from arl_research_engine import (
     merge_research_cycle_rows,
     parse_json_text,
     purchase_display_df,
+    ticket_strategy_display_frame,
     validate_purchase_numbers,
     weighted_model_text,
 )
@@ -60,6 +74,12 @@ RESULTS_CSV = DATA_DIR / "loto7.csv"
 SCORES_CSV = DATA_DIR / "loto7_next_number_scores.csv"
 PREDICTIONS_CSV = DATA_DIR / "loto7_predictions.csv"
 PURCHASES_CSV = DATA_DIR / "purchases.csv"
+ENSEMBLE_PREDICTIONS_CSV = DATA_DIR / "ensemble_predictions.csv"
+TICKET_STRATEGY_HISTORY_CSV = DATA_DIR / "ticket_strategy_history.csv"
+POPULARITY_SCORES_CSV = DATA_DIR / "popularity_scores.csv"
+CONTINUOUS_WIN_RESEARCH_CSV = DATA_DIR / "continuous_win_research.csv"
+BACKTEST_SUMMARY_CSV = DATA_DIR / "backtest_summary.csv"
+MODEL_WEIGHT_HISTORY_CSV = AI_IMPROVEMENT_DIR / "model_weight_history.csv"
 OFFICIAL_RESULTS_CSV = DATA_DIR / "loto7_results.csv"
 VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
 MODEL_SETTINGS_CSV = DATA_DIR / "loto7_model_settings.csv"
@@ -164,6 +184,19 @@ def save_csv(df, path, columns):
     df.reindex(columns=columns).to_csv(path, index=False, encoding="utf-8-sig")
 
 
+def append_research_rows(path, columns, rows):
+    if not rows:
+        return 0
+    existing = read_csv(path, columns)
+    incoming = pd.DataFrame(rows).reindex(columns=columns)
+    if existing.empty:
+        combined = incoming
+    else:
+        combined = pd.concat([existing.reindex(columns=columns), incoming], ignore_index=True)
+    save_csv(combined, path, columns)
+    return len(incoming)
+
+
 def model_key_from_name(model_name):
     for key, name in MODEL_LABELS.items():
         if name == model_name:
@@ -235,6 +268,142 @@ def row_numbers(row):
 
 def row_bonus_numbers(row):
     return sorted(to_int(row[column]) for column in BONUS_COLUMNS)
+
+
+def high_prize_history_context(result_history):
+    if result_history is None or result_history.empty:
+        return [], [], 1
+    history = result_history.copy()
+    round_column = history.columns[0]
+    history[round_column] = history[round_column].map(to_int)
+    history = history[history[round_column] > 0].sort_values(round_column)
+    number_rows = [row_numbers(row) for _, row in history.iterrows()]
+    bonus_rows = [row_bonus_numbers(row) for _, row in history.iterrows()]
+    target_round = int(history[round_column].max()) + 1 if not history.empty else 1
+    return number_rows, bonus_rows, target_round
+
+
+def save_high_prize_research_rows(tickets, weight_df, target_round):
+    created_at = now_text()
+    prediction_date = today_text()
+    saved = {}
+    saved["ensemble_predictions.csv"] = append_research_rows(
+        ENSEMBLE_PREDICTIONS_CSV,
+        ENSEMBLE_PREDICTION_COLUMNS,
+        build_ensemble_prediction_rows(tickets, "loto7", target_round, prediction_date, created_at),
+    )
+    saved["ticket_strategy_history.csv"] = append_research_rows(
+        TICKET_STRATEGY_HISTORY_CSV,
+        TICKET_STRATEGY_COLUMNS,
+        build_ticket_strategy_rows(tickets, "loto7", target_round, prediction_date, created_at),
+    )
+    saved["popularity_scores.csv"] = append_research_rows(
+        POPULARITY_SCORES_CSV,
+        POPULARITY_SCORE_COLUMNS,
+        build_popularity_score_rows(tickets, "loto7", target_round, prediction_date, created_at),
+    )
+    saved["continuous_win_research.csv"] = append_research_rows(
+        CONTINUOUS_WIN_RESEARCH_CSV,
+        CONTINUOUS_WIN_RESEARCH_COLUMNS,
+        build_continuous_win_research_rows(tickets, "loto7", target_round, prediction_date=prediction_date, created_at=created_at),
+    )
+    if weight_df is not None and not weight_df.empty:
+        weight_rows = weight_df.copy()
+        weight_rows["lottery_type"] = "loto7"
+        weight_rows["created_at"] = created_at
+        saved["ai_improvement/model_weight_history.csv"] = append_research_rows(
+            MODEL_WEIGHT_HISTORY_CSV,
+            MODEL_WEIGHT_HISTORY_COLUMNS,
+            weight_rows.to_dict("records"),
+        )
+    return saved
+
+
+def render_high_prize_continuous_mode(result_history, reports):
+    st.subheader("高額当選・連続当選強化モード")
+    st.caption("当選保証ではなく、予想、結果、検証、改善を継続するための研究モードです。")
+    number_rows, bonus_rows, target_round = high_prize_history_context(result_history)
+    if not number_rows:
+        st.warning("抽選履歴がないため、強化モードを作成できません。ロト7の結果CSVを確認してください。")
+        return
+
+    _, model_history = load_winning_condition_history(AI_IMPROVEMENT_DIR, "loto7")
+    tickets, weight_df = build_high_prize_ticket_strategy(
+        number_rows,
+        bonus_rows,
+        number_max=37,
+        draw_size=7,
+        target_round=target_round,
+        reports=reports,
+        model_history=model_history,
+        lottery_type="loto7",
+    )
+    ticket_df = ticket_strategy_display_frame(tickets)
+    mode_tabs = st.tabs(["高額当選・連続当選モード", "アンサンブル予測", "モデル重みランキング", "買い目別スコア", "バックテスト", "AI改善レポート"])
+
+    with mode_tabs[0]:
+        cols = st.columns(4)
+        cols[0].metric("対象回", target_round)
+        cols[1].metric("研究買い目", len(tickets))
+        cols[2].metric("対象モデル", len(ARL_MODEL_LABELS))
+        cols[3].metric("履歴回数", len(number_rows))
+        st.write("3口を本命・安定型、直近トレンド型、高額当選狙い・低人気型に分けて検証します。")
+        st.dataframe(build_research_flow_table(), width="stretch", hide_index=True)
+        if st.button("強化モードの研究履歴を保存", key="loto7_save_high_prize_mode"):
+            try:
+                saved = save_high_prize_research_rows(tickets, weight_df, target_round)
+                st.success(" / ".join(f"{name}: {count}件" for name, count in saved.items()))
+            except Exception as exc:
+                st.error(f"研究履歴の保存に失敗しました: {exc}")
+
+    with mode_tabs[1]:
+        if ticket_df.empty:
+            st.info("アンサンブル予測を作成できませんでした。抽選履歴と検証レポートを確認してください。")
+        else:
+            st.dataframe(ticket_df, width="stretch", hide_index=True)
+        st.markdown("**モデル重み**")
+        st.dataframe(weight_df, width="stretch", hide_index=True)
+
+    with mode_tabs[2]:
+        st.write("平均一致数、直近成績、長期成績、安定性、期待値、ボーナス一致率を使って重みを作成します。")
+        st.dataframe(weight_df.sort_values("applied_weight", ascending=False), width="stretch", hide_index=True)
+
+    with mode_tabs[3]:
+        if ticket_df.empty:
+            st.info("買い目別スコアはまだありません。")
+        else:
+            st.dataframe(ticket_df, width="stretch", hide_index=True)
+            popularity_rows = build_popularity_score_rows(tickets, "loto7", target_round, today_text(), now_text())
+            st.markdown("**低人気スコア内訳**")
+            st.dataframe(pd.DataFrame(popularity_rows), width="stretch", hide_index=True)
+
+    with mode_tabs[4]:
+        periods = st.multiselect("検証期間", [30, 50, 100, "all"], default=[30], key="loto7_high_prize_backtest_periods")
+        if st.button("強化バックテストを実行して保存", key="loto7_run_high_prize_backtest"):
+            with st.spinner("強化モードのバックテストを実行しています。"):
+                summary_df = build_high_prize_backtest_summary(
+                    number_rows,
+                    bonus_rows,
+                    number_max=37,
+                    draw_size=7,
+                    lottery_type="loto7",
+                    periods=periods,
+                    reports=reports,
+                    model_history=model_history,
+                )
+            st.session_state["loto7_high_prize_backtest"] = summary_df
+            if not summary_df.empty:
+                append_research_rows(BACKTEST_SUMMARY_CSV, BACKTEST_SUMMARY_COLUMNS, summary_df.to_dict("records"))
+                st.success(f"backtest_summary.csv に {len(summary_df)} 件保存しました。")
+        summary_df = st.session_state.get("loto7_high_prize_backtest", pd.DataFrame())
+        if summary_df.empty:
+            st.info("検証期間を選んでバックテストを実行してください。")
+        else:
+            st.dataframe(summary_df, width="stretch", hide_index=True)
+
+    with mode_tabs[5]:
+        ai_report = build_enhanced_ai_improvement_report(reports, weight_df, draw_size=7)
+        st.dataframe(ai_report, width="stretch", hide_index=True)
 
 
 def merge_official_results(results):
@@ -1670,7 +1839,7 @@ def render_lab():
         reports = add_verification_metrics(reports, draw_size=7)
         contributions = read_csv(CONTRIBUTIONS_CSV, CONTRIBUTION_COLUMNS)
     result_history = merge_official_results(read_csv(RESULTS_CSV))
-    tabs = st.tabs(["バックテスト", "検証レポート", "モデル貢献度", "条件別成功率", "AI改善レポート", "当選条件分析", "動画仮説研究", "予想履歴", "公式結果", "買い目管理"])
+    tabs = st.tabs(["バックテスト", "検証レポート", "モデル貢献度", "条件別成功率", "AI改善レポート", "当選条件分析", "動画仮説研究", "予想履歴", "公式結果", "買い目管理", "高額当選・連続当選モード"])
     with tabs[0]:
         st.markdown("**新フロー**")
         st.dataframe(build_research_flow_table(), width="stretch", hide_index=True)
@@ -1799,6 +1968,8 @@ def render_lab():
             st.dataframe(official.sort_values("開催回", ascending=False), width="stretch", hide_index=True)
     with tabs[9]:
         render_purchase_manager(result_history)
+    with tabs[10]:
+        render_high_prize_continuous_mode(result_history, reports)
 
 
 render_registration_form()
