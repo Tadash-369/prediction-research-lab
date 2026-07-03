@@ -1115,13 +1115,13 @@ def run_backtest(results, lookback_rounds=30, min_training_rounds=40):
     return summary_df, detail_df.sort_values(["開催回", "モデル", "候補番号"], ascending=[False, True, True])
 
 
-def run_pre_prediction_research(results):
+def run_pre_prediction_research(results, persist_setting=False):
     if results.empty or len(results) <= 40:
         return pd.DataFrame(), pd.DataFrame(), None
     lookback_rounds = min(5, max(3, len(results) - 40))
     summary_df, detail_df = run_backtest(results, lookback_rounds=lookback_rounds)
     best_key = best_actionable_model_key(summary_df)
-    if best_key:
+    if best_key and persist_setting:
         save_active_model_setting(best_key, f"予想生成前の履歴分析・直近{lookback_rounds}回評価")
     return summary_df, detail_df, best_key
 
@@ -1157,23 +1157,46 @@ def safe_model_id(model_key):
     return str(model_key).replace(" ", "_").replace("/", "_")
 
 
+def valid_prediction_numbers(numbers):
+    try:
+        parsed = [int(number) for number in numbers]
+    except Exception:
+        return []
+    unique = sorted(set(parsed))
+    if len(parsed) != 7 or len(unique) != 7:
+        return []
+    if any(number < 1 or number > 37 for number in unique):
+        return []
+    return unique
+
+
 def save_prediction_picks(picks, target_round, model_key, model_name):
     predictions = read_csv(PREDICTIONS_CSV, PREDICTION_COLUMNS)
     existing = set()
+    existing_ids = set()
     if not predictions.empty:
         for _, row in predictions.iterrows():
             existing.add((to_int(row["開催回"]), to_int(row["候補番号"]), str(row["予想番号"]), str(row["使用モデル"])))
+            existing_ids.add(str(row["予想ID"]).strip())
 
     rows = []
+    skipped = 0
+    errors = []
     prediction_date = today_text()
     for index, pick in enumerate(picks, start=1):
-        number_text = numbers_to_text(pick["numbers"])
+        numbers = valid_prediction_numbers(pick.get("numbers", []))
+        if not numbers:
+            errors.append(f"第{index}候補は7個の1〜37の重複なし数字ではないため保存しませんでした。")
+            continue
+        number_text = numbers_to_text(numbers)
         key = (target_round, index, number_text, model_name)
-        if key in existing:
+        prediction_id = f"L7-{target_round}-{prediction_date.replace('/', '')}-{safe_model_id(model_key)}-{index}"
+        if key in existing or prediction_id in existing_ids:
+            skipped += 1
             continue
         rows.append(
             {
-                "予想ID": f"L7-{target_round}-{prediction_date.replace('/', '')}-{safe_model_id(model_key)}-{index}",
+                "予想ID": prediction_id,
                 "開催回": target_round,
                 "予想日": prediction_date,
                 "候補番号": index,
@@ -1188,7 +1211,7 @@ def save_prediction_picks(picks, target_round, model_key, model_name):
         predictions["開催回"] = predictions["開催回"].map(to_int)
         predictions["候補番号"] = predictions["候補番号"].map(to_int)
         save_csv(predictions.sort_values(["開催回", "候補番号", "使用モデル", "保存日時"]), PREDICTIONS_CSV, PREDICTION_COLUMNS)
-    return len(rows)
+    return {"saved": len(rows), "skipped": skipped, "errors": errors}
 
 
 def render_next_score_prediction(score_df, results, target_round):
@@ -1198,11 +1221,15 @@ def render_next_score_prediction(score_df, results, target_round):
         st.info("候補スコアCSVと抽せん履歴が揃うと、スコアベース次回予測を表示します。")
         return
     if st.button("候補スコア活用予測を保存", key="loto7_next_score_prediction_save"):
-        saved_count = save_prediction_picks(picks, target_round, "next_score_prediction", "候補スコア活用予測")
-        if saved_count:
-            st.success(f"候補スコア活用予測を loto7_predictions.csv に {saved_count}件保存しました。")
+        result = save_prediction_picks(picks, target_round, "score", "候補スコア活用予測")
+        if result["saved"]:
+            st.success(f"候補スコア活用予測を loto7_predictions.csv に {result['saved']}件保存しました。")
         else:
             st.info("候補スコア活用予測の同一予想は保存済みです。")
+        if result["skipped"]:
+            st.info(f"重複のため {result['skipped']}件をスキップしました。")
+        for error in result["errors"]:
+            st.warning(error)
     for index, pick in enumerate(picks, start=1):
         st.markdown(f"**候補スコア活用予測 {index}: {numbers_to_text(pick['numbers'])}**")
         st.write(f"理由: {pick['reason']}")
@@ -1236,11 +1263,15 @@ def render_ai_weighted_prediction(score_df, results, target_round, weight_summar
         st.info("候補スコアCSVと抽せん履歴が揃うと、AI改善反映予測を表示します。")
         return
     if st.button("AI改善反映予測を保存", key="loto7_ai_weighted_prediction_save"):
-        saved_count = save_prediction_picks(picks, target_round, "ai_weighted_prediction", "AI改善反映予測")
-        if saved_count:
-            st.success(f"AI改善反映予測を loto7_predictions.csv に {saved_count}件保存しました。")
+        result = save_prediction_picks(picks, target_round, "ai", "AI改善反映予測")
+        if result["saved"]:
+            st.success(f"AI改善反映予測を loto7_predictions.csv に {result['saved']}件保存しました。")
         else:
             st.info("AI改善反映予測の同一予想は保存済みです。")
+        if result["skipped"]:
+            st.info(f"重複のため {result['skipped']}件をスキップしました。")
+        for error in result["errors"]:
+            st.warning(error)
     for index, pick in enumerate(picks, start=1):
         st.markdown(f"**AI改善反映予測 {index}: {numbers_to_text(pick['numbers'])}**")
         st.write(f"理由: {pick['reason']}")
@@ -1540,6 +1571,19 @@ def render_prediction_area(results):
         return
     results = results.copy()
     results["開催回"] = results["開催回"].map(to_int)
+    target_round = int(results["開催回"].max()) + 1
+    st.info(
+        "ロト7予測は、画面に表示しただけでは保存されません。"
+        "「このロト7予測を保存」ボタンを押した時だけ、CSVに予測履歴として記録されます。"
+        "保存された予測は、次回結果が出た後の検証・AI改善・モデル貢献度分析に使用されます。"
+    )
+    with st.expander(f"第{target_round}回抽選後の運用手順", expanded=False):
+        st.write(f"1. 第{target_round}回予測を確認・保存")
+        st.write(f"2. 第{target_round}回結果を登録")
+        st.write("3. 予測と結果を照合")
+        st.write("4. AI改善履歴とモデル貢献度を保存")
+        st.write(f"5. 第{target_round + 1}回予測を生成・保存")
+        st.write("6. Gitで研究履歴を保存")
     st.markdown("**研究フロー: 当選番号追加 → 結果分析 → 反省履歴保存 → 履歴分析 → モデル評価 → 改善条件抽出 → 次回予想生成**")
     with st.spinner("予想生成前の履歴分析とモデル評価を実行しています..."):
         pre_summary, _, best_key = get_pre_prediction_research(results)
@@ -1583,14 +1627,22 @@ def render_prediction_area(results):
     with st.expander("選択モデルの即時計算スコア"):
         st.dataframe(scores.head(20), width="stretch", hide_index=True)
 
-    target_round = int(results["開催回"].max()) + 1
     picks = generate_prediction_picks(results, model_key=model_key)
     st.subheader("次回予想買い目")
     if not picks:
         st.info("予想生成に必要な履歴が不足しています。")
         return
-    saved_count = save_prediction_picks(picks, target_round, model_key, MODEL_LABELS[model_key])
-    st.caption(f"予測研究所ログ: 第{target_round}回の予想を loto7_predictions.csv に保存しました。新規保存 {saved_count}件。")
+    st.caption(f"第{target_round}回の標準予測を表示しています。まだ loto7_predictions.csv には保存していません。")
+    if st.button("このロト7予測を保存", key="loto7_standard_prediction_save"):
+        result = save_prediction_picks(picks, target_round, model_key, MODEL_LABELS[model_key])
+        if result["saved"]:
+            st.success(f"第{target_round}回のロト7予測を loto7_predictions.csv に {result['saved']}件保存しました。")
+        else:
+            st.info("同じ抽選回・モデル・予測番号、または同じ予想IDの予測は保存済みです。")
+        if result["skipped"]:
+            st.info(f"重複のため {result['skipped']}件をスキップしました。")
+        for error in result["errors"]:
+            st.warning(error)
     for index, pick in enumerate(picks, start=1):
         st.markdown(f"**第{index}候補：{numbers_to_text(pick['numbers'])}**")
         st.write(f"理由：{pick['reason']}")
