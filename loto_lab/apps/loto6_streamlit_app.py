@@ -48,6 +48,7 @@ from arl_research_engine import (
     build_ensemble_prediction_rows,
     build_high_prize_backtest_summary,
     build_high_prize_ticket_strategy,
+    build_fixed_prediction_overview,
     build_research_cycle_rows,
     build_effective_conditions,
     build_hit_factor_summary,
@@ -1903,6 +1904,13 @@ def verify_predictions_for_round(round_no=None):
         predictions = predictions[predictions["開催回"] == int(round_no)]
         official_results = official_results[official_results["開催回"] == int(round_no)]
 
+    reports = read_csv(VERIFICATION_REPORTS_CSV, VERIFICATION_COLUMNS)
+    if not reports.empty and "予想ID" in reports:
+        existing_ids = set(reports["予想ID"].astype(str).str.strip())
+        predictions = predictions[~predictions["予想ID"].astype(str).str.strip().isin(existing_ids)]
+    if predictions.empty:
+        return 0
+
     report_rows = []
     contribution_rows = []
     winning_condition_rows = []
@@ -1956,11 +1964,6 @@ def verify_predictions_for_round(round_no=None):
                 saved_at=now_text(),
             )
         )
-
-    reports = read_csv(VERIFICATION_REPORTS_CSV, VERIFICATION_COLUMNS)
-    if not reports.empty and report_rows:
-        existing_ids = {str(row["予想ID"]) for _, row in pd.DataFrame(report_rows).iterrows()}
-        reports = reports[~reports["予想ID"].astype(str).isin(existing_ids)]
 
     if report_rows:
         reports = pd.concat([reports, pd.DataFrame(report_rows)], ignore_index=True)
@@ -2394,6 +2397,19 @@ def render_prediction_lab():
     metric_cols[1].metric("公式結果ログ", len(official_results))
     metric_cols[2].metric("検証レポート", len(reports))
     metric_cols[3].metric("貢献度ログ", len(contributions))
+
+    fixed_predictions, target_round, fixed_status = build_fixed_prediction_overview(
+        predictions,
+        official_results,
+        draw_size=6,
+        number_max=43,
+    )
+    if fixed_predictions.empty:
+        st.info(fixed_status)
+    else:
+        st.markdown(f"**第{target_round}回 固定予測（次回検証対象）**")
+        st.caption(f"状態: {fixed_status}。抽選結果登録後、この{len(fixed_predictions)}件を検証レポートへ照合します。")
+        st.dataframe(fixed_predictions, width="stretch", hide_index=True)
 
     if not official_results.empty:
         st.markdown("**最近の公式結果ログ**")

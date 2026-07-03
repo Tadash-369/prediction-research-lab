@@ -32,6 +32,7 @@ from arl_research_engine import (
     build_ai_improvement_summary,
     build_condition_success_table,
     build_contribution_ranking,
+    build_fixed_prediction_overview,
     build_model_dashboard,
     build_purchase_summary,
     build_research_flow_table,
@@ -222,8 +223,10 @@ def load_purchase_tracking_overview():
 
 def render_home():
     loto6_predictions = read_csv(DATA_DIR / "predictions.csv")
+    loto6_official = read_csv(DATA_DIR / "results.csv")
     loto6_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "verification_reports.csv"), draw_size=6)
     loto7_predictions = read_csv(DATA_DIR / "loto7_predictions.csv")
+    loto7_official = read_csv(DATA_DIR / "loto7_results.csv")
     loto7_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "loto7_verification_reports.csv"), draw_size=7)
     purchases, purchase_warnings = load_purchase_tracking_overview()
     docs = list(DOCS_DIR.glob("*.md")) if DOCS_DIR.exists() else []
@@ -261,6 +264,25 @@ def render_home():
         summary[column] = summary[column].astype(str)
     st.markdown("**研究所サマリー**")
     display_dataframe(summary, width="stretch", hide_index=True)
+
+    st.markdown("**次回検証対象の固定予測**")
+    prediction_tabs = st.tabs(["ロト6", "ロト7"])
+    for tab, label, predictions, official, draw_size, number_max in [
+        (prediction_tabs[0], "ロト6", loto6_predictions, loto6_official, 6, 43),
+        (prediction_tabs[1], "ロト7", loto7_predictions, loto7_official, 7, 37),
+    ]:
+        with tab:
+            fixed_predictions, target_round, fixed_status = build_fixed_prediction_overview(
+                predictions,
+                official,
+                draw_size=draw_size,
+                number_max=number_max,
+            )
+            if fixed_predictions.empty:
+                st.info(f"{label}: {fixed_status}")
+            else:
+                st.caption(f"{label} 第{target_round}回 / 状態: {fixed_status}")
+                display_dataframe(fixed_predictions, width="stretch", hide_index=True)
 
     score_overview = pd.DataFrame(
         [
@@ -384,6 +406,19 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
     cols[1].metric("公式結果ログ", len(official))
     cols[2].metric("検証レポート", len(reports))
     cols[3].metric("貢献度ログ", len(contributions))
+
+    fixed_predictions, target_round, fixed_status = build_fixed_prediction_overview(
+        predictions,
+        official,
+        draw_size=draw_size,
+        number_max=number_max,
+    )
+    if fixed_predictions.empty:
+        st.info(f"{name}: {fixed_status}")
+    else:
+        st.markdown(f"**{name} 第{target_round}回 固定予測（次回検証対象）**")
+        st.caption(f"状態: {fixed_status}")
+        display_dataframe(fixed_predictions, width="stretch", hide_index=True)
 
     st.markdown("**研究フロー**")
     display_dataframe(build_research_flow_table(), width="stretch", hide_index=True)

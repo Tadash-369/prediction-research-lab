@@ -335,6 +335,66 @@ def parse_numbers(value, number_max=None):
     return sorted(numbers)
 
 
+def build_fixed_prediction_overview(predictions, official_results=None, draw_size=6, number_max=None):
+    columns = [
+        "開催回",
+        "予想日",
+        "候補番号",
+        "使用モデル",
+        "予想番号",
+        "予測スコア",
+        "高額当選・連続当選モード",
+        "検証状態",
+        "保存日時",
+    ]
+    if predictions is None or predictions.empty or "開催回" not in predictions:
+        return pd.DataFrame(columns=columns), None, "予想履歴がありません。"
+
+    df = predictions.copy()
+    df["_draw_no"] = pd.to_numeric(df["開催回"], errors="coerce")
+    df = df[df["_draw_no"].notna()]
+    if df.empty:
+        return pd.DataFrame(columns=columns), None, "開催回を読み取れる予想履歴がありません。"
+    df["_draw_no"] = df["_draw_no"].astype(int)
+
+    official_rounds = set()
+    if official_results is not None and not official_results.empty and "開催回" in official_results:
+        official_values = pd.to_numeric(official_results["開催回"], errors="coerce").dropna()
+        official_rounds = {int(value) for value in official_values}
+
+    pending = df[~df["_draw_no"].isin(official_rounds)] if official_rounds else df
+    source = pending if not pending.empty else df
+    target_round = int(source["_draw_no"].max())
+    target = source[source["_draw_no"] == target_round].copy()
+    status = "結果待ち" if target_round not in official_rounds else "公式結果あり・検証可能"
+
+    if "予測スコア" not in target:
+        target["予測スコア"] = "-"
+    if "保存日時" not in target:
+        target["保存日時"] = "-"
+    for column in ("予想日", "候補番号", "使用モデル", "予想番号"):
+        if column not in target:
+            target[column] = ""
+
+    def normalized_numbers(value):
+        numbers = parse_numbers(value, number_max)
+        if len(numbers) == draw_size and len(set(numbers)) == draw_size:
+            return numbers_to_text(numbers)
+        return str(value or "")
+
+    def research_mode(model_name):
+        text = str(model_name or "")
+        mode_words = ("高額", "連続", "アンサンブル", "低人気")
+        return "対象" if any(word in text for word in mode_words) else "通常予測"
+
+    target["開催回"] = target["_draw_no"].astype(int)
+    target["予想番号"] = target["予想番号"].map(normalized_numbers)
+    target["高額当選・連続当選モード"] = target["使用モデル"].map(research_mode)
+    target["検証状態"] = status
+    target = target.sort_values(["開催回", "候補番号", "使用モデル"], ascending=[False, True, True])
+    return target.reindex(columns=columns), target_round, status
+
+
 def validate_purchase_numbers(value, draw_size, number_max):
     raw_text = str(value or "").strip()
     if not raw_text:
@@ -1023,6 +1083,30 @@ def write_history_jsonl(df, path):
             handle.write(json.dumps(cleaned, ensure_ascii=False, default=str) + "\n")
 
 
+def record_key_set(df, key_columns):
+    if df is None or df.empty:
+        return set()
+    frame = df.reindex(columns=key_columns)
+    return {
+        tuple(str(row.get(column, "")).strip() for column in key_columns)
+        for _, row in frame.iterrows()
+    }
+
+
+def filter_existing_records(incoming, existing, key_columns):
+    if incoming is None or incoming.empty:
+        return incoming
+    existing_keys = record_key_set(existing, key_columns)
+    if not existing_keys:
+        return incoming
+    return incoming[
+        incoming.apply(
+            lambda row: tuple(str(row.get(column, "")).strip() for column in key_columns) not in existing_keys,
+            axis=1,
+        )
+    ]
+
+
 def append_winning_condition_history(history_dir, main_rows, model_rows):
     if not main_rows and not model_rows:
         return
@@ -1035,10 +1119,13 @@ def append_winning_condition_history(history_dir, main_rows, model_rows):
     if main_rows:
         existing = read_history_csv(main_path, WINNING_CONDITION_HISTORY_COLUMNS)
         incoming = pd.DataFrame(main_rows, columns=WINNING_CONDITION_HISTORY_COLUMNS)
-        combined = pd.concat([existing, incoming], ignore_index=True).reindex(columns=WINNING_CONDITION_HISTORY_COLUMNS)
-        combined = combined.drop_duplicates(["lottery_type", "draw_no", "prediction_id"], keep="last")
-        combined.to_csv(main_path, index=False, encoding="utf-8-sig")
-        write_history_jsonl(combined, jsonl_path)
+        key_columns = ["lottery_type", "draw_no", "prediction_id"]
+        incoming = filter_existing_records(incoming, existing, key_columns)
+        if not incoming.empty:
+            combined = pd.concat([existing, incoming], ignore_index=True).reindex(columns=WINNING_CONDITION_HISTORY_COLUMNS)
+            combined = combined.drop_duplicates(key_columns, keep="first")
+            combined.to_csv(main_path, index=False, encoding="utf-8-sig")
+            write_history_jsonl(combined, jsonl_path)
 
     if model_rows:
         existing_models = read_history_csv(model_path, MODEL_IMPROVEMENT_HISTORY_COLUMNS)
@@ -1047,9 +1134,12 @@ def append_winning_condition_history(history_dir, main_rows, model_rows):
             for row in model_rows
         ]
         incoming_models = pd.DataFrame(normalized_rows, columns=MODEL_IMPROVEMENT_HISTORY_COLUMNS)
-        combined_models = pd.concat([existing_models, incoming_models], ignore_index=True).reindex(columns=MODEL_IMPROVEMENT_HISTORY_COLUMNS)
-        combined_models = combined_models.drop_duplicates(["lottery_type", "draw_no", "prediction_id", "model_name"], keep="last")
-        combined_models.to_csv(model_path, index=False, encoding="utf-8-sig")
+        key_columns = ["lottery_type", "draw_no", "prediction_id", "model_name"]
+        incoming_models = filter_existing_records(incoming_models, existing_models, key_columns)
+        if not incoming_models.empty:
+            combined_models = pd.concat([existing_models, incoming_models], ignore_index=True).reindex(columns=MODEL_IMPROVEMENT_HISTORY_COLUMNS)
+            combined_models = combined_models.drop_duplicates(key_columns, keep="first")
+            combined_models.to_csv(model_path, index=False, encoding="utf-8-sig")
 
 
 def load_winning_condition_history(history_dir, lottery_type=None):
@@ -1494,8 +1584,9 @@ def merge_contribution_rows(existing, rows):
     if existing is None or existing.empty:
         return incoming
     existing = existing.reindex(columns=CONTRIBUTION_COLUMNS)
-    ids = set(incoming["予想ID"].astype(str))
-    existing = existing[~existing["予想ID"].astype(str).isin(ids)]
+    incoming = filter_existing_records(incoming, existing, ["予想ID"])
+    if incoming.empty:
+        return existing
     return pd.concat([existing, incoming], ignore_index=True).reindex(columns=CONTRIBUTION_COLUMNS)
 
 
@@ -1533,8 +1624,9 @@ def merge_research_cycle_rows(existing, rows):
     if existing is None or existing.empty:
         return incoming
     existing = existing.reindex(columns=RESEARCH_CYCLE_COLUMNS)
-    ids = set(incoming["予想ID"].astype(str))
-    existing = existing[~existing["予想ID"].astype(str).isin(ids)]
+    incoming = filter_existing_records(incoming, existing, ["予想ID"])
+    if incoming.empty:
+        return existing
     return pd.concat([existing, incoming], ignore_index=True).reindex(columns=RESEARCH_CYCLE_COLUMNS)
 
 
