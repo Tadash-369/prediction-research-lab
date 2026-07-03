@@ -122,7 +122,6 @@ PRIZE_AMOUNT_COLUMNS = ["1等賞金", "2等賞金", "3等賞金", "4等賞金", 
 PRIZE_FILL_COLUMNS = [*PRIZE_COUNT_COLUMNS, *PRIZE_AMOUNT_COLUMNS, "キャリーオーバー"]
 SET_COLUMNS = ["開催回", "日付", "球セット", "信頼度", "根拠", "動画メタID", "メモ"]
 NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字"]
-:loto6_streamlit_app.py
 FILL_ONLY_COLUMNS = ["日付", *NUMBER_COLUMNS, "BONUS数字", *PRIZE_FILL_COLUMNS]
 
 SCORE_COLUMNS = ["順位", "数字", "スコア", "出現回数", "直近30回スコア", "未出現回数", "ボーナス出現回数", "根拠", "更新日時"]

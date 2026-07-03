@@ -253,7 +253,6 @@ def render_home():
                 "平均期待値": average_metric_text(loto7_reports, "期待値"),
                 "状態": "運用中" if len(loto7_reports) else "検証待ち",
             },
-            {"部門": "投資", "予想保存数": "-", "検証数": "-", "平均一致数": "-", "平均期待値": "-", "状態": "基礎機能実装中"},
             {"部門": "AI改善", "予想保存数": "-", "検証数": len(loto6_reports) + len(loto7_reports), "平均一致数": "-", "平均期待値": "-", "状態": "運用中"},
             {"部門": "保守", "予想保存数": "-", "検証数": "-", "平均一致数": "-", "平均期待値": "-", "状態": "同期・補完対応"},
         ]
@@ -439,89 +438,6 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
         else:
             display_dataframe(video_logs.sort_values("保存日時", ascending=False), width="stretch", hide_index=True)
 
-
-def render_investment_lab():
-    investment_dir = PROJECT_ROOT / "investment_lab" / "data"
-    portfolio_columns = ["銘柄コード", "銘柄名", "分類", "保有数", "取得単価", "現在値", "配当単価", "メモ"]
-    dividend_columns = ["日付", "銘柄コード", "銘柄名", "受取配当", "税引後", "メモ"]
-    watch_columns = ["対象", "分類", "現在値", "移動平均", "RSI", "MACD", "配当利回り", "PER", "PBR", "EPS成長率", "判定"]
-    portfolio_path = investment_dir / "portfolio.csv"
-    dividend_path = investment_dir / "dividends.csv"
-    watch_path = investment_dir / "watchlist.csv"
-
-    portfolio = read_csv(portfolio_path, portfolio_columns)
-    dividends = read_csv(dividend_path, dividend_columns)
-    watchlist = read_csv(watch_path, watch_columns)
-    if portfolio.empty:
-        portfolio = pd.DataFrame(
-            [
-                {"銘柄コード": "1321", "銘柄名": "日経225 ETF", "分類": "ETF", "保有数": 0, "取得単価": 0, "現在値": 0, "配当単価": 0, "メモ": ""},
-                {"銘柄コード": "SPY", "銘柄名": "S&P500 ETF", "分類": "米国ETF", "保有数": 0, "取得単価": 0, "現在値": 0, "配当単価": 0, "メモ": ""},
-            ],
-            columns=portfolio_columns,
-        )
-    if watchlist.empty:
-        watchlist = pd.DataFrame(
-            [
-                {"対象": "日経平均", "分類": "指数", "現在値": 0, "移動平均": 0, "RSI": 0, "MACD": 0, "配当利回り": 0, "PER": 0, "PBR": 0, "EPS成長率": 0, "判定": "観察"},
-                {"対象": "ドル円", "分類": "為替", "現在値": 0, "移動平均": 0, "RSI": 0, "MACD": 0, "配当利回り": 0, "PER": 0, "PBR": 0, "EPS成長率": 0, "判定": "観察"},
-            ],
-            columns=watch_columns,
-        )
-
-    portfolio_calc = portfolio.copy()
-    for column in ["保有数", "取得単価", "現在値", "配当単価"]:
-        portfolio_calc[column] = pd.to_numeric(portfolio_calc[column], errors="coerce").fillna(0)
-    portfolio_calc["評価額"] = portfolio_calc["保有数"] * portfolio_calc["現在値"]
-    portfolio_calc["取得額"] = portfolio_calc["保有数"] * portfolio_calc["取得単価"]
-    portfolio_calc["損益"] = portfolio_calc["評価額"] - portfolio_calc["取得額"]
-    portfolio_calc["年間配当予想"] = portfolio_calc["保有数"] * portfolio_calc["配当単価"]
-    total_value = float(portfolio_calc["評価額"].sum())
-    total_profit = float(portfolio_calc["損益"].sum())
-    total_dividend = float(portfolio_calc["年間配当予想"].sum())
-    yield_rate = round(total_dividend / total_value * 100, 2) if total_value else 0.0
-
-    cols = st.columns(4)
-    cols[0].metric("評価額", f"{round(total_value):,}")
-    cols[1].metric("損益", f"{round(total_profit):,}")
-    cols[2].metric("年間配当予想", f"{round(total_dividend):,}")
-    cols[3].metric("配当利回り", f"{yield_rate}%")
-
-    targets = pd.DataFrame(
-        [
-            {"対象": "日経平均", "分析項目": "移動平均 / RSI / MACD / ボリンジャーバンド / 出来高"},
-            {"対象": "TOPIX", "分析項目": "移動平均 / RSI / MACD / ボリンジャーバンド / 出来高"},
-            {"対象": "S&P500", "分析項目": "移動平均 / RSI / MACD / ボリンジャーバンド / 出来高"},
-            {"対象": "NASDAQ", "分析項目": "移動平均 / RSI / MACD / ボリンジャーバンド / 出来高"},
-            {"対象": "ドル円", "分析項目": "移動平均 / RSI / MACD / ボリンジャーバンド / 出来高"},
-            {"対象": "高配当株", "分析項目": "配当利回り / PER / PBR / EPS成長率 / 出来高"},
-            {"対象": "ETF", "分析項目": "移動平均 / RSI / MACD / 配当利回り / 出来高"},
-            {"対象": "米国ETF", "分析項目": "移動平均 / RSI / MACD / 配当利回り / 出来高"},
-            {"対象": "優待株", "分析項目": "配当利回り / PER / PBR / EPS成長率"},
-        ]
-    )
-    tabs = st.tabs(["ポートフォリオ", "配当管理", "売買候補", "分析対象"])
-    with tabs[0]:
-        edited = st.data_editor(portfolio, num_rows="dynamic", width="stretch", hide_index=True, key="portfolio_editor")
-        if st.button("ポートフォリオを保存"):
-            save_csv(edited, portfolio_path, portfolio_columns)
-            st.success("ポートフォリオを保存しました。")
-        st.markdown("**集計**")
-        display_dataframe(portfolio_calc, width="stretch", hide_index=True)
-    with tabs[1]:
-        edited_dividends = st.data_editor(dividends, num_rows="dynamic", width="stretch", hide_index=True, key="dividend_editor")
-        if st.button("配当履歴を保存"):
-            save_csv(edited_dividends, dividend_path, dividend_columns)
-            st.success("配当履歴を保存しました。")
-    with tabs[2]:
-        edited_watchlist = st.data_editor(watchlist, num_rows="dynamic", width="stretch", hide_index=True, key="watchlist_editor")
-        if st.button("売買候補を保存"):
-            save_csv(edited_watchlist, watch_path, watch_columns)
-            st.success("売買候補を保存しました。")
-    with tabs[3]:
-        display_dataframe(targets, width="stretch", hide_index=True)
-
-
 def render_ai_department():
     loto6_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "verification_reports.csv"), draw_size=6)
     loto7_reports = add_verification_metrics(read_csv(VERIFICATION_DIR / "loto7_verification_reports.csv"), draw_size=7)
@@ -566,77 +482,10 @@ def render_verification_department():
         )
     display_dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-
-def render_hospital_system():
-    hospital_dir = PROJECT_ROOT / "hospital_tools" / "documents" / "data"
-    staff_columns = ["職員ID", "氏名", "職種", "常勤換算", "夜勤可否", "委員会", "メモ"]
-    shift_columns = ["日付", "勤務帯", "必要人数", "配置人数", "不足人数", "メモ"]
-    committee_columns = ["委員会名", "担当者", "開催頻度", "負担度", "改善メモ"]
-    workload_columns = ["業務", "担当部署", "件数", "所要分", "負担度", "改善案"]
-    staff_path = hospital_dir / "staff.csv"
-    shift_path = hospital_dir / "shift_requirements.csv"
-    committee_path = hospital_dir / "committees.csv"
-    workload_path = hospital_dir / "workload.csv"
-
-    staff = read_csv(staff_path, staff_columns)
-    shifts = read_csv(shift_path, shift_columns)
-    committees = read_csv(committee_path, committee_columns)
-    workload = read_csv(workload_path, workload_columns)
-    if staff.empty:
-        staff = pd.DataFrame([{"職員ID": "S001", "氏名": "", "職種": "看護師", "常勤換算": 1.0, "夜勤可否": "可", "委員会": "", "メモ": ""}], columns=staff_columns)
-    if shifts.empty:
-        shifts = pd.DataFrame([{"日付": "", "勤務帯": "日勤", "必要人数": 0, "配置人数": 0, "不足人数": 0, "メモ": ""}], columns=shift_columns)
-    if committees.empty:
-        committees = pd.DataFrame([{"委員会名": "", "担当者": "", "開催頻度": "月1回", "負担度": 0, "改善メモ": ""}], columns=committee_columns)
-    if workload.empty:
-        workload = pd.DataFrame([{"業務": "", "担当部署": "", "件数": 0, "所要分": 0, "負担度": 0, "改善案": ""}], columns=workload_columns)
-
-    staff_count = len(staff)
-    shortage_total = numeric_column(shifts, "不足人数").sum() if not shifts.empty else 0
-    workload_score = numeric_column(workload, "負担度").mean() if not workload.empty else 0
-    cols = st.columns(3)
-    cols[0].metric("登録職員", staff_count)
-    cols[1].metric("不足人数合計", int(shortage_total))
-    cols[2].metric("平均負担度", round(float(workload_score), 2))
-
-    tabs = st.tabs(["職員", "勤務表", "委員会", "業務負担", "機能一覧"])
-    with tabs[0]:
-        edited_staff = st.data_editor(staff, num_rows="dynamic", width="stretch", hide_index=True, key="hospital_staff_editor")
-        if st.button("職員データを保存"):
-            save_csv(edited_staff, staff_path, staff_columns)
-            st.success("職員データを保存しました。")
-    with tabs[1]:
-        edited_shifts = st.data_editor(shifts, num_rows="dynamic", width="stretch", hide_index=True, key="hospital_shift_editor")
-        if st.button("勤務表条件を保存"):
-            save_csv(edited_shifts, shift_path, shift_columns)
-            st.success("勤務表条件を保存しました。")
-    with tabs[2]:
-        edited_committees = st.data_editor(committees, num_rows="dynamic", width="stretch", hide_index=True, key="hospital_committee_editor")
-        if st.button("委員会データを保存"):
-            save_csv(edited_committees, committee_path, committee_columns)
-            st.success("委員会データを保存しました。")
-    with tabs[3]:
-        edited_workload = st.data_editor(workload, num_rows="dynamic", width="stretch", hide_index=True, key="hospital_workload_editor")
-        if st.button("業務負担データを保存"):
-            save_csv(edited_workload, workload_path, workload_columns)
-            st.success("業務負担データを保存しました。")
-    with tabs[4]:
-        functions = pd.DataFrame(
-            [
-                {"機能": "勤務表自動作成", "状態": "基礎データ管理まで実装"},
-                {"機能": "人員配置最適化", "状態": "不足人数集計まで実装"},
-                {"機能": "委員会管理", "状態": "基礎データ管理まで実装"},
-                {"機能": "業務負担分析", "状態": "負担度集計まで実装"},
-            ]
-        )
-        display_dataframe(functions, width="stretch", hide_index=True)
-
 def render_system_department():
     apps = pd.DataFrame(
         [
             {"アプリ": "ロト研究所アプリ", "機能": "CSV自動読込 / 当選履歴管理 / 分析実行 / 予想生成 / 結果保存 / モデル別成績表 / AI改善レポート", "状態": "運用中"},
-            {"アプリ": "投資研究所アプリ", "機能": "ポートフォリオ管理 / 配当管理 / ETF分析 / 売買候補抽出", "状態": "基礎機能実装"},
-            {"アプリ": "病院業務改善システム", "機能": "勤務表条件 / 人員配置集計 / 委員会管理 / 業務負担分析", "状態": "基礎機能実装"},
         ]
     )
     display_dataframe(apps, width="stretch", hide_index=True)
@@ -666,7 +515,6 @@ def render_launch_guide():
             {"画面": "分析研究所トップ", "起動コマンド": "python -m streamlit run loto_lab/apps/analysis_research_lab.py --server.port 8501", "URL": "http://localhost:8501"},
             {"画面": "ロト6分析", "起動コマンド": "python -m streamlit run loto_lab/apps/loto6_streamlit_app.py --server.port 8502", "URL": "http://localhost:8502"},
             {"画面": "ロト7分析", "起動コマンド": "python -m streamlit run loto_lab/apps/loto7_streamlit_app.py --server.port 8503", "URL": "http://localhost:8503"},
-launcher):loto_lab/apps/analysis_research_lab.py
         ]
     )
     display_dataframe(guide, width="stretch", hide_index=True)
@@ -698,7 +546,7 @@ st.title(PROJECT_JAPANESE_NAME)
 st.caption(f"{PROJECT_ENGLISH_NAME}（{PROJECT_SHORT_NAME}）")
 st.info("目的は当選や利益そのものではなく、予測手法の研究・検証・改善を継続し、予測精度を向上させることです。")
 
-lab = st.radio("部門", ["ホーム", "ロト6", "ロト7", "投資", "AI改善", "検証", "保守", "システム開発", "病院業務改善"], horizontal=True)
+lab = st.radio("部門", ["ホーム", "ロト6", "ロト7", "AI改善", "検証", "保守", "システム開発"], horizontal=True)
 
 with st.expander("ロト分析モデル一覧", expanded=False):
     render_model_catalog()
@@ -733,8 +581,6 @@ elif lab == "ロト7":
         number_max=37,
         draw_size=7,
     )
-elif lab == "投資":
-    render_investment_lab()
 elif lab == "AI改善":
     render_ai_department()
 elif lab == "検証":
@@ -743,5 +589,3 @@ elif lab == "保守":
     render_maintenance_department()
 elif lab == "システム開発":
     render_system_department()
-else:
-    render_hospital_system()
