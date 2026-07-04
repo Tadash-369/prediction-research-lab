@@ -17,6 +17,8 @@ if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
 
 from arl_research_engine import (
+    ANTI_POPULAR_EXPECTED_VALUE_KEY,
+    ANTI_POPULAR_EXPECTED_VALUE_LABEL,
     ARL_MODEL_LABELS,
     BACKTEST_SUMMARY_COLUMNS,
     CONTINUOUS_WIN_RESEARCH_COLUMNS,
@@ -30,7 +32,9 @@ from arl_research_engine import (
     VIDEO_HYPOTHESIS_COLUMNS,
     add_verification_metrics,
     ai_improvement_weight_rows,
+    anti_popular_verification_fields,
     apply_ai_improvement_weights,
+    apply_prediction_pattern_roles,
     append_winning_condition_history,
     build_ai_improvement_summary,
     build_ai_improvement_weight_summary,
@@ -59,6 +63,7 @@ from arl_research_engine import (
     evaluate_purchase_history,
     extract_video_hypothesis,
     format_contribution_detail,
+    generate_anti_popular_expected_value_picks,
     load_winning_condition_history,
     merge_contribution_rows,
     merge_research_cycle_rows,
@@ -155,6 +160,10 @@ VERIFICATION_COLUMNS = [
     "足りなかった条件",
     "過剰だった条件",
     "モデル貢献度詳細",
+    "前回数字との重複数",
+    "31超え数字の有無",
+    "3連続除外チェック",
+    "改善メモ",
     "失敗要因",
     "逆算分析",
     "改善案",
@@ -746,13 +755,62 @@ def build_next_hypothesis(predicted, actual):
     )
 
 
+def history_number_rows(results):
+    if results is None or results.empty:
+        return []
+    history = results.copy()
+    history["開催回"] = history["開催回"].map(to_int)
+    history = history.sort_values("開催回")
+    rows = []
+    for _, row in history.iterrows():
+        numbers = sorted(to_int(row[column]) for column in NUMBER_COLUMNS)
+        if len(numbers) == 7:
+            rows.append(numbers)
+    return rows
+
+
+def build_anti_popular_pattern_pick(results, target_round, anchor_numbers=None):
+    return (
+        generate_anti_popular_expected_value_picks(
+            history_number_rows(results),
+            number_max=37,
+            draw_size=7,
+            target_round=target_round,
+            pick_count=1,
+            anchor_numbers=anchor_numbers,
+            max_anchor_overlap=2,
+        )
+        or [None]
+    )[0]
+
+
+def render_pattern_pick(pick, title):
+    pattern = pick.get("pattern_label", title)
+    role = pick.get("role_label", "")
+    st.markdown(f"**{pattern} {role}: {numbers_to_text(pick.get('numbers', []))}**")
+    st.write(f"使用モデル: {pick.get('model_name', '既存分析モデル')}")
+    st.write(f"重視した要素: {pick.get('emphasized_factors', '-')}")
+    st.write(f"選定理由: {pick.get('selection_reason', pick.get('reason', '-'))}")
+    st.write(f"他Patternとの重複数: {pick.get('overlap_summary', '-')}")
+    diagnostics = pick.get("anti_popular_diagnostics")
+    if diagnostics:
+        st.caption(
+            f"補助モデル確認: 前回重複{diagnostics.get('previous_overlap_count')}個 / "
+            f"31超え数字{'あり' if diagnostics.get('has_over_31') else 'なし'} / "
+            f"3連続チェック{'OK' if diagnostics.get('three_consecutive_excluded') else '除外対象'}"
+        )
+        st.caption(pick.get("expected_value_note", ""))
+    st.write(f"理由: {pick.get('reason', '-')}")
+
+
 def generate_prediction_picks(results, model_key="recent_trend", pick_count=3, candidate_limit=16):
     if results.empty:
         return []
 
     results = results.copy()
     results["開催回"] = results["開催回"].map(to_int)
-    scores = build_candidate_scores(results, model_key)
+    scoring_model_key = "machine_learning" if model_key == ANTI_POPULAR_EXPECTED_VALUE_KEY else model_key
+    scores = build_candidate_scores(results, scoring_model_key)
     score_map = dict(zip(scores["数字"], scores["スコア"]))
     candidate_numbers = scores.head(candidate_limit)["数字"].tolist()
     sums = results[NUMBER_COLUMNS].apply(pd.to_numeric, errors="coerce").sum(axis=1)
@@ -765,9 +823,9 @@ def generate_prediction_picks(results, model_key="recent_trend", pick_count=3, c
     for combo in combinations(candidate_numbers, 7):
         numbers = tuple(sorted(combo))
         summary = balance_summary(numbers)
-        if model_key != "non_overlap" and summary["consecutive"] > 1:
+        if scoring_model_key != "non_overlap" and summary["consecutive"] > 1:
             continue
-        if model_key == "machine_learning":
+        if scoring_model_key == "machine_learning":
             low_count = sum(1 for number in numbers if number <= 18)
             upper_band_count = sum(1 for number in numbers if 28 <= number <= 37)
             mid_high_count = sum(1 for number in numbers if 20 <= number <= 37)
@@ -780,7 +838,7 @@ def generate_prediction_picks(results, model_key="recent_trend", pick_count=3, c
                 continue
             if near_count < 3:
                 continue
-        elif model_key == "non_overlap":
+        elif scoring_model_key == "non_overlap":
             upper_band_count = sum(32 <= number <= 37 for number in numbers)
             if upper_band_count < 1:
                 continue
@@ -789,12 +847,12 @@ def generate_prediction_picks(results, model_key="recent_trend", pick_count=3, c
         ranking_score = (
             sum(score_map[number] for number in numbers)
             - abs(summary["sum"] - target_sum) / max(sum_std, 1) * 12
-            - (0 if model_key == "non_overlap" else summary["consecutive"] * 4)
+            - (0 if scoring_model_key == "non_overlap" else summary["consecutive"] * 4)
         )
-        if model_key == "machine_learning":
+        if scoring_model_key == "machine_learning":
             ranking_score += count_ai_near_signals(numbers) * 3
             ranking_score += sum(1 for number in numbers if 28 <= number <= 37) * 2
-        if model_key == "non_overlap":
+        if scoring_model_key == "non_overlap":
             ranking_score += sum(32 <= number <= 37 for number in numbers) * 3
         candidates.append((ranking_score, numbers))
 
@@ -804,11 +862,23 @@ def generate_prediction_picks(results, model_key="recent_trend", pick_count=3, c
     for _, numbers in candidates:
         if picks and len(set(numbers) & used_numbers) > 4:
             continue
-        picks.append({"numbers": numbers, "reason": build_pick_reason(numbers, target_sum, MODEL_LABELS[model_key])})
+        picks.append({"numbers": numbers, "reason": build_pick_reason(numbers, target_sum, MODEL_LABELS[scoring_model_key])})
         used_numbers.update(numbers)
         if len(picks) == pick_count:
             break
-    return picks
+    anti_pick = build_anti_popular_pattern_pick(
+        results,
+        int(results["開催回"].map(to_int).max()) + 1,
+        anchor_numbers=picks[0]["numbers"] if picks else None,
+    )
+    return apply_prediction_pattern_roles(
+        picks,
+        draw_size=7,
+        number_max=37,
+        score_map=score_map,
+        base_model_name=MODEL_LABELS[scoring_model_key],
+        anti_popular_pick=anti_pick,
+    )
 
 
 def build_score_number_reasons(numbers, score_df, low_threshold=18):
@@ -959,7 +1029,20 @@ def generate_next_score_prediction_picks(score_df, results, draw_size=7, pick_co
         used_numbers.update(numbers)
         if len(picks) == pick_count:
             break
-    return picks
+    score_map = {int(row["数字"]): float(row.get("総合スコア", 0) or 0) for _, row in score_df.iterrows()}
+    anti_pick = build_anti_popular_pattern_pick(
+        results,
+        int(results["開催回"].map(to_int).max()) + 1,
+        anchor_numbers=picks[0]["numbers"] if picks else None,
+    )
+    return apply_prediction_pattern_roles(
+        picks,
+        draw_size=draw_size,
+        number_max=37,
+        score_map=score_map,
+        base_model_name="候補スコア活用予測",
+        anti_popular_pick=anti_pick,
+    )
 
 
 def generate_ai_weighted_prediction_picks(score_df, results, weight_summary, draw_size=7, pick_count=3):
@@ -1037,7 +1120,20 @@ def generate_ai_weighted_prediction_picks(score_df, results, weight_summary, dra
         used_numbers.update(numbers)
         if len(picks) == pick_count:
             break
-    return picks
+    score_map = {int(row["数字"]): float(row.get("AI改善後スコア", row.get("総合スコア", 0)) or 0) for _, row in weighted_df.iterrows()}
+    anti_pick = build_anti_popular_pattern_pick(
+        results,
+        int(results["開催回"].map(to_int).max()) + 1,
+        anchor_numbers=picks[0]["numbers"] if picks else None,
+    )
+    return apply_prediction_pattern_roles(
+        picks,
+        draw_size=draw_size,
+        number_max=37,
+        score_map=score_map,
+        base_model_name="AI改善反映予測",
+        anti_popular_pick=anti_pick,
+    )
 
 
 def run_backtest(results, lookback_rounds=30, min_training_rounds=40):
@@ -1157,7 +1253,8 @@ def get_pre_prediction_research(results):
 def best_actionable_model_key(summary_df):
     if summary_df.empty:
         return None
-    usable = summary_df[summary_df["モデル"] != MODEL_LABELS["random_baseline"]]
+    excluded_models = {MODEL_LABELS["random_baseline"], MODEL_LABELS.get(ANTI_POPULAR_EXPECTED_VALUE_KEY)}
+    usable = summary_df[~summary_df["モデル"].isin(excluded_models)]
     if usable.empty:
         return None
     return model_key_from_name(str(usable.iloc[0]["モデル"]))
@@ -1199,8 +1296,10 @@ def save_prediction_picks(picks, target_round, model_key, model_name):
             errors.append(f"第{index}候補は7個の1〜37の重複なし数字ではないため保存しませんでした。")
             continue
         number_text = numbers_to_text(numbers)
-        key = (target_round, index, number_text, model_name)
-        prediction_id = f"L7-{target_round}-{prediction_date.replace('/', '')}-{safe_model_id(model_key)}-{index}"
+        row_model_key = pick.get("model_key") or model_key
+        row_model_name = pick.get("model_name") or model_name
+        key = (target_round, index, number_text, row_model_name)
+        prediction_id = f"L7-{target_round}-{prediction_date.replace('/', '')}-{safe_model_id(row_model_key)}-{index}"
         if key in existing or prediction_id in existing_ids:
             skipped += 1
             continue
@@ -1211,7 +1310,7 @@ def save_prediction_picks(picks, target_round, model_key, model_name):
                 "予想日": prediction_date,
                 "候補番号": index,
                 "予想番号": number_text,
-                "使用モデル": model_name,
+                "使用モデル": row_model_name,
                 "予想理由": pick["reason"],
                 "保存日時": now_text(),
             }
@@ -1241,9 +1340,9 @@ def render_next_score_prediction(score_df, results, target_round):
         for error in result["errors"]:
             st.warning(error)
     for index, pick in enumerate(picks, start=1):
-        st.markdown(f"**候補スコア活用予測 {index}: {numbers_to_text(pick['numbers'])}**")
-        st.write(f"理由: {pick['reason']}")
-        st.dataframe(pick["number_reasons"], width="stretch", hide_index=True)
+        render_pattern_pick(pick, f"候補スコア活用予測 {index}")
+        if not pick.get("number_reasons", pd.DataFrame()).empty:
+            st.dataframe(pick["number_reasons"], width="stretch", hide_index=True)
 
 
 def render_ai_improvement_weight_summary(weight_summary):
@@ -1283,9 +1382,9 @@ def render_ai_weighted_prediction(score_df, results, target_round, weight_summar
         for error in result["errors"]:
             st.warning(error)
     for index, pick in enumerate(picks, start=1):
-        st.markdown(f"**AI改善反映予測 {index}: {numbers_to_text(pick['numbers'])}**")
-        st.write(f"理由: {pick['reason']}")
-        st.dataframe(pick["number_reasons"], width="stretch", hide_index=True)
+        render_pattern_pick(pick, f"AI改善反映予測 {index}")
+        if not pick.get("number_reasons", pd.DataFrame()).empty:
+            st.dataframe(pick["number_reasons"], width="stretch", hide_index=True)
 
 
 def determine_grade(match_count, bonus_count):
@@ -1499,6 +1598,7 @@ def verify_predictions(round_no=None):
                 selected_model=prediction.get("使用モデル", ""),
             )
             report_row = build_report_row(prediction, official_row, support_map)
+            report_row.update(anti_popular_verification_fields(predicted, number_rows[-1] if number_rows else [], 37, 7))
             key = str(report_row.get("検証キー") or report_row.get("予想ID", "")).strip()
             if key in existing_keys:
                 continue
@@ -1671,8 +1771,7 @@ def render_prediction_area(results):
         for error in result["errors"]:
             st.warning(error)
     for index, pick in enumerate(picks, start=1):
-        st.markdown(f"**第{index}候補：{numbers_to_text(pick['numbers'])}**")
-        st.write(f"理由：{pick['reason']}")
+        render_pattern_pick(pick, f"第{index}候補")
 
 
 def render_winning_condition_history():

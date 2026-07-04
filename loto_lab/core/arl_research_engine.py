@@ -12,6 +12,9 @@ PROJECT_JAPANESE_NAME = "分析研究所"
 PROJECT_ENGLISH_NAME = "Prediction Research Lab"
 PROJECT_SHORT_NAME = "PRL"
 
+ANTI_POPULAR_EXPECTED_VALUE_KEY = "anti_popular_expected_value"
+ANTI_POPULAR_EXPECTED_VALUE_LABEL = "人と被りにくい期待値最大化モデル"
+
 LOTO_MODEL_LABELS = OrderedDict(
     [
         ("frequency_analysis", "出現頻度分析"),
@@ -30,6 +33,7 @@ LOTO_MODEL_LABELS = OrderedDict(
         ("monte_carlo", "モンテカルロシミュレーション"),
         ("machine_learning", "機械学習モデル"),
         ("random_baseline", "ランダム予測モデル"),
+        (ANTI_POPULAR_EXPECTED_VALUE_KEY, ANTI_POPULAR_EXPECTED_VALUE_LABEL),
     ]
 )
 
@@ -60,6 +64,9 @@ MODEL_ALIASES = {
     "hot50": "hot_analysis",
     "cold_revival": "cold_analysis",
     "bonus_promotion": "bonus_analysis",
+    "anti_popular": ANTI_POPULAR_EXPECTED_VALUE_KEY,
+    "anti_popular_ev": ANTI_POPULAR_EXPECTED_VALUE_KEY,
+    "non_overlap_jackpot": ANTI_POPULAR_EXPECTED_VALUE_KEY,
 }
 
 AI_MODEL_SCORE_COLUMNS = {
@@ -79,6 +86,7 @@ AI_MODEL_SCORE_COLUMNS = {
     "last_digit_analysis": ["総合スコア"],
     "monte_carlo": ["総合スコア"],
     "random_baseline": ["総合スコア"],
+    ANTI_POPULAR_EXPECTED_VALUE_KEY: ["総合スコア"],
 }
 
 CONTRIBUTION_COLUMNS = [
@@ -193,6 +201,47 @@ HIGH_PRIZE_TICKET_ROLES = [
     "直近トレンド型",
     "高額当選狙い・低人気型",
 ]
+
+PREDICTION_PATTERN_ROLES = [
+    {
+        "pattern_key": "A",
+        "pattern_label": "Pattern A",
+        "role_label": "本命型",
+        "emphasized_factors": "既存分析モデルの上位スコア、奇数偶数、高低、合計値の安定性",
+        "selection_reason": "過去成績と候補スコアを優先し、検証しやすい本命軸として採用。",
+    },
+    {
+        "pattern_key": "B",
+        "pattern_label": "Pattern B",
+        "role_label": "バランス型",
+        "emphasized_factors": "本命コア1〜2個、モデルスコア、数字帯の分散、他Patternとの重複抑制",
+        "selection_reason": "本命型と完全には重ねず、共通コアを残してバランスを調整。",
+    },
+    {
+        "pattern_key": "C",
+        "pattern_label": "Pattern C",
+        "role_label": "チャレンジ型",
+        "emphasized_factors": "31超え数字、前回当選番号との適度な重複、3連続除外、人と被りにくい構成",
+        "selection_reason": "当選時の分配リスクを下げる可能性を研究する補助モデルとして採用。",
+    },
+]
+
+CHAMINI6_GOD_MODE_ENGINE = {
+    "engine_key": "chamini6_god_mode",
+    "engine_name": "Chamini6 God Mode",
+    "status": "integration_ready",
+    "lottery_types": ["loto6", "loto7"],
+    "contract": "independent_engine",
+    "notes": "既存16分析エンジンとは独立した追加エンジンとして接続できる準備枠。",
+}
+
+PREDICTION_ENGINE_REGISTRY = OrderedDict(
+    [
+        ("standard_loto_models", {"engine_name": "既存ロト分析モデル群", "status": "active"}),
+        (ANTI_POPULAR_EXPECTED_VALUE_KEY, {"engine_name": ANTI_POPULAR_EXPECTED_VALUE_LABEL, "status": "active_auxiliary"}),
+        (CHAMINI6_GOD_MODE_ENGINE["engine_key"], CHAMINI6_GOD_MODE_ENGINE),
+    ]
+)
 
 ENSEMBLE_PREDICTION_COLUMNS = [
     "lottery_type",
@@ -446,6 +495,263 @@ def count_consecutive_pairs(numbers):
     return sum(1 for left, right in zip(ordered, ordered[1:]) if right - left == 1)
 
 
+def has_three_consecutive(numbers):
+    ordered = sorted(set(int(number) for number in numbers))
+    run = 1
+    for left, right in zip(ordered, ordered[1:]):
+        if right - left == 1:
+            run += 1
+            if run >= 3:
+                return True
+        else:
+            run = 1
+    return False
+
+
+def anti_popular_overlap_limit(draw_size):
+    return 4 if int(draw_size) <= 6 else 5
+
+
+def anti_popular_candidate_status(numbers, previous_numbers, number_max, draw_size):
+    selected = sorted(set(safe_int(number) for number in numbers if 1 <= safe_int(number) <= number_max))
+    previous = set(clean_number_rows([previous_numbers], number_max)[0]) if previous_numbers else set()
+    previous_overlap = len(set(selected) & previous)
+    overlap_limit = anti_popular_overlap_limit(draw_size)
+    has_over_31 = any(number > 31 for number in selected)
+    has_three_run = has_three_consecutive(selected)
+    valid = (
+        len(selected) == int(draw_size)
+        and previous_overlap >= 1
+        and previous_overlap < overlap_limit
+        and has_over_31
+        and not has_three_run
+    )
+    return {
+        "valid": valid,
+        "previous_overlap_count": previous_overlap,
+        "previous_overlap_limit": overlap_limit - 1,
+        "has_over_31": has_over_31,
+        "three_consecutive_excluded": not has_three_run,
+        "three_consecutive_found": has_three_run,
+    }
+
+
+def anti_popular_model_description():
+    return (
+        "当選確率そのものを上げる目的ではなく、当選時に他人と数字が被りにくく、"
+        "賞金分配リスクを下げる可能性を研究する補助モデル。"
+    )
+
+
+def anti_popular_reason(numbers, status):
+    return (
+        f"{ANTI_POPULAR_EXPECTED_VALUE_LABEL}: {anti_popular_model_description()}"
+        f"前回数字との重複{status['previous_overlap_count']}個、"
+        f"31超え数字{'あり' if status['has_over_31'] else 'なし'}、"
+        f"3連続チェック{'OK' if status['three_consecutive_excluded'] else '除外対象'}。"
+    )
+
+
+def _anti_popular_candidate_score(numbers, previous_numbers, rows, number_max, draw_size):
+    status = anti_popular_candidate_status(numbers, previous_numbers, number_max, draw_size)
+    if not status["valid"]:
+        return None
+    target_sum, sum_std = _history_sum_stats(rows, draw_size, number_max, precleaned=True) if rows else (sum(numbers), max(draw_size * 4, 1))
+    target_sum = _safe_float(target_sum, sum(numbers))
+    sum_std = max(_safe_float(sum_std, draw_size * 4), 1.0)
+    over_31_count = sum(number > 31 for number in numbers)
+    birthday_count = sum(number <= 31 for number in numbers)
+    tail_penalty = sum(max(0, count - 1) for count in Counter(number % 10 for number in numbers).values()) * 4
+    consecutive_penalty = count_consecutive_pairs(numbers) * 5
+    overlap = status["previous_overlap_count"]
+    preferred_overlap = 1 if draw_size <= 6 else 2
+    overlap_penalty = abs(overlap - preferred_overlap) * 9
+    sum_penalty = abs(sum(numbers) - target_sum) / sum_std * 6
+    return over_31_count * 18 + max(0, draw_size - birthday_count) * 3 - tail_penalty - consecutive_penalty - overlap_penalty - sum_penalty
+
+
+def generate_anti_popular_expected_value_picks(
+    number_rows,
+    number_max,
+    draw_size,
+    target_round=0,
+    pick_count=1,
+    anchor_numbers=None,
+    max_anchor_overlap=None,
+    attempts=5000,
+):
+    rows = clean_number_rows(number_rows, number_max)
+    if not rows:
+        return []
+    previous_numbers = rows[-1]
+    previous_set = set(previous_numbers)
+    seed = int(target_round or 0) * 1009 + int(number_max) * 37 + int(draw_size) * 101
+    rng = random.Random(seed)
+    all_numbers = list(range(1, number_max + 1))
+    anchor_set = set(anchor_numbers or [])
+
+    candidates = {}
+    for _ in range(attempts):
+        forced = rng.sample(sorted(previous_set), min(rng.choice([1, 2]), len(previous_set)))
+        remaining_pool = [number for number in all_numbers if number not in forced]
+        sampled = forced + rng.sample(remaining_pool, draw_size - len(forced))
+        numbers = tuple(sorted(sampled))
+        if max_anchor_overlap is not None and anchor_set and len(set(numbers) & anchor_set) > int(max_anchor_overlap):
+            continue
+        score = _anti_popular_candidate_score(numbers, previous_numbers, rows, number_max, draw_size)
+        if score is None:
+            continue
+        candidates[numbers] = max(score, candidates.get(numbers, float("-inf")))
+
+    if not candidates:
+        high_numbers = [number for number in range(32, number_max + 1)]
+        base = sorted(rng.sample(sorted(previous_set), 1))
+        fill_pool = [number for number in high_numbers + all_numbers if number not in base]
+        for number in fill_pool:
+            if len(base) >= draw_size:
+                break
+            base.append(number)
+        numbers = tuple(sorted(base[:draw_size]))
+        status = anti_popular_candidate_status(numbers, previous_numbers, number_max, draw_size)
+        if status["valid"]:
+            candidates[numbers] = _anti_popular_candidate_score(numbers, previous_numbers, rows, number_max, draw_size) or 0.0
+
+    picks = []
+    for numbers, score in sorted(candidates.items(), key=lambda item: item[1], reverse=True)[:pick_count]:
+        status = anti_popular_candidate_status(numbers, previous_numbers, number_max, draw_size)
+        picks.append(
+            {
+                "numbers": tuple(numbers),
+                "reason": anti_popular_reason(numbers, status),
+                "model_key": ANTI_POPULAR_EXPECTED_VALUE_KEY,
+                "model_name": ANTI_POPULAR_EXPECTED_VALUE_LABEL,
+                "used_models": [ANTI_POPULAR_EXPECTED_VALUE_LABEL],
+                "emphasized_factors": "前回数字との1個以上の重複、31超え数字、3連続除外、過度な前回重複の除外",
+                "selection_reason": anti_popular_reason(numbers, status),
+                "anti_popular_diagnostics": status,
+                "model_description": anti_popular_model_description(),
+                "expected_value_note": "分配リスク低減を研究する補助指標であり、当選確率の上昇を保証しません。",
+                "prediction_score": round(float(score), 3),
+            }
+        )
+    return picks
+
+
+def _ranked_replacement_pool(number_max, score_map=None):
+    score_map = score_map or {}
+    return [
+        number
+        for number, _ in sorted(
+            ((number, _safe_float(score_map.get(number), 0.0)) for number in range(1, number_max + 1)),
+            key=lambda item: (item[1], -item[0]),
+            reverse=True,
+        )
+    ]
+
+
+def _limit_anchor_overlap(numbers, anchor_numbers, limit, number_max, score_map=None, core_count=2):
+    selected = set(int(number) for number in numbers)
+    anchor = set(int(number) for number in anchor_numbers or [])
+    if not anchor:
+        return tuple(sorted(selected))
+    score_map = score_map or {}
+    overlap = selected & anchor
+    protected_count = min(max(core_count, 0), len(overlap), max(limit, 0))
+    protected = set(sorted(overlap, key=lambda number: _safe_float(score_map.get(number), 0.0), reverse=True)[:protected_count])
+    pool = _ranked_replacement_pool(number_max, score_map)
+    while len(selected & anchor) > limit:
+        removable = sorted(
+            (number for number in selected & anchor if number not in protected),
+            key=lambda number: _safe_float(score_map.get(number), 0.0),
+        )
+        if not removable:
+            break
+        remove_number = removable[0]
+        replacement = None
+        for candidate in pool:
+            if candidate in selected or candidate in anchor:
+                continue
+            replacement = candidate
+            break
+        if replacement is None:
+            break
+        selected.remove(remove_number)
+        selected.add(replacement)
+    return tuple(sorted(selected))
+
+
+def _pattern_overlap_summary(picks):
+    labels = [pick.get("pattern_key", chr(65 + index)) for index, pick in enumerate(picks)]
+    counts = {}
+    for left_index, left in enumerate(picks):
+        for right_index in range(left_index + 1, len(picks)):
+            right = picks[right_index]
+            key = f"{labels[left_index]}-{labels[right_index]}"
+            counts[key] = len(set(left.get("numbers", [])) & set(right.get("numbers", [])))
+    summary = " / ".join(f"{key}: {value}個" for key, value in counts.items()) if counts else "-"
+    for pick in picks:
+        pick["overlap_counts"] = counts
+        pick["overlap_summary"] = summary
+    return picks
+
+
+def apply_prediction_pattern_roles(picks, draw_size, number_max, score_map=None, base_model_name="", anti_popular_pick=None):
+    normalized = []
+    for pick in picks or []:
+        numbers = tuple(sorted(int(number) for number in pick.get("numbers", []) if 1 <= int(number) <= number_max))
+        if len(numbers) != draw_size:
+            continue
+        item = dict(pick)
+        item["numbers"] = numbers
+        normalized.append(item)
+
+    if anti_popular_pick:
+        anti_item = dict(anti_popular_pick)
+        anti_item["numbers"] = tuple(sorted(int(number) for number in anti_item.get("numbers", [])))
+        if len(anti_item["numbers"]) == draw_size:
+            if len(normalized) >= 3:
+                normalized[2] = anti_item
+            else:
+                normalized.append(anti_item)
+
+    normalized = normalized[:3]
+    if not normalized:
+        return []
+
+    anchor = normalized[0]["numbers"]
+    if len(normalized) >= 2:
+        normalized[1]["numbers"] = _limit_anchor_overlap(normalized[1]["numbers"], anchor, 3, number_max, score_map, core_count=2)
+    if len(normalized) >= 3:
+        normalized[2]["numbers"] = _limit_anchor_overlap(normalized[2]["numbers"], anchor, 2, number_max, score_map, core_count=2)
+
+    for index, pick in enumerate(normalized):
+        role = PREDICTION_PATTERN_ROLES[min(index, len(PREDICTION_PATTERN_ROLES) - 1)]
+        pick["pattern_key"] = role["pattern_key"]
+        pick["pattern_label"] = role["pattern_label"]
+        pick["role_label"] = role["role_label"]
+        pick.setdefault("model_name", base_model_name or "既存分析モデル")
+        pick.setdefault("used_models", [pick.get("model_name") or base_model_name or "既存分析モデル"])
+        pick.setdefault("emphasized_factors", role["emphasized_factors"])
+        pick.setdefault("selection_reason", role["selection_reason"])
+        pick["reason"] = (
+            f"{role['pattern_label']} {role['role_label']}。"
+            f"使用モデル: {' / '.join(str(model) for model in pick.get('used_models', []))}。"
+            f"重視した要素: {pick.get('emphasized_factors', role['emphasized_factors'])}。"
+            f"{pick.get('reason', role['selection_reason'])}"
+        )
+    return _pattern_overlap_summary(normalized)
+
+
+def anti_popular_verification_fields(predicted, previous_numbers, number_max, draw_size):
+    status = anti_popular_candidate_status(predicted, previous_numbers, number_max, draw_size)
+    return {
+        "前回数字との重複数": status["previous_overlap_count"],
+        "31超え数字の有無": "あり" if status["has_over_31"] else "なし",
+        "3連続除外チェック": "OK" if status["three_consecutive_excluded"] else "3連続あり",
+        "改善メモ": anti_popular_model_description(),
+    }
+
+
 def last_seen_gaps(number_rows, number_max):
     last_seen = {number: -1 for number in range(1, number_max + 1)}
     for index, row in enumerate(number_rows):
@@ -561,6 +867,16 @@ def build_model_scores(number_rows, model_key, number_max, draw_size, target_rou
         return {number: rng.random() for number in range(1, number_max + 1)}
     if not rows:
         return {number: 0.0 for number in range(1, number_max + 1)}
+    if key == ANTI_POPULAR_EXPECTED_VALUE_KEY:
+        latest = set(rows[-1])
+        rng = random.Random(int(target_round or 0) * 1009 + number_max * 37 + draw_size)
+        return {
+            number: (1.2 if number in latest else 0.0)
+            + (1.0 if number > 31 else 0.0)
+            + (0.25 if number % 10 not in (0, 5, 7) else 0.0)
+            + rng.random() * 0.35
+            for number in range(1, number_max + 1)
+        }
 
     components = model_score_components(rows, number_max, draw_size, target_round, bonus_rows)
     counts = Counter(number for row in rows for number in row)
