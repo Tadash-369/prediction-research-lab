@@ -120,16 +120,22 @@ AI_SCORE_DISPLAY_COLUMNS = [
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
+    "検証キー",
     "予想ID",
     "開催回",
+    "抽せん日",
     "検証日",
+    "候補番号",
     "使用モデル",
     "予想番号",
+    "本数字",
     "実際の当選番号",
     "ボーナス数字",
     "本数字一致数",
+    "一致本数字",
     "的中率",
     "ボーナス一致数",
+    "一致ボーナス数字",
     "勝率",
     "期待値",
     "等級判定",
@@ -248,6 +254,10 @@ def now_text():
 
 def today_text():
     return date.today().strftime("%Y/%m/%d")
+
+
+def verification_key(prediction_id, model_name, candidate_no):
+    return f"{str(prediction_id).strip()}__{str(model_name).strip()}__{to_int(candidate_no)}"
 
 
 def numbers_to_text(numbers):
@@ -1326,6 +1336,12 @@ def build_report_row(prediction_row, official_row, support_map=None):
         differences.append(f"{number:02d}->{nearest:02d}({nearest - number:+d})")
     match_count = len(matched)
     bonus_count = len(set(predicted) & set(bonus))
+    prediction_id = str(prediction_row.get("予想ID", ""))
+    candidate_no = to_int(prediction_row.get("候補番号"))
+    model_name = str(prediction_row.get("使用モデル", ""))
+    actual_text = numbers_to_text(actual)
+    bonus_text = numbers_to_text(bonus)
+    matched_bonus = sorted(set(predicted) & set(bonus))
     grade = determine_grade(match_count, bonus_count)
     hit_rate = round(match_count / max(len(actual), 1) * 100, 1)
     win_rate = 0.0 if grade == "該当なし" else 100.0
@@ -1358,16 +1374,22 @@ def build_report_row(prediction_row, official_row, support_map=None):
     consecutive_text = f"予想{predicted_summary['consecutive']}組 / 実際{actual_summary['consecutive']}組"
 
     return {
-        "予想ID": prediction_row["予想ID"],
+        "検証キー": verification_key(prediction_id, model_name, candidate_no),
+        "予想ID": prediction_id,
         "開催回": to_int(prediction_row["開催回"]),
+        "抽せん日": official_row.get("抽せん日", ""),
         "検証日": today_text(),
-        "使用モデル": prediction_row.get("使用モデル", ""),
+        "候補番号": candidate_no,
+        "使用モデル": model_name,
         "予想番号": numbers_to_text(predicted),
-        "実際の当選番号": numbers_to_text(actual),
-        "ボーナス数字": numbers_to_text(bonus),
+        "本数字": actual_text,
+        "実際の当選番号": actual_text,
+        "ボーナス数字": bonus_text,
         "本数字一致数": match_count,
+        "一致本数字": numbers_to_text(matched) if matched else "",
         "的中率": hit_rate,
         "ボーナス一致数": bonus_count,
+        "一致ボーナス数字": numbers_to_text(matched_bonus) if matched_bonus else "",
         "勝率": win_rate,
         "期待値": expected_value,
         "等級判定": grade,
@@ -1447,11 +1469,12 @@ def verify_predictions(round_no=None):
         official = official[official["開催回"] == int(round_no)]
 
     reports = read_csv(VERIFICATION_REPORTS_CSV, VERIFICATION_COLUMNS)
-    if not reports.empty and "予想ID" in reports:
-        existing_ids = set(reports["予想ID"].astype(str).str.strip())
-        predictions = predictions[~predictions["予想ID"].astype(str).str.strip().isin(existing_ids)]
-    if predictions.empty:
-        return 0
+    existing_keys = set()
+    if not reports.empty:
+        if "検証キー" in reports:
+            existing_keys = set(reports["検証キー"].astype(str).str.strip())
+        elif "予想ID" in reports:
+            existing_keys = set(reports["予想ID"].astype(str).str.strip())
 
     rows = []
     contribution_rows = []
@@ -1476,6 +1499,10 @@ def verify_predictions(round_no=None):
                 selected_model=prediction.get("使用モデル", ""),
             )
             report_row = build_report_row(prediction, official_row, support_map)
+            key = str(report_row.get("検証キー") or report_row.get("予想ID", "")).strip()
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
             rows.append(report_row)
             winning_row, model_rows = build_winning_condition_report(
                 lottery_type="loto7",

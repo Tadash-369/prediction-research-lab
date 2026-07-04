@@ -45,16 +45,22 @@ LOTO7_NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", 
 LOTO7_BONUS_COLUMNS = ["BONUS数字1", "BONUS数字2"]
 
 LOTO7_VERIFICATION_COLUMNS = [
+    "検証キー",
     "予想ID",
     "開催回",
+    "抽せん日",
     "検証日",
+    "候補番号",
     "使用モデル",
     "予想番号",
+    "本数字",
     "実際の当選番号",
     "ボーナス数字",
     "本数字一致数",
+    "一致本数字",
     "的中率",
     "ボーナス一致数",
+    "一致ボーナス数字",
     "勝率",
     "期待値",
     "等級判定",
@@ -202,9 +208,12 @@ def backup_file(path):
 
 def normalize_text(value):
     text = str(value)
+    stripped = text.strip()
+    if stripped in MODEL_NAME_REPLACEMENTS:
+        return MODEL_NAME_REPLACEMENTS[stripped]
     for old, new in MODEL_NAME_REPLACEMENTS.items():
         text = text.replace(old, new)
-    return text
+    return text.replace("機械学習モデルモデル", "機械学習モデル")
 
 
 def model_key_from_name(model_name):
@@ -232,6 +241,10 @@ def unique_prediction_id(row, prefix, used_ids, fallback_index):
     return prediction_id
 
 
+def verification_key(prediction_id, model_name, candidate_no):
+    return f"{str(prediction_id).strip()}__{str(model_name).strip()}__{safe_int(candidate_no)}"
+
+
 def normalize_text_columns(df, columns):
     if df.empty:
         return df
@@ -247,7 +260,6 @@ def migrate_predictions(path, prefix, rewrite_duplicate_ids, apply_changes):
     if predictions.empty:
         return {"file": path.name, "status": "empty", "rows": 0, "backup": ""}
     predictions = ensure_columns(predictions, PREDICTION_COLUMNS)
-    predictions = normalize_text_columns(predictions, ["使用モデル", "予想理由"])
     predictions["開催回"] = predictions["開催回"].map(safe_int)
     predictions["候補番号"] = predictions["候補番号"].map(safe_int)
 
@@ -412,6 +424,12 @@ def build_loto7_report_row(prediction_row, official_row, support_map=None):
     match_count = len(matched)
     bonus_count = len(set(predicted) & set(bonus))
     grade = determine_loto7_grade(match_count, bonus_count)
+    prediction_id = str(prediction_row.get("予想ID", ""))
+    candidate_no = safe_int(prediction_row.get("候補番号"))
+    model_name = normalize_text(prediction_row.get("使用モデル", ""))
+    actual_text = numbers_to_text(actual)
+    bonus_text = numbers_to_text(bonus)
+    matched_bonus = sorted(set(predicted) & set(bonus))
     hit_rate = round(match_count / max(len(actual), 1) * 100, 1)
     win_rate = 0.0 if grade == "該当なし" else 100.0
     expected_value = round((match_count + bonus_count * 0.25) / 7, 3)
@@ -443,16 +461,22 @@ def build_loto7_report_row(prediction_row, official_row, support_map=None):
     consecutive_text = f"予想{predicted_summary['consecutive']}組 / 実際{actual_summary['consecutive']}組"
 
     return {
-        "予想ID": prediction_row.get("予想ID", ""),
+        "検証キー": verification_key(prediction_id, model_name, candidate_no),
+        "予想ID": prediction_id,
         "開催回": safe_int(prediction_row.get("開催回")),
+        "抽せん日": official_row.get("抽せん日", ""),
         "検証日": datetime.now().strftime("%Y/%m/%d"),
-        "使用モデル": normalize_text(prediction_row.get("使用モデル", "")),
+        "候補番号": candidate_no,
+        "使用モデル": model_name,
         "予想番号": numbers_to_text(predicted),
-        "実際の当選番号": numbers_to_text(actual),
-        "ボーナス数字": numbers_to_text(bonus),
+        "本数字": actual_text,
+        "実際の当選番号": actual_text,
+        "ボーナス数字": bonus_text,
         "本数字一致数": match_count,
+        "一致本数字": numbers_to_text(matched) if matched else "",
         "的中率": hit_rate,
         "ボーナス一致数": bonus_count,
+        "一致ボーナス数字": numbers_to_text(matched_bonus) if matched_bonus else "",
         "勝率": win_rate,
         "期待値": expected_value,
         "等級判定": grade,
@@ -493,7 +517,7 @@ def historical_loto7_context_before_round(round_no):
     return number_rows, bonus_rows
 
 
-def rebuild_loto7_artifacts(apply_changes):
+def rebuild_loto7_artifacts(apply_changes, include_ai_history=False):
     prediction_path = DATA_DIR / "loto7_predictions.csv"
     official_path = DATA_DIR / "loto7_results.csv"
     report_path = VERIFICATION_DIR / "loto7_verification_reports.csv"
@@ -597,7 +621,7 @@ def rebuild_loto7_artifacts(apply_changes):
             backup = backup_file(path)
             save_csv(ensure_columns(df, columns), path)
         results.append({"file": path.name, "status": "rebuilt" if apply_changes else "dry-run rebuild", "rows": len(df), "backup": backup})
-    if apply_changes and winning_condition_rows:
+    if apply_changes and include_ai_history and winning_condition_rows:
         append_winning_condition_history(AI_IMPROVEMENT_DIR, winning_condition_rows, model_improvement_rows)
         results.append(
             {

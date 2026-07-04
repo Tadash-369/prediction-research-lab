@@ -317,7 +317,7 @@ def render_home():
     next_actions = pd.DataFrame(
         [
             {"優先": 1, "次の作業": "ロト6またはロト7で最新当選結果を登録し、検証レポートを更新する"},
-            {"優先": 2, "次の作業": "保守部門でVer1.0補完とフォルダ同期を実行する"},
+            {"優先": 2, "次の作業": "保守部門でVer1.1整合性補完とフォルダ同期を実行する"},
             {"優先": 3, "次の作業": "AI改善部門で成功要因、失敗要因、改善案、次回仮説を確認する"},
             {"優先": 4, "次の作業": "モデル別成績と条件別成功率を見て、次回予想の仮説を決める"},
         ]
@@ -527,12 +527,12 @@ def render_system_department():
 
 
 def render_maintenance_department():
-    st.info("既存CSVをVer1.0形式へ補完します。実行時は自動でバックアップを作成します。")
+    st.info("既存CSVをVer1.1形式へ補完します。実行時は自動でバックアップを作成します。")
     cols = st.columns(2)
     if cols[0].button("補完内容を確認"):
         summary = run_maintenance(apply_changes=False)
         display_dataframe(summary, width="stretch", hide_index=True)
-    if cols[1].button("Ver1.0補完を実行"):
+    if cols[1].button("Ver1.1補完を実行"):
         summary = run_maintenance(apply_changes=True)
         st.success("補完を実行しました。")
         display_dataframe(summary, width="stretch", hide_index=True)

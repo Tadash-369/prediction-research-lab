@@ -35,6 +35,7 @@ loto7_*_frames/
 
 # Local data backups
 分析研究所/data/backups/
+loto_lab/data/backups/
 
 # Regeneratable lottery score outputs
 loto_lab/data/*_next_number_scores.csv
