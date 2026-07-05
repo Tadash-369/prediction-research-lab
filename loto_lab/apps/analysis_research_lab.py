@@ -41,7 +41,7 @@ from arl_research_engine import (
     parse_json_text,
     weighted_model_text,
 )
-from prl_maintenance import run_maintenance
+from prl_maintenance import collect_csv_safety_diagnostics, run_maintenance
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -528,6 +528,10 @@ def render_system_department():
 
 def render_maintenance_department():
     st.info("既存CSVをVer1.1形式へ補完します。実行時は自動でバックアップを作成します。")
+    with st.expander("CSV安全診断（読み取り専用）", expanded=False):
+        diagnostics = collect_csv_safety_diagnostics()
+        display_dataframe(diagnostics, width="stretch", hide_index=True)
+        st.caption("不足列や重複キーがある場合は、バックアップ付き保守処理または個別補正で対応します。この診断だけではCSVを書き換えません。")
     cols = st.columns(2)
     if cols[0].button("補完内容を確認"):
         summary = run_maintenance(apply_changes=False)

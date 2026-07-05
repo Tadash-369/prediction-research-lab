@@ -14,6 +14,8 @@ PROJECT_SHORT_NAME = "PRL"
 
 ANTI_POPULAR_EXPECTED_VALUE_KEY = "anti_popular_expected_value"
 ANTI_POPULAR_EXPECTED_VALUE_LABEL = "人と被りにくい期待値最大化モデル"
+CHAMINI6_GOD_MODE_KEY = "chamini6_god_mode"
+CHAMINI6_GOD_MODE_LABEL = "Chamini6 God Mode"
 
 LOTO_MODEL_LABELS = OrderedDict(
     [
@@ -34,6 +36,7 @@ LOTO_MODEL_LABELS = OrderedDict(
         ("machine_learning", "機械学習モデル"),
         ("random_baseline", "ランダム予測モデル"),
         (ANTI_POPULAR_EXPECTED_VALUE_KEY, ANTI_POPULAR_EXPECTED_VALUE_LABEL),
+        (CHAMINI6_GOD_MODE_KEY, CHAMINI6_GOD_MODE_LABEL),
     ]
 )
 
@@ -67,6 +70,8 @@ MODEL_ALIASES = {
     "anti_popular": ANTI_POPULAR_EXPECTED_VALUE_KEY,
     "anti_popular_ev": ANTI_POPULAR_EXPECTED_VALUE_KEY,
     "non_overlap_jackpot": ANTI_POPULAR_EXPECTED_VALUE_KEY,
+    "chamini6": CHAMINI6_GOD_MODE_KEY,
+    "god_mode": CHAMINI6_GOD_MODE_KEY,
 }
 
 AI_MODEL_SCORE_COLUMNS = {
@@ -87,6 +92,7 @@ AI_MODEL_SCORE_COLUMNS = {
     "monte_carlo": ["総合スコア"],
     "random_baseline": ["総合スコア"],
     ANTI_POPULAR_EXPECTED_VALUE_KEY: ["総合スコア"],
+    CHAMINI6_GOD_MODE_KEY: ["総合スコア"],
 }
 
 CONTRIBUTION_COLUMNS = [
@@ -227,12 +233,12 @@ PREDICTION_PATTERN_ROLES = [
 ]
 
 CHAMINI6_GOD_MODE_ENGINE = {
-    "engine_key": "chamini6_god_mode",
-    "engine_name": "Chamini6 God Mode",
-    "status": "integration_ready",
+    "engine_key": CHAMINI6_GOD_MODE_KEY,
+    "engine_name": CHAMINI6_GOD_MODE_LABEL,
+    "status": "active",
     "lottery_types": ["loto6", "loto7"],
     "contract": "independent_engine",
-    "notes": "既存16分析エンジンとは独立した追加エンジンとして接続できる準備枠。",
+    "notes": "既存分析エンジンを削除せず、独立した統合候補として接続する正式エンジン。",
 }
 
 PREDICTION_ENGINE_REGISTRY = OrderedDict(
@@ -242,6 +248,25 @@ PREDICTION_ENGINE_REGISTRY = OrderedDict(
         (CHAMINI6_GOD_MODE_ENGINE["engine_key"], CHAMINI6_GOD_MODE_ENGINE),
     ]
 )
+
+CHAMINI6_COMPONENT_MODEL_KEYS = [
+    "frequency_analysis",
+    "cold_analysis",
+    "hot_analysis",
+    "odd_even_analysis",
+    "sum_value_analysis",
+    "high_low_analysis",
+    "consecutive_analysis",
+    "last_digit_analysis",
+    "pair_analysis",
+    "triple_analysis",
+    "bonus_analysis",
+    "markov_chain",
+    "bayesian_estimation",
+    "monte_carlo",
+    "machine_learning",
+    ANTI_POPULAR_EXPECTED_VALUE_KEY,
+]
 
 ENSEMBLE_PREDICTION_COLUMNS = [
     "lottery_type",
@@ -637,6 +662,350 @@ def generate_anti_popular_expected_value_picks(
     return picks
 
 
+SET_BALL_COLUMN_CANDIDATES = (
+    "球セット",
+    "セット球",
+    "抽せん球",
+    "抽せん球セット",
+    "使用球セット",
+    "逅・そ繝・ヨ",
+)
+
+
+def detect_set_ball_column(frame):
+    if frame is None or frame.empty:
+        return None
+    for column in SET_BALL_COLUMN_CANDIDATES:
+        if column in frame.columns:
+            return column
+    for column in frame.columns:
+        text = str(column)
+        if "セット" in text or "set" in text.lower():
+            return column
+    return None
+
+
+def build_set_ball_analysis(results, number_columns, number_max, draw_size, set_ball_frame=None, round_column="開催回"):
+    empty_number_frame = pd.DataFrame(columns=["数字", "同一セット出現数", "全体出現数", "セット球スコア"])
+    empty_summary = pd.DataFrame(columns=["項目", "値"])
+    if results is None or results.empty:
+        return {
+            "available": False,
+            "message": "抽せん履歴がないため、セット球分析をスキップしました。",
+            "set_ball_column": "",
+            "latest_set_ball": "",
+            "score_map": {number: 0.0 for number in range(1, number_max + 1)},
+            "summary_frame": empty_summary,
+            "number_frame": empty_number_frame,
+        }
+
+    frame = results.copy()
+    if round_column not in frame.columns:
+        round_column = frame.columns[0] if len(frame.columns) else "開催回"
+    for column in number_columns:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame[round_column] = pd.to_numeric(frame[round_column], errors="coerce")
+
+    set_column = detect_set_ball_column(frame)
+    if set_column is None and set_ball_frame is not None and not set_ball_frame.empty:
+        set_frame = set_ball_frame.copy()
+        set_round_column = round_column if round_column in set_frame.columns else set_frame.columns[0]
+        set_column = detect_set_ball_column(set_frame)
+        if set_column and set_round_column in set_frame.columns:
+            set_frame[set_round_column] = pd.to_numeric(set_frame[set_round_column], errors="coerce")
+            frame = frame.merge(
+                set_frame[[set_round_column, set_column]].dropna(subset=[set_round_column]).drop_duplicates(set_round_column, keep="last"),
+                left_on=round_column,
+                right_on=set_round_column,
+                how="left",
+            )
+            if set_round_column != round_column and set_round_column in frame.columns:
+                frame = frame.drop(columns=[set_round_column])
+
+    if set_column is None or set_column not in frame.columns:
+        return {
+            "available": False,
+            "message": "セット球データなし。列が追加された場合のみChamini6の補助スコアに反映します。",
+            "set_ball_column": "",
+            "latest_set_ball": "",
+            "score_map": {number: 0.0 for number in range(1, number_max + 1)},
+            "summary_frame": empty_summary,
+            "number_frame": empty_number_frame,
+        }
+
+    available_number_columns = [column for column in number_columns if column in frame.columns]
+    if len(available_number_columns) < int(draw_size):
+        return {
+            "available": False,
+            "message": "セット球分析に必要な数字列が不足しているため、補助スコアをスキップしました。",
+            "set_ball_column": str(set_column),
+            "latest_set_ball": "",
+            "score_map": {number: 0.0 for number in range(1, number_max + 1)},
+            "summary_frame": empty_summary,
+            "number_frame": empty_number_frame,
+        }
+
+    valid = frame.dropna(subset=[round_column]).copy()
+    valid[set_column] = valid[set_column].fillna("").astype(str).str.strip()
+    valid = valid[valid[set_column] != ""]
+    if valid.empty:
+        return {
+            "available": False,
+            "message": "セット球列はありますが、有効なセット球値がありません。",
+            "set_ball_column": str(set_column),
+            "latest_set_ball": "",
+            "score_map": {number: 0.0 for number in range(1, number_max + 1)},
+            "summary_frame": empty_summary,
+            "number_frame": empty_number_frame,
+        }
+
+    latest = valid.sort_values(round_column).tail(1).iloc[0]
+    latest_set = str(latest.get(set_column, "")).strip()
+    same_set = valid[valid[set_column] == latest_set].copy()
+    all_rows = clean_number_rows(valid[available_number_columns].values.tolist(), number_max)
+    same_rows = clean_number_rows(same_set[available_number_columns].values.tolist(), number_max)
+    all_counter = Counter(number for row in all_rows for number in row)
+    same_counter = Counter(number for row in same_rows for number in row)
+    raw_scores = {}
+    for number in range(1, number_max + 1):
+        same_freq = same_counter.get(number, 0)
+        all_freq = all_counter.get(number, 0)
+        raw_scores[number] = same_freq * 1.5 + all_freq * 0.1
+    score_map = normalize_scores(raw_scores, number_max)
+    target_rows = same_rows or all_rows
+    sums = [sum(row) for row in target_rows]
+    odd_counts = [sum(number % 2 for number in row) for row in target_rows]
+    high_counts = [sum(number > game_low_limit(number_max) for number in row) for row in target_rows]
+    summary_rows = [
+        {"項目": "最新セット球", "値": latest_set},
+        {"項目": "同一セット履歴数", "値": int(len(same_rows))},
+        {"項目": "平均合計値", "値": round(sum(sums) / max(len(sums), 1), 2) if sums else "-"},
+        {"項目": "平均奇数数", "値": round(sum(odd_counts) / max(len(odd_counts), 1), 2) if odd_counts else "-"},
+        {"項目": "平均高数字数", "値": round(sum(high_counts) / max(len(high_counts), 1), 2) if high_counts else "-"},
+    ]
+    number_rows = [
+        {
+            "数字": number,
+            "同一セット出現数": int(same_counter.get(number, 0)),
+            "全体出現数": int(all_counter.get(number, 0)),
+            "セット球スコア": round(float(score_map.get(number, 0.0)) * 100, 2),
+        }
+        for number in range(1, number_max + 1)
+    ]
+    number_frame = pd.DataFrame(number_rows).sort_values(["セット球スコア", "同一セット出現数", "数字"], ascending=[False, False, True])
+    return {
+        "available": True,
+        "message": f"セット球 {latest_set} の履歴をChamini6補助スコアに利用できます。",
+        "set_ball_column": str(set_column),
+        "latest_set_ball": latest_set,
+        "score_map": score_map,
+        "summary_frame": pd.DataFrame(summary_rows),
+        "number_frame": number_frame,
+    }
+
+
+def _fixed_chamini6_component_weights():
+    return {
+        "frequency_analysis": 1.0,
+        "cold_analysis": 0.9,
+        "hot_analysis": 1.1,
+        "odd_even_analysis": 0.55,
+        "sum_value_analysis": 0.65,
+        "high_low_analysis": 0.6,
+        "consecutive_analysis": 0.5,
+        "last_digit_analysis": 0.45,
+        "pair_analysis": 0.95,
+        "triple_analysis": 0.7,
+        "bonus_analysis": 0.5,
+        "markov_chain": 0.95,
+        "bayesian_estimation": 0.9,
+        "monte_carlo": 0.75,
+        "machine_learning": 1.25,
+        ANTI_POPULAR_EXPECTED_VALUE_KEY: 0.45,
+    }
+
+
+def _ai_weight_for_model(component_key, ai_weight_summary=None):
+    summary = ai_weight_summary or {}
+    weights = summary.get("model_weights", {}) or {}
+    canonical = canonical_model_key(component_key)
+    label = model_label(canonical)
+    value = 0.0
+    for key in (canonical, label, str(component_key)):
+        if key in weights:
+            value = _safe_float(weights.get(key), 0.0)
+            break
+    return _clamp(1.0 + value, 0.72, 1.32)
+
+
+def build_chamini6_score_map(
+    number_rows,
+    bonus_rows,
+    number_max,
+    draw_size,
+    target_round=0,
+    reports=None,
+    model_history=None,
+    lottery_type="",
+    ai_weight_summary=None,
+    set_ball_analysis=None,
+):
+    rows = clean_number_rows(number_rows, number_max)
+    bonus_rows = clean_number_rows(bonus_rows or [], number_max)
+    combined = {number: 0.0 for number in range(1, number_max + 1)}
+    fixed_weights = _fixed_chamini6_component_weights()
+    performance_df = build_model_performance_weights(reports, draw_size, lottery_type, model_history)
+    performance_weights = {
+        str(row.get("model_key")): _safe_float(row.get("applied_weight"), 1.0)
+        for _, row in performance_df.iterrows()
+    }
+    detail_rows = []
+    for component_key in CHAMINI6_COMPONENT_MODEL_KEYS:
+        raw_scores = build_model_scores(rows, component_key, number_max, draw_size, target_round, bonus_rows)
+        normalized = normalize_scores(raw_scores, number_max)
+        fixed = fixed_weights.get(component_key, 1.0)
+        performance = performance_weights.get(component_key, 1.0)
+        ai_weight = _ai_weight_for_model(component_key, ai_weight_summary)
+        applied = _clamp(fixed * performance * ai_weight, 0.25, 2.4)
+        for number, score in normalized.items():
+            combined[number] += score * applied
+        detail_rows.append(
+            {
+                "モデルキー": component_key,
+                "モデル名": model_label(component_key),
+                "固定重み": round(fixed, 3),
+                "成績重み": round(performance, 3),
+                "AI改善重み": round(ai_weight, 3),
+                "適用重み": round(applied, 3),
+                "状態": "反映",
+            }
+        )
+    if set_ball_analysis and set_ball_analysis.get("available"):
+        set_scores = normalize_scores(set_ball_analysis.get("score_map", {}), number_max)
+        set_weight = 0.55
+        for number, score in set_scores.items():
+            combined[number] += score * set_weight
+        detail_rows.append(
+            {
+                "モデルキー": "set_ball_analysis",
+                "モデル名": "セット球分析",
+                "固定重み": set_weight,
+                "成績重み": 1.0,
+                "AI改善重み": 1.0,
+                "適用重み": set_weight,
+                "状態": set_ball_analysis.get("message", "反映"),
+            }
+        )
+    else:
+        detail_rows.append(
+            {
+                "モデルキー": "set_ball_analysis",
+                "モデル名": "セット球分析",
+                "固定重み": 0.0,
+                "成績重み": 1.0,
+                "AI改善重み": 1.0,
+                "適用重み": 0.0,
+                "状態": (set_ball_analysis or {}).get("message", "セット球データなし"),
+            }
+        )
+    return combined, pd.DataFrame(detail_rows)
+
+
+def _chamini6_candidate_score(numbers, score_map, rows, number_max, draw_size, sum_stats=None):
+    sum_stats = sum_stats or _history_sum_stats(rows, draw_size, number_max, precleaned=True)
+    balance = _balance_score(numbers, rows, number_max, draw_size, sum_stats)
+    raw = sum(_safe_float(score_map.get(number), 0.0) for number in numbers) / max(draw_size, 1) * 100
+    over_31_bonus = 4 if any(number > 31 for number in numbers) else -8
+    consecutive_penalty = 20 if has_three_consecutive(numbers) else count_consecutive_pairs(numbers) * 2
+    return raw + balance * 0.2 + over_31_bonus - consecutive_penalty
+
+
+def generate_chamini6_god_mode_picks(
+    number_rows,
+    bonus_rows,
+    number_max,
+    draw_size,
+    target_round=0,
+    reports=None,
+    model_history=None,
+    lottery_type="",
+    ai_weight_summary=None,
+    set_ball_analysis=None,
+    pick_count=1,
+):
+    rows = clean_number_rows(number_rows, number_max)
+    if not rows:
+        return []
+    score_map, detail_df = build_chamini6_score_map(
+        rows,
+        bonus_rows,
+        number_max,
+        draw_size,
+        target_round,
+        reports,
+        model_history,
+        lottery_type,
+        ai_weight_summary,
+        set_ball_analysis,
+    )
+    candidate_limit = min(number_max, max(draw_size + 9, 15 if draw_size <= 6 else 16))
+    candidate_numbers = top_score_numbers(score_map, candidate_limit)
+    if len(candidate_numbers) < draw_size:
+        candidate_numbers = [number for number, _ in sorted(score_map.items(), key=lambda item: item[1], reverse=True)[:candidate_limit]]
+    low_limit = game_low_limit(number_max)
+    sum_stats = _history_sum_stats(rows, draw_size, number_max, precleaned=True)
+    candidates = []
+    for combo in combinations(candidate_numbers, draw_size):
+        numbers = tuple(sorted(combo))
+        odd = sum(number % 2 for number in numbers)
+        low = sum(number <= low_limit for number in numbers)
+        if draw_size == 6 and (odd not in (2, 3, 4) or low not in (2, 3, 4)):
+            continue
+        if draw_size == 7 and (odd not in (3, 4) or low not in (3, 4)):
+            continue
+        if has_three_consecutive(numbers):
+            continue
+        score = _chamini6_candidate_score(numbers, score_map, rows, number_max, draw_size, sum_stats)
+        candidates.append((score, numbers))
+    if not candidates:
+        fallback = tuple(sorted(candidate_numbers[:draw_size]))
+        candidates.append((_chamini6_candidate_score(fallback, score_map, rows, number_max, draw_size, sum_stats), fallback))
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    picks = []
+    used = set()
+    for score, numbers in candidates:
+        if picks and len(set(numbers) & used) > max(2, draw_size // 2):
+            continue
+        set_text = "セット球分析を補助反映" if set_ball_analysis and set_ball_analysis.get("available") else "セット球データなし"
+        ai_text = "AI改善重みを反映" if (ai_weight_summary or {}).get("available") else "AI改善重みは通常値"
+        anti_status = anti_popular_candidate_status(numbers, rows[-1], number_max, draw_size)
+        reason = (
+            f"{CHAMINI6_GOD_MODE_LABEL}: 16分析エンジン、AI改善重み、"
+            f"人と被りにくい期待値最大化モデルを統合。{ai_text} / {set_text}。"
+        )
+        picks.append(
+            {
+                "numbers": tuple(numbers),
+                "reason": reason,
+                "model_key": CHAMINI6_GOD_MODE_KEY,
+                "model_name": CHAMINI6_GOD_MODE_KEY,
+                "display_model_name": CHAMINI6_GOD_MODE_LABEL,
+                "used_models": [model_label(key) for key in CHAMINI6_COMPONENT_MODEL_KEYS],
+                "emphasized_factors": "総合統合、AI改善重み、セット球補助、低人気期待値、奇数偶数・高低・合計値バランス",
+                "selection_reason": reason,
+                "prediction_score": round(float(score), 3),
+                "chamini6_detail": detail_df,
+                "anti_popular_diagnostics": anti_status,
+                "model_description": "複数モデルを削除・置換せず、研究用の統合候補として重み付けする独立エンジンです。",
+            }
+        )
+        used.update(numbers)
+        if len(picks) >= pick_count:
+            break
+    return picks
+
+
 def _ranked_replacement_pool(number_max, score_map=None):
     score_map = score_map or {}
     return [
@@ -877,6 +1246,33 @@ def build_model_scores(number_rows, model_key, number_max, draw_size, target_rou
             + rng.random() * 0.35
             for number in range(1, number_max + 1)
         }
+    if key == CHAMINI6_GOD_MODE_KEY:
+        combined = {number: 0.0 for number in range(1, number_max + 1)}
+        fixed_weights = {
+            "frequency_analysis": 1.0,
+            "cold_analysis": 0.9,
+            "hot_analysis": 1.1,
+            "odd_even_analysis": 0.55,
+            "sum_value_analysis": 0.65,
+            "high_low_analysis": 0.6,
+            "consecutive_analysis": 0.5,
+            "last_digit_analysis": 0.45,
+            "pair_analysis": 0.95,
+            "triple_analysis": 0.7,
+            "bonus_analysis": 0.5,
+            "markov_chain": 0.95,
+            "bayesian_estimation": 0.9,
+            "monte_carlo": 0.75,
+            "machine_learning": 1.25,
+            ANTI_POPULAR_EXPECTED_VALUE_KEY: 0.45,
+        }
+        for component_key in CHAMINI6_COMPONENT_MODEL_KEYS:
+            raw_scores = build_model_scores(rows, component_key, number_max, draw_size, target_round, bonus_rows)
+            normalized = normalize_scores(raw_scores, number_max)
+            weight = fixed_weights.get(component_key, 1.0)
+            for number, score in normalized.items():
+                combined[number] += score * weight
+        return combined
 
     components = model_score_components(rows, number_max, draw_size, target_round, bonus_rows)
     counts = Counter(number for row in rows for number in row)
@@ -2231,10 +2627,17 @@ def ranking_target_models():
     for label in ("候補スコア活用予測", "AI改善反映予測"):
         if label not in labels:
             labels.append(label)
+    for label in (CHAMINI6_GOD_MODE_LABEL,):
+        if label not in labels:
+            labels.append(label)
     return labels
 
 
 def ranking_model_type(model_name):
+    if model_name in (CHAMINI6_GOD_MODE_KEY, CHAMINI6_GOD_MODE_LABEL):
+        return "Chamini6 God Mode"
+    if model_name in (ANTI_POPULAR_EXPECTED_VALUE_KEY, ANTI_POPULAR_EXPECTED_VALUE_LABEL):
+        return "補助モデル"
     if model_name in ("候補スコア活用予測", "AI改善反映予測"):
         return "予測方式"
     if model_name == ARL_MODEL_LABELS.get("random_baseline"):
@@ -2538,9 +2941,10 @@ def build_model_performance_weights(reports, draw_size, lottery_type="", model_h
     ai_scores = model_history_ai_scores(model_history)
     weight_rows = []
     for model_key, label in ARL_MODEL_LABELS.items():
-        model_rows = df[df[model_column] == str(label)].copy()
+        model_aliases = {str(label), str(model_key)}
+        model_rows = df[df[model_column].isin(model_aliases)].copy()
         if model_rows.empty:
-            ai_after = ai_scores.get(str(label))
+            ai_after = ai_scores.get(str(label), ai_scores.get(str(model_key)))
             raw_score = (ai_after or 0.0) * 18
             weight_rows.append(
                 {
@@ -2572,7 +2976,7 @@ def build_model_performance_weights(reports, draw_size, lottery_type="", model_h
         stability = _clamp(100.0 - (std / max(draw_size, 1) * 100.0))
         expected_value = float(((matches + bonus_matches * 0.25) / max(draw_size, 1)).mean())
         bonus_rate = float((bonus_matches > 0).mean() * 100.0) if len(bonus_matches) else 0.0
-        ai_after = ai_scores.get(str(label), 0.0)
+        ai_after = ai_scores.get(str(label), ai_scores.get(str(model_key), 0.0))
         raw_score = (
             avg_match * 30
             + recent5 * 18

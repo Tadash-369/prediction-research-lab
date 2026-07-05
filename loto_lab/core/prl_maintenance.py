@@ -206,6 +206,97 @@ def backup_file(path):
     return str(backup_path)
 
 
+def _missing_columns(df, columns):
+    return [column for column in columns if column not in df.columns]
+
+
+def _duplicate_count(df, columns):
+    if df.empty or any(column not in df.columns for column in columns):
+        return 0
+    return int(df.duplicated(subset=columns, keep=False).sum())
+
+
+def _latest_draw_text(df):
+    if df.empty or not len(df.columns):
+        return "-"
+    round_column = df.columns[0]
+    values = pd.to_numeric(df[round_column], errors="coerce").dropna()
+    return str(int(values.max())) if not values.empty else "-"
+
+
+def collect_csv_safety_diagnostics():
+    rows = []
+    targets = [
+        ("loto6_results", DATA_DIR / "loto6.csv", None, "開催回の重複と最新回を確認します。"),
+        ("loto7_results", DATA_DIR / "loto7.csv", None, "開催回の重複と最新回を確認します。"),
+        ("loto6_predictions", DATA_DIR / "predictions.csv", PREDICTION_COLUMNS, "予想IDと複合キーの重複を確認します。"),
+        ("loto7_predictions", DATA_DIR / "loto7_predictions.csv", PREDICTION_COLUMNS, "予想IDと複合キーの重複を確認します。"),
+        ("loto6_verification", VERIFICATION_DIR / "verification_reports.csv", None, "検証履歴の読み込み可否を確認します。"),
+        ("loto7_verification", VERIFICATION_DIR / "loto7_verification_reports.csv", LOTO7_VERIFICATION_COLUMNS, "検証キーと列構成を確認します。"),
+        ("loto6_contributions", VERIFICATION_DIR / "loto6_model_contributions.csv", CONTRIBUTION_COLUMNS, "モデル貢献度列を確認します。"),
+        ("loto7_contributions", VERIFICATION_DIR / "loto7_model_contributions.csv", CONTRIBUTION_COLUMNS, "モデル貢献度列を確認します。"),
+        ("loto6_research_cycles", VERIFICATION_DIR / "loto6_research_cycles.csv", RESEARCH_CYCLE_COLUMNS, "研究サイクル列を確認します。"),
+        ("loto7_research_cycles", VERIFICATION_DIR / "loto7_research_cycles.csv", RESEARCH_CYCLE_COLUMNS, "研究サイクル列を確認します。"),
+    ]
+    for name, path, columns, guidance in targets:
+        if not path.exists():
+            rows.append(
+                {
+                    "対象": name,
+                    "ファイル": str(path.relative_to(LOTO_LAB_DIR)),
+                    "状態": "missing",
+                    "詳細": "ファイルがまだありません。",
+                    "推奨対応": guidance,
+                }
+            )
+            continue
+        try:
+            df = read_csv(path, columns)
+        except Exception as exc:
+            rows.append(
+                {
+                    "対象": name,
+                    "ファイル": str(path.relative_to(LOTO_LAB_DIR)),
+                    "状態": "read_error",
+                    "詳細": str(exc),
+                    "推奨対応": "CSVをバックアップしてから文字コードと列構成を確認してください。",
+                }
+            )
+            continue
+        missing = _missing_columns(df, columns or [])
+        details = []
+        if missing:
+            details.append(f"不足列: {', '.join(map(str, missing[:6]))}")
+        if not df.empty and len(df.columns):
+            round_dupes = _duplicate_count(df, [df.columns[0]])
+            if "results" in name and round_dupes:
+                details.append(f"開催回重複: {round_dupes}行")
+        if columns == PREDICTION_COLUMNS and not df.empty:
+            id_dupes = _duplicate_count(df, [PREDICTION_COLUMNS[0]])
+            composite_dupes = _duplicate_count(df, [PREDICTION_COLUMNS[1], PREDICTION_COLUMNS[3], PREDICTION_COLUMNS[4], PREDICTION_COLUMNS[5]])
+            if id_dupes:
+                details.append(f"予想ID重複: {id_dupes}行")
+            if composite_dupes:
+                details.append(f"予想複合キー重複: {composite_dupes}行")
+        if columns == LOTO7_VERIFICATION_COLUMNS and not df.empty:
+            key_dupes = _duplicate_count(df, [LOTO7_VERIFICATION_COLUMNS[0]])
+            if key_dupes:
+                details.append(f"検証キー重複: {key_dupes}行")
+        if not details:
+            details.append(f"読み込みOK / 最新回: {_latest_draw_text(df)} / 行数: {len(df)}")
+        status = "needs_attention" if missing or any("重複" in detail for detail in details) else "ok"
+        rows.append(
+            {
+                "対象": name,
+                "ファイル": str(path.relative_to(LOTO_LAB_DIR)),
+                "状態": status,
+                "詳細": " / ".join(details),
+                "推奨対応": guidance,
+            }
+        )
+    return pd.DataFrame(rows, columns=["対象", "ファイル", "状態", "詳細", "推奨対応"])
+
+
 def normalize_text(value):
     text = str(value)
     stripped = text.strip()

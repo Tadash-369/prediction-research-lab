@@ -21,6 +21,8 @@ from arl_research_engine import (
     ANTI_POPULAR_EXPECTED_VALUE_LABEL,
     ARL_MODEL_LABELS,
     BACKTEST_SUMMARY_COLUMNS,
+    CHAMINI6_GOD_MODE_KEY,
+    CHAMINI6_GOD_MODE_LABEL,
     CONTINUOUS_WIN_RESEARCH_COLUMNS,
     CONTRIBUTION_COLUMNS,
     ENSEMBLE_PREDICTION_COLUMNS,
@@ -51,6 +53,7 @@ from arl_research_engine import (
     build_effective_conditions,
     build_hit_factor_summary,
     build_missing_excess_conditions,
+    build_set_ball_analysis,
     build_model_dashboard,
     build_model_scores,
     build_model_support_map,
@@ -64,6 +67,7 @@ from arl_research_engine import (
     extract_video_hypothesis,
     format_contribution_detail,
     generate_anti_popular_expected_value_picks,
+    generate_chamini6_god_mode_picks,
     load_winning_condition_history,
     merge_contribution_rows,
     merge_research_cycle_rows,
@@ -769,6 +773,82 @@ def history_number_rows(results):
     return rows
 
 
+def history_bonus_rows(results):
+    if results is None or results.empty:
+        return []
+    history = results.copy()
+    history["開催回"] = history["開催回"].map(to_int)
+    history = history.sort_values("開催回")
+    rows = []
+    for _, row in history.iterrows():
+        numbers = [number for number in row_bonus_numbers(row) if 1 <= number <= 37]
+        if numbers:
+            rows.append(numbers)
+    return rows
+
+
+def render_set_ball_analysis_panel(results):
+    analysis = build_set_ball_analysis(results, NUMBER_COLUMNS, 37, 7, round_column="開催回")
+    with st.expander("セット球分析（Chamini6補助）", expanded=False):
+        if analysis.get("available"):
+            st.success(analysis.get("message", "セット球分析を反映できます。"))
+            if not analysis.get("summary_frame", pd.DataFrame()).empty:
+                st.dataframe(analysis["summary_frame"], width="stretch", hide_index=True)
+            if not analysis.get("number_frame", pd.DataFrame()).empty:
+                st.dataframe(analysis["number_frame"].head(12), width="stretch", hide_index=True)
+        else:
+            st.info(analysis.get("message", "セット球データなし。"))
+    return analysis
+
+
+def render_chamini6_prediction(results, target_round, ai_weight_summary, set_ball_analysis):
+    reports = read_csv(VERIFICATION_REPORTS_CSV, VERIFICATION_COLUMNS)
+    _, model_history = load_winning_condition_history(AI_IMPROVEMENT_DIR, "loto7")
+    picks = generate_chamini6_god_mode_picks(
+        history_number_rows(results),
+        history_bonus_rows(results),
+        number_max=37,
+        draw_size=7,
+        target_round=target_round,
+        reports=reports,
+        model_history=model_history,
+        lottery_type="loto7",
+        ai_weight_summary=ai_weight_summary,
+        set_ball_analysis=set_ball_analysis,
+        pick_count=1,
+    )
+    with st.expander(f"{CHAMINI6_GOD_MODE_LABEL}（統合候補）", expanded=False):
+        if not picks:
+            st.info("Chamini6 God Modeを表示するには、抽せん履歴が必要です。")
+            return
+        pick = picks[0]
+        st.markdown(f"**予想番号: {numbers_to_text(pick.get('numbers', []))}**")
+        st.write(f"使用モデル: {pick.get('display_model_name', CHAMINI6_GOD_MODE_LABEL)}")
+        st.write(f"重視した要素: {pick.get('emphasized_factors', '-')}")
+        st.write(f"選定理由: {pick.get('selection_reason', pick.get('reason', '-'))}")
+        st.caption("Pattern A/B/Cとは別の統合候補です。Pattern Cには低人気期待値要素を、Chamini6には複数モデル重みを強めに反映します。")
+        diagnostics = pick.get("anti_popular_diagnostics", {})
+        if diagnostics:
+            st.caption(
+                f"低人気補助: 前回重複{diagnostics.get('previous_overlap_count')}個 / "
+                f"31超え数字{'あり' if diagnostics.get('has_over_31') else 'なし'} / "
+                f"3連続チェック{'OK' if diagnostics.get('three_consecutive_excluded') else '要注意'}"
+            )
+        detail = pick.get("chamini6_detail", pd.DataFrame())
+        if not detail.empty:
+            st.dataframe(detail, width="stretch", hide_index=True)
+        if st.button("Chamini6 God Mode予測を保存", key="loto7_chamini6_save"):
+            result = save_prediction_picks(picks, target_round, CHAMINI6_GOD_MODE_KEY, CHAMINI6_GOD_MODE_KEY)
+            if result["saved"]:
+                st.success(f"Chamini6 God Mode予測を {result['saved']} 件保存しました。")
+            else:
+                st.info("同じChamini6 God Mode予測は保存済みです。")
+            if result["skipped"]:
+                st.info(f"重複のため {result['skipped']} 件をスキップしました。")
+            for error in result["errors"]:
+                st.warning(error)
+
+
 def build_anti_popular_pattern_pick(results, target_round, anchor_numbers=None):
     return (
         generate_anti_popular_expected_value_picks(
@@ -1253,7 +1333,12 @@ def get_pre_prediction_research(results):
 def best_actionable_model_key(summary_df):
     if summary_df.empty:
         return None
-    excluded_models = {MODEL_LABELS["random_baseline"], MODEL_LABELS.get(ANTI_POPULAR_EXPECTED_VALUE_KEY)}
+    excluded_models = {
+        MODEL_LABELS["random_baseline"],
+        MODEL_LABELS.get(ANTI_POPULAR_EXPECTED_VALUE_KEY),
+        MODEL_LABELS.get(CHAMINI6_GOD_MODE_KEY),
+        CHAMINI6_GOD_MODE_KEY,
+    }
     usable = summary_df[~summary_df["モデル"].isin(excluded_models)]
     if usable.empty:
         return None
@@ -1714,7 +1799,7 @@ def render_prediction_area(results):
     st.markdown("**研究フロー: 当選番号追加 → 結果分析 → 反省履歴保存 → 履歴分析 → モデル評価 → 改善条件抽出 → 次回予想生成**")
     with st.spinner("予想生成前の履歴分析とモデル評価を実行しています..."):
         pre_summary, _, best_key = get_pre_prediction_research(results)
-    model_options = [key for key in MODEL_LABELS if key != "random_baseline"]
+    model_options = [key for key in MODEL_LABELS if key not in ("random_baseline", CHAMINI6_GOD_MODE_KEY)]
     active_setting = read_active_model_setting()
     default_model = best_key if best_key in model_options else active_setting["model_key"] if active_setting and active_setting["model_key"] in model_options else "machine_learning"
     model_key = st.selectbox(
@@ -1744,12 +1829,15 @@ def render_prediction_area(results):
         st.warning(warning)
     top_count = st.selectbox("CSVランキング表示件数", [10, 20, 30, 37], index=1, key="loto7_score_top_count")
     render_ai_improvement_weight_summary(ai_weight_summary)
+    set_ball_analysis = render_set_ball_analysis_panel(results)
     if score_csv.empty:
         st.info("候補スコアCSVがありません。上の「候補スコアCSVを更新」から作成できます。")
     else:
         st.dataframe(score_display_df(score_csv).head(top_count), width="stretch", hide_index=True)
         render_next_score_prediction(score_csv, results, int(results["開催回"].max()) + 1)
         render_ai_weighted_prediction(score_csv, results, int(results["開催回"].max()) + 1, ai_weight_summary)
+
+    render_chamini6_prediction(results, target_round, ai_weight_summary, set_ball_analysis)
 
     with st.expander("選択モデルの即時計算スコア"):
         st.dataframe(scores.head(20), width="stretch", hide_index=True)
