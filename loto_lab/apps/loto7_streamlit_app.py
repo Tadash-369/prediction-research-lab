@@ -77,6 +77,7 @@ from arl_research_engine import (
     validate_purchase_numbers,
     weighted_model_text,
 )
+from prl_maintenance import collect_csv_safety_diagnostics
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -267,6 +268,25 @@ def now_text():
 
 def today_text():
     return date.today().strftime("%Y/%m/%d")
+
+
+def render_prediction_flow_diagnostics(lottery_key="loto7", lottery_label="ロト7"):
+    with st.expander(f"{lottery_label} 保存・検証フロー診断（読み取り専用）", expanded=False):
+        try:
+            diagnostics = collect_csv_safety_diagnostics()
+        except Exception as exc:
+            st.warning(f"CSV安全診断を読み込めませんでした: {exc}")
+            return
+        if diagnostics.empty:
+            st.info("診断対象のCSV情報がありません。")
+            return
+        target_col = diagnostics.columns[0]
+        filtered = diagnostics[diagnostics[target_col].astype(str).str.startswith(lottery_key)]
+        if filtered.empty:
+            st.info(f"{lottery_label} の保存・検証診断行はありません。")
+            return
+        st.caption("この診断は読み取り専用です。表示しても loto7_predictions.csv や検証履歴CSVは更新されません。")
+        st.dataframe(filtered, width="stretch", hide_index=True)
 
 
 def verification_key(prediction_id, model_name, candidate_no):
@@ -1838,6 +1858,7 @@ def render_prediction_area(results):
         render_ai_weighted_prediction(score_csv, results, int(results["開催回"].max()) + 1, ai_weight_summary)
 
     render_chamini6_prediction(results, target_round, ai_weight_summary, set_ball_analysis)
+    render_prediction_flow_diagnostics("loto7", "ロト7")
 
     with st.expander("選択モデルの即時計算スコア"):
         st.dataframe(scores.head(20), width="stretch", hide_index=True)

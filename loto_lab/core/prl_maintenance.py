@@ -171,6 +171,8 @@ SYNC_TARGETS = [
     ("video_hypotheses.csv", "分析研究所/reports/video_hypotheses.csv"),
 ]
 
+DIAGNOSTIC_COLUMNS = ["対象", "ファイル", "状態", "詳細", "推奨対応"]
+
 
 def read_csv(path, columns=None):
     if not path.exists():
@@ -222,6 +224,123 @@ def _latest_draw_text(df):
     round_column = df.columns[0]
     values = pd.to_numeric(df[round_column], errors="coerce").dropna()
     return str(int(values.max())) if not values.empty else "-"
+
+
+def _relative_path(path):
+    try:
+        return str(path.relative_to(LOTO_LAB_DIR))
+    except ValueError:
+        return str(path)
+
+
+def _diagnostic_row(target, path, status, detail, recommendation):
+    return {
+        DIAGNOSTIC_COLUMNS[0]: target,
+        DIAGNOSTIC_COLUMNS[1]: _relative_path(path),
+        DIAGNOSTIC_COLUMNS[2]: status,
+        DIAGNOSTIC_COLUMNS[3]: detail,
+        DIAGNOSTIC_COLUMNS[4]: recommendation,
+    }
+
+
+def _first_existing_column(df, candidates, fallback_index=0):
+    for column in candidates:
+        if column in df.columns:
+            return column
+    if not df.empty and len(df.columns) > fallback_index:
+        return df.columns[fallback_index]
+    return ""
+
+
+def _draw_set(df, column=""):
+    if df.empty:
+        return set()
+    draw_column = column if column in df.columns else _first_existing_column(df, [], 0)
+    if not draw_column:
+        return set()
+    values = pd.to_numeric(df[draw_column], errors="coerce").dropna()
+    return {int(value) for value in values}
+
+
+def _chamini6_count(df):
+    if df.empty:
+        return 0
+    mask = pd.Series(False, index=df.index)
+    for column in (PREDICTION_COLUMNS[0], PREDICTION_COLUMNS[5], PREDICTION_COLUMNS[6], "検証キー"):
+        if column in df.columns:
+            mask = mask | df[column].astype(str).str.contains("chamini6|Chamini6", case=False, na=False)
+    return int(mask.sum())
+
+
+def _collect_prediction_flow_diagnostics():
+    rows = []
+    configs = [
+        {
+            "label": "loto6",
+            "prediction_path": DATA_DIR / "predictions.csv",
+            "result_path": DATA_DIR / "results.csv",
+            "report_path": VERIFICATION_DIR / "verification_reports.csv",
+        },
+        {
+            "label": "loto7",
+            "prediction_path": DATA_DIR / "loto7_predictions.csv",
+            "result_path": DATA_DIR / "loto7_results.csv",
+            "report_path": VERIFICATION_DIR / "loto7_verification_reports.csv",
+        },
+    ]
+    for config in configs:
+        predictions = read_csv(config["prediction_path"], PREDICTION_COLUMNS)
+        results = read_csv(config["result_path"])
+        reports = read_csv(config["report_path"])
+
+        prediction_draws = _draw_set(predictions, PREDICTION_COLUMNS[1])
+        result_draws = _draw_set(results)
+        report_draw_column = _first_existing_column(reports, [PREDICTION_COLUMNS[1], LOTO7_VERIFICATION_COLUMNS[2]], 2)
+        report_draws = _draw_set(reports, report_draw_column)
+
+        ready_draws = prediction_draws & result_draws
+        predictions_without_result = sorted(prediction_draws - result_draws)
+        results_without_prediction = sorted(result_draws - prediction_draws)
+
+        if predictions.empty or not ready_draws:
+            unverified_ready_count = 0
+        else:
+            draw_column = PREDICTION_COLUMNS[1] if PREDICTION_COLUMNS[1] in predictions.columns else predictions.columns[0]
+            ready_mask = pd.to_numeric(predictions[draw_column], errors="coerce").isin(ready_draws)
+            verified_ready_count = 0
+            if not reports.empty and report_draw_column in reports.columns:
+                verified_ready_count = int(pd.to_numeric(reports[report_draw_column], errors="coerce").isin(ready_draws).sum())
+            unverified_ready_count = max(int(ready_mask.sum()) - verified_ready_count, 0)
+
+        details = (
+            f"検証可能回: {len(ready_draws)} / "
+            f"結果あり未検証予想(概算): {unverified_ready_count} / "
+            f"結果なし予想回: {len(predictions_without_result)} / "
+            f"予想なし結果回: {len(results_without_prediction)}"
+        )
+        status = "needs_attention" if unverified_ready_count or results_without_prediction else "ok"
+        rows.append(
+            _diagnostic_row(
+                f"{config['label']}_prediction_verification_flow",
+                config["prediction_path"],
+                status,
+                details,
+                "結果登録後、対象回の検証・AI改善・モデル貢献度保存へ進んでください。",
+            )
+        )
+
+        chamini6_predictions = _chamini6_count(predictions)
+        chamini6_verified = _chamini6_count(reports)
+        rows.append(
+            _diagnostic_row(
+                f"{config['label']}_chamini6_flow",
+                config["prediction_path"],
+                "ok",
+                f"Chamini6保存済み予想: {chamini6_predictions} / Chamini6検証済み: {chamini6_verified}",
+                "Chamini6 God Modeを保存済み予想・検証・AI改善の対象として継続確認します。",
+            )
+        )
+    return rows
 
 
 def collect_csv_safety_diagnostics():
@@ -294,7 +413,8 @@ def collect_csv_safety_diagnostics():
                 "推奨対応": guidance,
             }
         )
-    return pd.DataFrame(rows, columns=["対象", "ファイル", "状態", "詳細", "推奨対応"])
+    rows.extend(_collect_prediction_flow_diagnostics())
+    return pd.DataFrame(rows, columns=DIAGNOSTIC_COLUMNS)
 
 
 def normalize_text(value):

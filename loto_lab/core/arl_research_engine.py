@@ -987,9 +987,9 @@ def generate_chamini6_god_mode_picks(
         picks.append(
             {
                 "numbers": tuple(numbers),
-                "reason": reason,
+                "reason": f"[{CHAMINI6_GOD_MODE_KEY}] {reason}",
                 "model_key": CHAMINI6_GOD_MODE_KEY,
-                "model_name": CHAMINI6_GOD_MODE_KEY,
+                "model_name": CHAMINI6_GOD_MODE_LABEL,
                 "display_model_name": CHAMINI6_GOD_MODE_LABEL,
                 "used_models": [model_label(key) for key in CHAMINI6_COMPONENT_MODEL_KEYS],
                 "emphasized_factors": "総合統合、AI改善重み、セット球補助、低人気期待値、奇数偶数・高低・合計値バランス",

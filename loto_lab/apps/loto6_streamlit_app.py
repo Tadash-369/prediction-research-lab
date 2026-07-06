@@ -83,6 +83,7 @@ from arl_research_engine import (
     validate_purchase_numbers,
     weighted_model_text,
 )
+from prl_maintenance import collect_csv_safety_diagnostics
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -363,6 +364,19 @@ def safe_prediction_model_id(model_name):
     return safe or hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
+def valid_loto6_prediction_numbers(numbers):
+    try:
+        parsed = [int(number) for number in numbers]
+    except Exception:
+        return []
+    unique = sorted(set(parsed))
+    if len(parsed) != 6 or len(unique) != 6:
+        return []
+    if any(number < 1 or number > 43 for number in unique):
+        return []
+    return unique
+
+
 def best_actionable_model_key(summary_df):
     if summary_df.empty:
         return None
@@ -467,6 +481,25 @@ def today_text():
 
 def now_text():
     return datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+
+
+def render_prediction_flow_diagnostics(lottery_key="loto6", lottery_label="ロト6"):
+    with st.expander(f"{lottery_label} 保存・検証フロー診断（読み取り専用）", expanded=False):
+        try:
+            diagnostics = collect_csv_safety_diagnostics()
+        except Exception as exc:
+            st.warning(f"CSV安全診断を読み込めませんでした: {exc}")
+            return
+        if diagnostics.empty:
+            st.info("診断対象のCSV情報がありません。")
+            return
+        target_col = diagnostics.columns[0]
+        filtered = diagnostics[diagnostics[target_col].astype(str).str.startswith(lottery_key)]
+        if filtered.empty:
+            st.info(f"{lottery_label} の保存・検証診断行はありません。")
+            return
+        st.caption("この診断は読み取り専用です。表示しても predictions.csv や検証履歴CSVは更新されません。")
+        st.dataframe(filtered, width="stretch", hide_index=True)
 
 
 def numbers_to_text(numbers):
@@ -1063,11 +1096,12 @@ def render_chamini6_prediction(results, target_round, ai_weight_summary, set_bal
         if not detail.empty:
             st.dataframe(detail, width="stretch", hide_index=True)
         if st.button("Chamini6 God Mode予測を保存", key="loto6_chamini6_save"):
-            saved_count = save_prediction_picks(picks, target_round, CHAMINI6_GOD_MODE_KEY)
-            if saved_count:
-                st.success(f"Chamini6 God Mode予測を {saved_count} 件保存しました。")
-            else:
-                st.info("同じChamini6 God Mode予測は保存済みです。")
+            result = save_prediction_picks_detailed(picks, target_round, CHAMINI6_GOD_MODE_LABEL)
+            render_loto6_prediction_save_result(
+                result,
+                "Chamini6 God Mode予測を {saved} 件保存しました。",
+                "同じChamini6 God Mode予測は保存済みです。",
+            )
 
 
 def build_anti_popular_pattern_pick(results, target_round, anchor_numbers=None):
@@ -1817,13 +1851,13 @@ def run_backtest(results, lookback_rounds=50, min_training_rounds=30):
     return summary_df, detail_df.sort_values(["開催回", "モデル", "候補番号"], ascending=[False, True, True])
 
 
-def run_pre_prediction_research(results):
+def run_pre_prediction_research(results, persist_setting=False):
     if results.empty or len(results) <= 30:
         return pd.DataFrame(), pd.DataFrame(), None
     lookback_rounds = min(5, max(3, len(results) - 30))
     summary_df, detail_df = run_backtest(results, lookback_rounds=lookback_rounds)
     best_model_key = best_actionable_model_key(summary_df)
-    if best_model_key:
+    if best_model_key and persist_setting:
         save_active_model_setting(best_model_key, f"予想生成前の履歴分析・直近{lookback_rounds}回評価")
     return summary_df, detail_df, best_model_key
 
@@ -1846,7 +1880,95 @@ def get_pre_prediction_research(results):
     )
 
 
+def prediction_reason_with_pattern(pick):
+    pattern_text = " ".join(
+        str(value)
+        for value in (pick.get("pattern_label"), pick.get("role_label"))
+        if value
+    ).strip()
+    reason = str(pick.get("reason", pick.get("selection_reason", "")))
+    return f"[{pattern_text}] {reason}" if pattern_text else reason
+
+
+def save_prediction_picks_detailed(picks, target_round, model_name="score_balance_v1"):
+    id_col, draw_col, date_col, candidate_col, numbers_col, model_col, reason_col, saved_col = PREDICTION_COLUMNS
+    predictions = read_csv(PREDICTIONS_CSV, PREDICTION_COLUMNS)
+    existing_keys = set()
+    existing_ids = set()
+    if not predictions.empty:
+        for _, row in predictions.iterrows():
+            existing_keys.add(
+                (
+                    to_int(row.get(draw_col)),
+                    to_int(row.get(candidate_col)),
+                    str(row.get(numbers_col)),
+                    str(row.get(model_col)),
+                )
+            )
+            existing_ids.add(str(row.get(id_col, "")).strip())
+
+    rows = []
+    skipped = 0
+    errors = []
+    prediction_date = today_text()
+    for index, pick in enumerate(picks, start=1):
+        numbers = valid_loto6_prediction_numbers(pick.get("numbers", []))
+        if not numbers:
+            errors.append(f"candidate {index}: invalid loto6 numbers")
+            continue
+        number_text = numbers_to_text(numbers)
+        row_model_name = pick.get("model_name") or model_name
+        model_id = safe_prediction_model_id(pick.get("model_key") or row_model_name)
+        prediction_id = f"{int(target_round)}-{prediction_date.replace('/', '')}-{model_id}-{index}"
+        key = (int(target_round), index, number_text, row_model_name)
+        if key in existing_keys or prediction_id in existing_ids:
+            skipped += 1
+            continue
+        rows.append(
+            {
+                id_col: prediction_id,
+                draw_col: int(target_round),
+                date_col: prediction_date,
+                candidate_col: index,
+                numbers_col: number_text,
+                model_col: row_model_name,
+                reason_col: prediction_reason_with_pattern(pick),
+                saved_col: now_text(),
+            }
+        )
+        existing_keys.add(key)
+        existing_ids.add(prediction_id)
+
+    if rows:
+        predictions = pd.concat([predictions, pd.DataFrame(rows)], ignore_index=True)
+        predictions[draw_col] = predictions[draw_col].map(to_int)
+        predictions[candidate_col] = predictions[candidate_col].map(to_int)
+        predictions = predictions.sort_values([draw_col, candidate_col, saved_col])
+        save_csv(predictions, PREDICTIONS_CSV, PREDICTION_COLUMNS)
+    return {
+        "saved": len(rows),
+        "skipped": skipped,
+        "errors": errors,
+        "prediction_ids": [row[id_col] for row in rows],
+        "target_round": int(target_round),
+    }
+
+
+def render_loto6_prediction_save_result(result, saved_message, duplicate_message):
+    if result["saved"]:
+        st.success(saved_message.format(saved=result["saved"]))
+    else:
+        st.info(duplicate_message)
+    if result.get("prediction_ids"):
+        st.caption(f"保存した予想ID: {', '.join(result['prediction_ids'])}")
+    if result.get("skipped"):
+        st.warning(f"重複のため {result['skipped']} 件をスキップしました。")
+    for error in result.get("errors", []):
+        st.warning(error)
+
+
 def save_prediction_picks(picks, target_round, model_name="score_balance_v1"):
+    return save_prediction_picks_detailed(picks, target_round, model_name)["saved"]
     predictions = read_csv(PREDICTIONS_CSV, PREDICTION_COLUMNS)
     existing_keys = set()
     if not predictions.empty:
@@ -2286,11 +2408,24 @@ def render_prediction_picks(scores, results, target_round):
     else:
         st.caption("反映中の研究モデル: 標準スコアバランス")
 
-    saved_count = save_prediction_picks(picks, target_round, active_model_name)
+    save_clicked = st.button("ロト6標準予測を保存", key="loto6_standard_prediction_save")
+    saved_count = 0
+    save_result = {"saved": 0, "skipped": 0, "errors": [], "prediction_ids": []}
+    if save_clicked:
+        save_result = save_prediction_picks_detailed(picks, target_round, active_model_name)
+        saved_count = save_result["saved"]
+        if save_result["prediction_ids"]:
+            st.caption(f"保存した予想ID: {', '.join(save_result['prediction_ids'])}")
+        if save_result["skipped"]:
+            st.warning(f"重複のため {save_result['skipped']} 件をスキップしました。")
+        for error in save_result["errors"]:
+            st.warning(error)
     if saved_count:
         st.caption(f"予測研究所ログ: 第{target_round}回の予想{saved_count}件を predictions.csv に保存しました。")
+    elif save_clicked:
+        st.info("同じ抽選回・モデル・予測番号、または同じ予想IDのロト6標準予測は保存済みです。")
     else:
-        st.caption(f"予測研究所ログ: 第{target_round}回の同一予想は保存済みです。")
+        st.caption(f"第{target_round}回のロト6標準予測を表示しています。保存ボタンを押すまで predictions.csv は更新されません。")
 
     for index, pick in enumerate(picks, start=1):
         render_pattern_pick(pick, f"第{index}候補")
@@ -2303,11 +2438,12 @@ def render_next_score_prediction(score_df, results, target_round):
         st.info("候補スコアCSVと抽せん履歴が揃うと、スコアベース次回予測を表示します。")
         return
     if st.button("候補スコア活用予測を保存", key="loto6_next_score_prediction_save"):
-        saved_count = save_prediction_picks(picks, target_round, "候補スコア活用予測")
-        if saved_count:
-            st.success(f"候補スコア活用予測を predictions.csv に {saved_count}件保存しました。")
-        else:
-            st.info("候補スコア活用予測の同一予想は保存済みです。")
+        result = save_prediction_picks_detailed(picks, target_round, "候補スコア活用予測")
+        render_loto6_prediction_save_result(
+            result,
+            "候補スコア活用予測を predictions.csv に {saved}件保存しました。",
+            "候補スコア活用予測の同一予想は保存済みです。",
+        )
     for index, pick in enumerate(picks, start=1):
         render_pattern_pick(pick, f"候補スコア活用予測 {index}")
         if not pick.get("number_reasons", pd.DataFrame()).empty:
@@ -2341,11 +2477,12 @@ def render_ai_weighted_prediction(score_df, results, target_round, weight_summar
         st.info("候補スコアCSVと抽せん履歴が揃うと、AI改善反映予測を表示します。")
         return
     if st.button("AI改善反映予測を保存", key="loto6_ai_weighted_prediction_save"):
-        saved_count = save_prediction_picks(picks, target_round, "AI改善反映予測")
-        if saved_count:
-            st.success(f"AI改善反映予測を predictions.csv に {saved_count}件保存しました。")
-        else:
-            st.info("AI改善反映予測の同一予想は保存済みです。")
+        result = save_prediction_picks_detailed(picks, target_round, "AI改善反映予測")
+        render_loto6_prediction_save_result(
+            result,
+            "AI改善反映予測を predictions.csv に {saved}件保存しました。",
+            "AI改善反映予測の同一予想は保存済みです。",
+        )
     for index, pick in enumerate(picks, start=1):
         render_pattern_pick(pick, f"AI改善反映予測 {index}")
         if not pick.get("number_reasons", pd.DataFrame()).empty:
@@ -2828,6 +2965,7 @@ else:
     render_ai_weighted_prediction(scores, results, latest_round + 1, ai_weight_summary)
 
 render_chamini6_prediction(results, latest_round + 1, ai_weight_summary, set_ball_analysis)
+render_prediction_flow_diagnostics("loto6", "ロト6")
 render_prediction_lab()
 
 st.subheader("球セット履歴")
