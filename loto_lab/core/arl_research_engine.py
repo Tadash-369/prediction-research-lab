@@ -7,6 +7,23 @@ from pathlib import Path
 
 import pandas as pd
 
+from balance_hypothesis_engine import (
+    BALANCE_HYPOTHESIS_KEY,
+    BALANCE_HYPOTHESIS_LABEL,
+    evaluate_balance_hypothesis,
+)
+from model_aliases import (
+    CHAMINI6_LEGACY_GOD_MODE_KEY,
+    CHAMINI6_LEGACY_GOD_MODE_LABEL,
+    CHAMINI_SP_GOD_MODE_KEY,
+    CHAMINI_SP_GOD_MODE_LABEL,
+    MODEL_ALIAS as MODEL_KEY_ALIAS,
+    MODEL_DISPLAY_NAME,
+    get_model_display_name,
+    is_chamini_sp_model,
+    normalize_model_key as normalize_alias_model_key,
+)
+
 
 PROJECT_JAPANESE_NAME = "分析研究所"
 PROJECT_ENGLISH_NAME = "Prediction Research Lab"
@@ -14,8 +31,8 @@ PROJECT_SHORT_NAME = "PRL"
 
 ANTI_POPULAR_EXPECTED_VALUE_KEY = "anti_popular_expected_value"
 ANTI_POPULAR_EXPECTED_VALUE_LABEL = "人と被りにくい期待値最大化モデル"
-CHAMINI6_GOD_MODE_KEY = "chamini6_god_mode"
-CHAMINI6_GOD_MODE_LABEL = "Chamini6 God Mode"
+CHAMINI6_GOD_MODE_KEY = CHAMINI_SP_GOD_MODE_KEY
+CHAMINI6_GOD_MODE_LABEL = CHAMINI_SP_GOD_MODE_LABEL
 
 LOTO_MODEL_LABELS = OrderedDict(
     [
@@ -36,6 +53,7 @@ LOTO_MODEL_LABELS = OrderedDict(
         ("machine_learning", "機械学習モデル"),
         ("random_baseline", "ランダム予測モデル"),
         (ANTI_POPULAR_EXPECTED_VALUE_KEY, ANTI_POPULAR_EXPECTED_VALUE_LABEL),
+        (BALANCE_HYPOTHESIS_KEY, BALANCE_HYPOTHESIS_LABEL),
         (CHAMINI6_GOD_MODE_KEY, CHAMINI6_GOD_MODE_LABEL),
     ]
 )
@@ -70,8 +88,9 @@ MODEL_ALIASES = {
     "anti_popular": ANTI_POPULAR_EXPECTED_VALUE_KEY,
     "anti_popular_ev": ANTI_POPULAR_EXPECTED_VALUE_KEY,
     "non_overlap_jackpot": ANTI_POPULAR_EXPECTED_VALUE_KEY,
-    "chamini6": CHAMINI6_GOD_MODE_KEY,
-    "god_mode": CHAMINI6_GOD_MODE_KEY,
+    "balance_hypothesis": BALANCE_HYPOTHESIS_KEY,
+    "balance_engine": BALANCE_HYPOTHESIS_KEY,
+    **MODEL_KEY_ALIAS,
 }
 
 AI_MODEL_SCORE_COLUMNS = {
@@ -92,6 +111,7 @@ AI_MODEL_SCORE_COLUMNS = {
     "monte_carlo": ["総合スコア"],
     "random_baseline": ["総合スコア"],
     ANTI_POPULAR_EXPECTED_VALUE_KEY: ["総合スコア"],
+    BALANCE_HYPOTHESIS_KEY: ["総合スコア"],
     CHAMINI6_GOD_MODE_KEY: ["総合スコア"],
 }
 
@@ -245,6 +265,7 @@ PREDICTION_ENGINE_REGISTRY = OrderedDict(
     [
         ("standard_loto_models", {"engine_name": "既存ロト分析モデル群", "status": "active"}),
         (ANTI_POPULAR_EXPECTED_VALUE_KEY, {"engine_name": ANTI_POPULAR_EXPECTED_VALUE_LABEL, "status": "active_auxiliary"}),
+        (BALANCE_HYPOTHESIS_KEY, {"engine_name": BALANCE_HYPOTHESIS_LABEL, "status": "active_hypothesis"}),
         (CHAMINI6_GOD_MODE_ENGINE["engine_key"], CHAMINI6_GOD_MODE_ENGINE),
     ]
 )
@@ -266,6 +287,7 @@ CHAMINI6_COMPONENT_MODEL_KEYS = [
     "monte_carlo",
     "machine_learning",
     ANTI_POPULAR_EXPECTED_VALUE_KEY,
+    BALANCE_HYPOTHESIS_KEY,
 ]
 
 ENSEMBLE_PREDICTION_COLUMNS = [
@@ -380,11 +402,12 @@ MODEL_WEIGHT_HISTORY_COLUMNS = [
 
 
 def canonical_model_key(model_key):
-    return MODEL_ALIASES.get(str(model_key), str(model_key))
+    return normalize_alias_model_key(MODEL_ALIASES.get(str(model_key), str(model_key)))
 
 
 def model_label(model_key):
-    return ARL_MODEL_LABELS.get(canonical_model_key(model_key), str(model_key))
+    canonical = canonical_model_key(model_key)
+    return MODEL_DISPLAY_NAME.get(str(model_key), ARL_MODEL_LABELS.get(canonical, get_model_display_name(canonical)))
 
 
 def safe_int(value, default=0):
@@ -726,7 +749,7 @@ def build_set_ball_analysis(results, number_columns, number_max, draw_size, set_
     if set_column is None or set_column not in frame.columns:
         return {
             "available": False,
-            "message": "セット球データなし。列が追加された場合のみChamini6の補助スコアに反映します。",
+            "message": f"セット球データなし。列が追加された場合のみ{CHAMINI6_GOD_MODE_LABEL}の補助スコアに反映します。",
             "set_ball_column": "",
             "latest_set_ball": "",
             "score_map": {number: 0.0 for number in range(1, number_max + 1)},
@@ -796,7 +819,7 @@ def build_set_ball_analysis(results, number_columns, number_max, draw_size, set_
     number_frame = pd.DataFrame(number_rows).sort_values(["セット球スコア", "同一セット出現数", "数字"], ascending=[False, False, True])
     return {
         "available": True,
-        "message": f"セット球 {latest_set} の履歴をChamini6補助スコアに利用できます。",
+        "message": f"セット球 {latest_set} の履歴を{CHAMINI6_GOD_MODE_LABEL}補助スコアに利用できます。",
         "set_ball_column": str(set_column),
         "latest_set_ball": latest_set,
         "score_map": score_map,
@@ -823,6 +846,7 @@ def _fixed_chamini6_component_weights():
         "monte_carlo": 0.75,
         "machine_learning": 1.25,
         ANTI_POPULAR_EXPECTED_VALUE_KEY: 0.45,
+        BALANCE_HYPOTHESIS_KEY: 0.7,
     }
 
 
@@ -912,13 +936,22 @@ def build_chamini6_score_map(
     return combined, pd.DataFrame(detail_rows)
 
 
-def _chamini6_candidate_score(numbers, score_map, rows, number_max, draw_size, sum_stats=None):
+def _chamini6_candidate_score(numbers, score_map, rows, number_max, draw_size, sum_stats=None, bonus_rows=None, set_ball_analysis=None):
     sum_stats = sum_stats or _history_sum_stats(rows, draw_size, number_max, precleaned=True)
     balance = _balance_score(numbers, rows, number_max, draw_size, sum_stats)
+    balance_hypothesis = evaluate_balance_hypothesis(
+        numbers,
+        rows,
+        number_max=number_max,
+        draw_size=draw_size,
+        bonus_rows=bonus_rows or [],
+        set_ball_analysis=set_ball_analysis,
+    )
     raw = sum(_safe_float(score_map.get(number), 0.0) for number in numbers) / max(draw_size, 1) * 100
     over_31_bonus = 4 if any(number > 31 for number in numbers) else -8
     consecutive_penalty = 20 if has_three_consecutive(numbers) else count_consecutive_pairs(numbers) * 2
-    return raw + balance * 0.2 + over_31_bonus - consecutive_penalty
+    hypothesis_adjustment = (float(balance_hypothesis.get("balance_score", 50.0)) - 50.0) * 0.22
+    return raw + balance * 0.2 + hypothesis_adjustment + over_31_bonus - consecutive_penalty
 
 
 def generate_chamini6_god_mode_picks(
@@ -937,9 +970,10 @@ def generate_chamini6_god_mode_picks(
     rows = clean_number_rows(number_rows, number_max)
     if not rows:
         return []
+    cleaned_bonus_rows = clean_number_rows(bonus_rows or [], number_max)
     score_map, detail_df = build_chamini6_score_map(
         rows,
-        bonus_rows,
+        cleaned_bonus_rows,
         number_max,
         draw_size,
         target_round,
@@ -966,11 +1000,11 @@ def generate_chamini6_god_mode_picks(
             continue
         if has_three_consecutive(numbers):
             continue
-        score = _chamini6_candidate_score(numbers, score_map, rows, number_max, draw_size, sum_stats)
+        score = _chamini6_candidate_score(numbers, score_map, rows, number_max, draw_size, sum_stats, cleaned_bonus_rows, set_ball_analysis)
         candidates.append((score, numbers))
     if not candidates:
         fallback = tuple(sorted(candidate_numbers[:draw_size]))
-        candidates.append((_chamini6_candidate_score(fallback, score_map, rows, number_max, draw_size, sum_stats), fallback))
+        candidates.append((_chamini6_candidate_score(fallback, score_map, rows, number_max, draw_size, sum_stats, cleaned_bonus_rows, set_ball_analysis), fallback))
     candidates.sort(reverse=True, key=lambda item: item[0])
     picks = []
     used = set()
@@ -980,9 +1014,19 @@ def generate_chamini6_god_mode_picks(
         set_text = "セット球分析を補助反映" if set_ball_analysis and set_ball_analysis.get("available") else "セット球データなし"
         ai_text = "AI改善重みを反映" if (ai_weight_summary or {}).get("available") else "AI改善重みは通常値"
         anti_status = anti_popular_candidate_status(numbers, rows[-1], number_max, draw_size)
+        balance_hypothesis = evaluate_balance_hypothesis(
+            numbers,
+            rows,
+            number_max=number_max,
+            draw_size=draw_size,
+            bonus_rows=cleaned_bonus_rows,
+            set_ball_analysis=set_ball_analysis,
+        )
         reason = (
             f"{CHAMINI6_GOD_MODE_LABEL}: 16分析エンジン、AI改善重み、"
-            f"人と被りにくい期待値最大化モデルを統合。{ai_text} / {set_text}。"
+            f"人と被りにくい期待値最大化モデル、バランス仮説エンジンを統合。"
+            f"バランス評価: {balance_hypothesis['balance_grade']}({balance_hypothesis['balance_score']})。"
+            f"{ai_text} / {set_text}。"
         )
         picks.append(
             {
@@ -992,9 +1036,13 @@ def generate_chamini6_god_mode_picks(
                 "model_name": CHAMINI6_GOD_MODE_LABEL,
                 "display_model_name": CHAMINI6_GOD_MODE_LABEL,
                 "used_models": [model_label(key) for key in CHAMINI6_COMPONENT_MODEL_KEYS],
-                "emphasized_factors": "総合統合、AI改善重み、セット球補助、低人気期待値、奇数偶数・高低・合計値バランス",
+                "emphasized_factors": "総合統合、AI改善重み、セット球補助、低人気期待値、バランス仮説、奇数偶数・高低・合計値バランス",
                 "selection_reason": reason,
                 "prediction_score": round(float(score), 3),
+                "balance_score": balance_hypothesis["balance_score"],
+                "balance_grade": balance_hypothesis["balance_grade"],
+                "balance_reasons": balance_hypothesis["balance_reasons"],
+                "balance_warnings": balance_hypothesis["balance_warnings"],
                 "chamini6_detail": detail_df,
                 "anti_popular_diagnostics": anti_status,
                 "model_description": "複数モデルを削除・置換せず、研究用の統合候補として重み付けする独立エンジンです。",
@@ -1246,6 +1294,22 @@ def build_model_scores(number_rows, model_key, number_max, draw_size, target_rou
             + rng.random() * 0.35
             for number in range(1, number_max + 1)
         }
+    if key == BALANCE_HYPOTHESIS_KEY:
+        counts = Counter(number for row in rows for number in row)
+        gaps = last_seen_gaps(rows, number_max)
+        recent_rows = rows[-20:]
+        recent_counts = Counter(number for row in recent_rows for number in row)
+        average_frequency = sum(counts.values()) / max(number_max, 1)
+        high_band = set(high_band_for_game(number_max))
+        return {
+            number: 0.45
+            + (0.25 if recent_counts[number] else 0.0)
+            + (0.2 if counts[number] <= average_frequency else 0.0)
+            + (0.15 if gaps.get(number, 0) >= max(6, len(rows) // 12) else 0.0)
+            + (0.1 if number in high_band else 0.0)
+            - (0.12 if number % 10 in (0, 5) else 0.0)
+            for number in range(1, number_max + 1)
+        }
     if key == CHAMINI6_GOD_MODE_KEY:
         combined = {number: 0.0 for number in range(1, number_max + 1)}
         fixed_weights = {
@@ -1265,6 +1329,7 @@ def build_model_scores(number_rows, model_key, number_max, draw_size, target_rou
             "monte_carlo": 0.75,
             "machine_learning": 1.25,
             ANTI_POPULAR_EXPECTED_VALUE_KEY: 0.45,
+            BALANCE_HYPOTHESIS_KEY: 0.7,
         }
         for component_key in CHAMINI6_COMPONENT_MODEL_KEYS:
             raw_scores = build_model_scores(rows, component_key, number_max, draw_size, target_round, bonus_rows)
@@ -1880,13 +1945,13 @@ def canonical_model_from_name(model_name):
         return text, text.split("custom:", 1)[1]
     key = canonical_model_key(text)
     if key in ARL_MODEL_LABELS:
-        return key, ARL_MODEL_LABELS[key]
+        return key, model_label(key)
     for model_key, label in ARL_MODEL_LABELS.items():
         if text == label:
-            return model_key, label
+            return canonical_model_key(model_key), model_label(model_key)
     for alias, model_key in MODEL_ALIASES.items():
         if text == alias:
-            return model_key, ARL_MODEL_LABELS.get(model_key, text)
+            return canonical_model_key(model_key), model_label(model_key)
     return f"custom:{text}", text
 
 
@@ -2634,8 +2699,12 @@ def ranking_target_models():
 
 
 def ranking_model_type(model_name):
-    if model_name in (CHAMINI6_GOD_MODE_KEY, CHAMINI6_GOD_MODE_LABEL):
-        return "Chamini6 God Mode"
+    if is_chamini_sp_model(model_name):
+        return CHAMINI_SP_GOD_MODE_LABEL
+    if model_name in (CHAMINI6_GOD_MODE_LABEL, CHAMINI6_LEGACY_GOD_MODE_LABEL):
+        return CHAMINI_SP_GOD_MODE_LABEL
+    if canonical_model_key(model_name) == BALANCE_HYPOTHESIS_KEY or model_name == BALANCE_HYPOTHESIS_LABEL:
+        return BALANCE_HYPOTHESIS_LABEL
     if model_name in (ANTI_POPULAR_EXPECTED_VALUE_KEY, ANTI_POPULAR_EXPECTED_VALUE_LABEL):
         return "補助モデル"
     if model_name in ("候補スコア活用予測", "AI改善反映予測"):

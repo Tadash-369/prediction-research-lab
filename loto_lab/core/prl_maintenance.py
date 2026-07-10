@@ -27,6 +27,15 @@ from arl_research_engine import (
     parse_numbers,
     safe_int,
 )
+from model_aliases import (
+    CHAMINI6_LEGACY_GOD_MODE_KEY,
+    CHAMINI6_LEGACY_GOD_MODE_LABEL,
+    CHAMINI_SP_GOD_MODE_KEY,
+    CHAMINI_SP_GOD_MODE_LABEL,
+    get_model_display_name,
+    is_chamini_sp_model,
+    normalize_model_key as normalize_alias_model_key,
+)
 
 
 CORE_DIR = Path(__file__).resolve().parent
@@ -88,6 +97,9 @@ LOTO7_VERIFICATION_COLUMNS = [
 ]
 
 MODEL_NAME_REPLACEMENTS = {
+    CHAMINI6_LEGACY_GOD_MODE_KEY: CHAMINI_SP_GOD_MODE_LABEL,
+    CHAMINI6_LEGACY_GOD_MODE_LABEL: CHAMINI_SP_GOD_MODE_LABEL,
+    CHAMINI_SP_GOD_MODE_KEY: CHAMINI_SP_GOD_MODE_LABEL,
     "頻出数字バランス": "出現頻度分析",
     "直近トレンド": "ホットナンバー分析",
     "出現間隔": "コールドナンバー分析",
@@ -114,6 +126,9 @@ MODEL_NAME_REPLACEMENTS = {
 MODEL_NAME_TO_KEY = {label: key for key, label in ARL_MODEL_LABELS.items()}
 MODEL_NAME_TO_KEY.update(
     {
+        CHAMINI6_LEGACY_GOD_MODE_KEY: CHAMINI_SP_GOD_MODE_KEY,
+        CHAMINI6_LEGACY_GOD_MODE_LABEL: CHAMINI_SP_GOD_MODE_KEY,
+        CHAMINI_SP_GOD_MODE_LABEL: CHAMINI_SP_GOD_MODE_KEY,
         "頻出数字バランス": "frequency_analysis",
         "直近トレンド": "hot_analysis",
         "出現間隔": "cold_analysis",
@@ -274,13 +289,15 @@ def _draw_set(df, column=""):
     return {int(value) for value in values}
 
 
-def _chamini6_count(df):
+def _chamini_sp_count(df):
     if df.empty:
         return 0
     mask = pd.Series(False, index=df.index)
     for column in (PREDICTION_COLUMNS[0], PREDICTION_COLUMNS[5], PREDICTION_COLUMNS[6], "検証キー"):
         if column in df.columns:
-            mask = mask | df[column].astype(str).str.contains("chamini6|Chamini6", case=False, na=False)
+            values = df[column].astype(str)
+            mask = mask | values.apply(is_chamini_sp_model)
+            mask = mask | values.str.contains("chamini6|chamini_sp|Chamini6|ChaminiSP", case=False, na=False)
     return int(mask.sum())
 
 
@@ -341,15 +358,15 @@ def _collect_prediction_flow_diagnostics():
             )
         )
 
-        chamini6_predictions = _chamini6_count(predictions)
-        chamini6_verified = _chamini6_count(reports)
+        chamini_sp_predictions = _chamini_sp_count(predictions)
+        chamini_sp_verified = _chamini_sp_count(reports)
         rows.append(
             _diagnostic_row(
-                f"{config['label']}_chamini6_flow",
+                f"{config['label']}_chamini_sp_flow",
                 config["prediction_path"],
                 "ok",
-                f"Chamini6保存済み予想: {chamini6_predictions} / Chamini6検証済み: {chamini6_verified}",
-                "Chamini6 God Modeを保存済み予想・検証・AI改善の対象として継続確認します。",
+                f"ChaminiSP保存済み予想: {chamini_sp_predictions} / ChaminiSP検証済み: {chamini_sp_verified}",
+                "ChaminiSP God Modeを保存済み予想・検証・AI改善の対象として継続確認します。旧Chamini6キーも互換集計します。",
             )
         )
     return rows
@@ -432,6 +449,8 @@ def collect_csv_safety_diagnostics():
 def normalize_text(value):
     text = str(value)
     stripped = text.strip()
+    if is_chamini_sp_model(stripped):
+        return CHAMINI_SP_GOD_MODE_LABEL
     if stripped in MODEL_NAME_REPLACEMENTS:
         return MODEL_NAME_REPLACEMENTS[stripped]
     for old, new in MODEL_NAME_REPLACEMENTS.items():
@@ -441,6 +460,9 @@ def normalize_text(value):
 
 def model_key_from_name(model_name):
     normalized = normalize_text(model_name)
+    alias_key = normalize_alias_model_key(model_name)
+    if alias_key in MODEL_NAME_TO_KEY.values() or alias_key == CHAMINI_SP_GOD_MODE_KEY:
+        return alias_key
     return MODEL_NAME_TO_KEY.get(normalized, str(model_name))
 
 

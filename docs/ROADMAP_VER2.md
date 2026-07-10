@@ -117,3 +117,26 @@ git diff --check
 
 - `python` がPATHにない環境では、`.venv\Scripts\python.exe` を使う。
 - 手動で軽量起動する場合は `$env:PRL_LIGHT_SMOKE="1"` を設定してから `streamlit run` を実行する。
+
+## Ver1.6: ChaminiSP God Mode名称変更とバランス仮説エンジン正式統合
+
+目的:
+
+- Chamini6 God Modeの現行表示名を `ChaminiSP God Mode` に変更し、新規保存用の内部キーを `chamini_sp_god_mode` にする。
+- 旧 `chamini6_god_mode` は既存履歴を壊さず読める互換キーとして残す。
+- バランス仮説エンジンを独立した研究用補助エンジンとして追加し、ChaminiSPの統合判断に反映する。
+
+実装方針:
+
+- 既存CSV/JSONLは書き換えず、新規保存・新規表示だけをChaminiSPへ寄せる。
+- `balance_hypothesis_engine` は奇数偶数、高低、合計値、連番、下一桁、十の位、ホット/コールド、出現間隔、ボーナス周辺、セット球補助を評価する。
+- 出力は `balance_score`、`balance_grade`、`balance_reasons`、`balance_warnings` とし、ロト6・ロト7画面に表示する。
+- ChaminiSPはPattern A/B/Cとは別の統合候補として維持し、バランス仮説を補助スコアとして使う。
+- 保守診断ではChaminiSP件数を表示し、旧Chamini6キーの履歴も互換集計する。
+
+確認ポイント:
+
+- 旧 `chamini6_god_mode` の履歴がモデルランキング・保守診断で読めること。
+- 新規ChaminiSP候補は `chamini_sp_god_mode` として扱えること。
+- バランス仮説エンジンの評価理由と警告がロト6・ロト7画面に表示されること。
+- 軽量スモークモード、保存ボタン方式、CSV安全診断が維持されること。
