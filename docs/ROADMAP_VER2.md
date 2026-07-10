@@ -88,3 +88,32 @@
 - ロト7画面を開いただけでは `loto7_predictions.csv` が更新されないこと。
 - Chamini6 God Modeが予想保存・検証・モデル貢献度・AI改善の対象として追跡できること。
 - 研究データCSV/JSONLを自動的に削除・restore・一括変更しないこと。
+
+## Ver1.5: Streamlit軽量スモーク確認基盤
+
+目的:
+
+- トップ、ロト6、ロト7のStreamlit画面を、重い予測生成に邪魔されず毎回確認できるようにする。
+- `PRL_LIGHT_SMOKE=1` の軽量モードで、画面構造、タブ、CSV安全診断、保存・検証フロー診断を読み取り専用で確認する。
+- 通常モードの予測、保存、検証、AI改善、Chamini6 God Modeは維持する。
+
+実装方針:
+
+- 軽量モードでは予測生成、Chamini6候補生成、バックテスト、保存ボタン処理を実行しない。
+- 軽量モードでは研究データCSV/JSONLを書き換えない。
+- 起動確認は `loto_lab.core.streamlit_smoke_check` から実行し、HTTP 200確認後にプロセスを停止する。
+
+確認コマンド:
+
+```powershell
+git status --short
+git diff --stat
+.\.venv\Scripts\python.exe -m compileall loto_lab
+git diff --check
+.\.venv\Scripts\python.exe -m loto_lab.core.streamlit_smoke_check
+```
+
+補足:
+
+- `python` がPATHにない環境では、`.venv\Scripts\python.exe` を使う。
+- 手動で軽量起動する場合は `$env:PRL_LIGHT_SMOKE="1"` を設定してから `streamlit run` を実行する。

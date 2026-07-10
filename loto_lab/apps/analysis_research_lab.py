@@ -41,7 +41,7 @@ from arl_research_engine import (
     parse_json_text,
     weighted_model_text,
 )
-from prl_maintenance import collect_csv_safety_diagnostics, run_maintenance
+from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value, run_maintenance
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -96,6 +96,32 @@ def dataframe_for_display(df, text_columns=None):
 
 def display_dataframe(df, **kwargs):
     st.dataframe(dataframe_for_display(df), **kwargs)
+
+
+def app_light_smoke_mode():
+    if is_light_smoke_mode():
+        return True
+    try:
+        params = st.query_params
+        return any(is_light_smoke_value(params.get(key, "")) for key in ("PRL_LIGHT_SMOKE", "light_smoke", "smoke"))
+    except Exception:
+        return False
+
+
+def render_light_smoke_overview():
+    st.success("PRL_LIGHT_SMOKE=1: 分析研究所トップ軽量スモークモードで起動しています。")
+    st.caption("重い集計や保守実行ボタンを避け、読み取り専用の基本診断だけを表示します。")
+    diagnostics = collect_csv_safety_diagnostics()
+    tab_summary, tab_diagnostics = st.tabs(["基本構造", "CSV安全診断"])
+    with tab_summary:
+        cols = st.columns(4)
+        cols[0].metric("診断行", len(diagnostics))
+        cols[1].metric("ロト6診断", int(diagnostics[diagnostics[diagnostics.columns[0]].astype(str).str.startswith("loto6")].shape[0]) if not diagnostics.empty else 0)
+        cols[2].metric("ロト7診断", int(diagnostics[diagnostics[diagnostics.columns[0]].astype(str).str.startswith("loto7")].shape[0]) if not diagnostics.empty else 0)
+        cols[3].metric("軽量モード", "ON")
+        st.info("この画面ではCSVを読み取り専用で確認します。")
+    with tab_diagnostics:
+        display_dataframe(diagnostics, width="stretch", hide_index=True)
 
 
 def numeric_column(df, column_name, default=0):
@@ -584,6 +610,10 @@ st.set_page_config(page_title=f"{PROJECT_JAPANESE_NAME} | {PROJECT_SHORT_NAME}",
 st.title(PROJECT_JAPANESE_NAME)
 st.caption(f"{PROJECT_ENGLISH_NAME}（{PROJECT_SHORT_NAME}）")
 st.info("目的は当選や利益そのものではなく、予測手法の研究・検証・改善を継続し、予測精度を向上させることです。")
+
+if app_light_smoke_mode():
+    render_light_smoke_overview()
+    st.stop()
 
 lab = st.radio("部門", ["ホーム", "ロト6", "ロト7", "AI改善", "検証", "保守", "システム開発"], horizontal=True)
 

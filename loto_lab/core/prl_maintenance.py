@@ -1,5 +1,6 @@
 from datetime import datetime
 from itertools import combinations
+import os
 from pathlib import Path
 import re
 import shutil
@@ -172,6 +173,17 @@ SYNC_TARGETS = [
 ]
 
 DIAGNOSTIC_COLUMNS = ["対象", "ファイル", "状態", "詳細", "推奨対応"]
+LIGHT_SMOKE_TRUE_VALUES = {"1", "true", "yes", "on", "light", "smoke"}
+
+
+def is_light_smoke_value(value):
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value).strip().lower() in LIGHT_SMOKE_TRUE_VALUES
+
+
+def is_light_smoke_mode():
+    return is_light_smoke_value(os.environ.get("PRL_LIGHT_SMOKE", ""))
 
 
 def read_csv(path, columns=None):
