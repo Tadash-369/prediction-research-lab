@@ -30,12 +30,15 @@ from arl_research_engine import (
     add_verification_metrics,
     build_ai_improvement_weight_summary,
     build_ai_improvement_summary,
+    build_balance_hypothesis_performance,
+    build_chamini_sp_performance_summary,
     build_condition_success_table,
     build_contribution_ranking,
     build_fixed_prediction_overview,
     build_model_dashboard,
     build_purchase_summary,
     build_research_flow_table,
+    build_unverified_chamini_sp_predictions,
     evaluate_purchase_history,
     load_winning_condition_history,
     parse_json_text,
@@ -468,6 +471,24 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
             st.info(f"{name}のモデル別成績は、予想と結果の照合後に表示されます。")
         else:
             display_dataframe(dashboard, width="stretch", hide_index=True)
+            with st.expander(f"{name} ChaminiSP / バランス仮説 研究成績", expanded=False):
+                st.markdown("**ChaminiSP God Mode 総合成績**")
+                display_dataframe(build_chamini_sp_performance_summary(reports, draw_size=draw_size), width="stretch", hide_index=True)
+                balance_stats = build_balance_hypothesis_performance(reports, draw_size=draw_size)
+                st.markdown("**balance hypothesis 研究成績**")
+                display_dataframe(balance_stats["overview"], width="stretch", hide_index=True)
+                if not balance_stats["grade"].empty:
+                    st.markdown("**grade別成績**")
+                    display_dataframe(balance_stats["grade"], width="stretch", hide_index=True)
+                if not balance_stats["score_groups"].empty:
+                    st.markdown("**高スコア・低スコア群比較**")
+                    display_dataframe(balance_stats["score_groups"], width="stretch", hide_index=True)
+                unverified = build_unverified_chamini_sp_predictions(predictions, official, reports, draw_size=draw_size, number_max=number_max)
+                st.markdown("**未検証のChaminiSP保存済み予想**")
+                if unverified.empty:
+                    st.info("未検証のChaminiSP予想はありません。")
+                else:
+                    display_dataframe(unverified, width="stretch", hide_index=True)
     with tabs[2]:
         ranking = build_contribution_ranking(contributions)
         if ranking.empty:

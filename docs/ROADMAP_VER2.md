@@ -140,3 +140,28 @@ git diff --check
 - 新規ChaminiSP候補は `chamini_sp_god_mode` として扱えること。
 - バランス仮説エンジンの評価理由と警告がロト6・ロト7画面に表示されること。
 - 軽量スモークモード、保存ボタン方式、CSV安全診断が維持されること。
+
+## Ver1.7: バランス仮説スコアの検証保存と成績評価統合
+
+目的:
+
+- ChaminiSP予測時点の `balance_score` と `balance_grade` を研究データとして保存し、抽せん結果後の検証へ引き継ぐ。
+- ChaminiSP God Modeの総合成績と、balance hypothesis内部要素の研究成績を分離して確認できるようにする。
+- 旧Chamini6履歴はChaminiSPとして互換集計し、既存CSV/JSONLを一括変換しない。
+
+実装方針:
+
+- 予測CSVには `balance_score`、`balance_grade`、`balance_reasons`、`balance_warnings`、`balance_details_json`、`balance_not_evaluated`、`balance_weights_version` を新規保存時だけ付与する。
+- 検証CSVには予測時点のバランス情報を引き継ぎ、`総一致数` と `balance_result_class` を研究区分として追加する。
+- 高スコア判定は `BALANCE_HIGH_SCORE_THRESHOLD` で一元管理し、自動重み変更は行わない。
+- grade別成績、高スコア/低スコア群比較、相関サンプル数は、データ不足時に例外ではなく「検証データ不足」として表示する。
+- AI改善履歴へは独立列の強制追加ではなく、既存の失敗要因・改善案・次回仮説へ研究メモとして連携する。
+- テストは一時データ・メモリ上のDataFrameで行い、本番研究CSV/JSONLを書き換えない。
+
+確認ポイント:
+
+- ChaminiSP新規予測は `chamini_sp_god_mode` として保存され、旧 `chamini6_god_mode` は読み込み時に互換集計されること。
+- 予測時点のbalance情報が検証行へ引き継がれること。
+- ChaminiSP総合成績、balance hypothesis研究成績、grade別成績、高低スコア群比較が表示できること。
+- 旧CSVにbalance列がなくても読み込み・軽量スモークが失敗しないこと。
+- 研究データCSV/JSONLの削除、初期化、全件再保存、自動重み変更を行わないこと。

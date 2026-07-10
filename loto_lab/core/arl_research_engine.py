@@ -115,6 +115,32 @@ AI_MODEL_SCORE_COLUMNS = {
     CHAMINI6_GOD_MODE_KEY: ["総合スコア"],
 }
 
+BALANCE_WEIGHTS_VERSION = "balance_hypothesis_v1"
+BALANCE_HIGH_SCORE_THRESHOLD = 75.0
+MIN_CORRELATION_SAMPLES = 10
+
+BALANCE_PREDICTION_COLUMNS = [
+    "balance_score",
+    "balance_grade",
+    "balance_reasons",
+    "balance_warnings",
+    "balance_details_json",
+    "balance_not_evaluated",
+    "balance_weights_version",
+]
+
+BALANCE_VERIFICATION_COLUMNS = [
+    "総一致数",
+    "balance_score",
+    "balance_grade",
+    "balance_result_class",
+    "balance_reasons",
+    "balance_warnings",
+    "balance_details_json",
+    "balance_not_evaluated",
+    "balance_weights_version",
+]
+
 CONTRIBUTION_COLUMNS = [
     "研究所",
     "予想ID",
@@ -1484,6 +1510,187 @@ def parse_json_text(value, fallback=None):
         return fallback
 
 
+def _string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return []
+    parsed = parse_json_text(text, None)
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if str(item).strip()]
+    return [part.strip() for part in text.replace(" / ", "|").split("|") if part.strip()]
+
+
+def _join_reasons(value):
+    return " / ".join(_string_list(value))
+
+
+def balance_prediction_fields_from_pick(pick):
+    pick = pick or {}
+    raw_score = pick.get("balance_score", "")
+    try:
+        score = round(float(raw_score), 3)
+        not_evaluated = False
+    except (TypeError, ValueError):
+        score = ""
+        not_evaluated = True
+    grade = str(pick.get("balance_grade", "") or ("not_evaluated" if not_evaluated else "")).strip()
+    reasons = _string_list(pick.get("balance_reasons", []))
+    warnings = _string_list(pick.get("balance_warnings", []))
+    details = {
+        "balance_score": score,
+        "balance_grade": grade,
+        "balance_reasons": reasons,
+        "balance_warnings": warnings,
+        "balance_not_evaluated": not_evaluated,
+        "balance_weights_version": BALANCE_WEIGHTS_VERSION,
+    }
+    return {
+        "balance_score": score,
+        "balance_grade": grade,
+        "balance_reasons": _join_reasons(reasons),
+        "balance_warnings": _join_reasons(warnings),
+        "balance_details_json": json_text(details),
+        "balance_not_evaluated": "1" if not_evaluated else "0",
+        "balance_weights_version": BALANCE_WEIGHTS_VERSION,
+    }
+
+
+def ensure_balance_columns(df, include_verification=False):
+    columns = list(BALANCE_PREDICTION_COLUMNS)
+    if include_verification:
+        columns = list(dict.fromkeys(BALANCE_VERIFICATION_COLUMNS + columns))
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+    target = df.copy()
+    for column in columns:
+        if column not in target.columns:
+            target[column] = ""
+    return target
+
+
+def balance_fields_from_prediction_row(row):
+    data = {}
+    for column in BALANCE_PREDICTION_COLUMNS:
+        data[column] = row.get(column, "") if hasattr(row, "get") else ""
+    details = parse_json_text(data.get("balance_details_json"), {})
+    if isinstance(details, dict):
+        for key in ("balance_score", "balance_grade", "balance_reasons", "balance_warnings", "balance_not_evaluated", "balance_weights_version"):
+            if data.get(key, "") in ("", None) and key in details:
+                data[key] = details.get(key, "")
+    reasons = _join_reasons(data.get("balance_reasons", ""))
+    warnings = _join_reasons(data.get("balance_warnings", ""))
+    try:
+        score = round(float(data.get("balance_score")), 3)
+        not_evaluated = False
+    except (TypeError, ValueError):
+        score = ""
+        not_evaluated = True
+    grade = str(data.get("balance_grade", "") or ("not_evaluated" if not_evaluated else "")).strip()
+    normalized_details = {
+        "balance_score": score,
+        "balance_grade": grade,
+        "balance_reasons": _string_list(reasons),
+        "balance_warnings": _string_list(warnings),
+        "balance_not_evaluated": not_evaluated,
+        "balance_weights_version": str(data.get("balance_weights_version", "") or BALANCE_WEIGHTS_VERSION),
+    }
+    return {
+        "balance_score": score,
+        "balance_grade": grade,
+        "balance_reasons": reasons,
+        "balance_warnings": warnings,
+        "balance_details_json": json_text(normalized_details),
+        "balance_not_evaluated": "1" if not_evaluated else "0",
+        "balance_weights_version": normalized_details["balance_weights_version"],
+    }
+
+
+def classify_balance_result(balance_score, match_count, draw_size):
+    try:
+        score = float(balance_score)
+    except (TypeError, ValueError):
+        return "not_evaluated"
+    high_score = score >= BALANCE_HIGH_SCORE_THRESHOLD
+    high_hit = safe_int(match_count) >= 3
+    if high_score and high_hit:
+        return "high_score_high_hit"
+    if high_score and not high_hit:
+        return "high_score_low_hit"
+    if not high_score and high_hit:
+        return "low_score_high_hit"
+    return "low_score_low_hit"
+
+
+def append_text(existing, addition):
+    existing = str(existing or "").strip()
+    addition = str(addition or "").strip()
+    if not addition:
+        return existing
+    if not existing:
+        return addition
+    if addition in existing:
+        return existing
+    return f"{existing} / {addition}"
+
+
+def balance_report_fields_from_prediction(prediction_row, report_row, draw_size):
+    balance = balance_fields_from_prediction_row(prediction_row)
+    match_count = safe_int(report_row.get("本数字一致数", 0))
+    if "ボーナス一致数" in report_row:
+        bonus_count = safe_int(report_row.get("ボーナス一致数", 0))
+    else:
+        bonus_count = 1 if str(report_row.get("ボーナス一致", "")).strip() == "あり" else 0
+    total_count = match_count + bonus_count
+    result_class = classify_balance_result(balance.get("balance_score"), match_count, draw_size)
+    balance.update(
+        {
+            "総一致数": total_count,
+            "balance_result_class": result_class,
+        }
+    )
+    return balance
+
+
+def attach_balance_verification_fields(report_row, prediction_row, draw_size):
+    updated = dict(report_row)
+    balance_fields = balance_report_fields_from_prediction(prediction_row, updated, draw_size)
+    updated.update(balance_fields)
+    if balance_fields.get("balance_not_evaluated") == "1":
+        return updated
+
+    score = balance_fields.get("balance_score", "")
+    grade = balance_fields.get("balance_grade", "")
+    result_class = balance_fields.get("balance_result_class", "not_evaluated")
+    if result_class == "high_score_high_hit":
+        updated["的中要因"] = append_text(
+            updated.get("的中要因", ""),
+            f"バランス仮説スコア{score}({grade})が高く、研究上の高一致区分に入った",
+        )
+    elif result_class == "high_score_low_hit":
+        updated["失敗要因"] = append_text(
+            updated.get("失敗要因", ""),
+            f"バランス仮説スコア{score}({grade})は高かったが一致数が伸びず、過去傾向適合の偏りを追加検証",
+        )
+    elif result_class == "low_score_high_hit":
+        updated["的中要因"] = append_text(
+            updated.get("的中要因", ""),
+            f"バランス仮説スコア{score}({grade})は低めでも一致数が伸びたため、低スコア群も比較継続",
+        )
+    updated["改善案"] = append_text(
+        updated.get("改善案", ""),
+        "バランス仮説は自動重み変更せず、高スコア群と低スコア群の一致数差を継続検証する",
+    )
+    updated["次回の仮説"] = append_text(
+        updated.get("次回の仮説", ""),
+        "balance_scoreと一致数の関係をChaminiSP内部要素として蓄積し、十分な件数後に重み候補を比較する",
+    )
+    return updated
+
+
 def game_low_limit(number_max):
     return 21 if number_max >= 43 else 18
 
@@ -2745,6 +2952,9 @@ def model_history_ai_scores(model_history):
     if model_history is None or model_history.empty or "model_name" not in model_history or "matched_count" not in model_history:
         return {}
     df = model_history.copy()
+    df["model_name"] = df["model_name"].fillna("").astype(str).map(
+        lambda value: CHAMINI_SP_GOD_MODE_LABEL if is_chamini_sp_model(value) else value
+    )
     df["matched_count"] = pd.to_numeric(df["matched_count"], errors="coerce")
     grouped = df.dropna(subset=["matched_count"]).groupby("model_name")["matched_count"].mean()
     return {str(model): float(score) for model, score in grouped.items()}
@@ -2811,6 +3021,9 @@ def build_model_dashboard(
     if model_column not in df:
         df[model_column] = "未記録"
     df[model_column] = df[model_column].fillna("").replace("", "未記録")
+    df[model_column] = df[model_column].map(
+        lambda value: CHAMINI_SP_GOD_MODE_LABEL if is_chamini_sp_model(value) else value
+    )
     if "開催回" in df:
         df["開催回"] = pd.to_numeric(df["開催回"], errors="coerce").fillna(0)
         df = df.sort_values("開催回")
@@ -2955,6 +3168,253 @@ def _bonus_match_series(df, column):
     return df[column].map(text_to_score).astype(float)
 
 
+def _chamini_sp_mask(df, model_column="使用モデル"):
+    if df is None:
+        return pd.Series(dtype=bool)
+    if df.empty or model_column not in df:
+        return pd.Series([False] * len(df), index=df.index)
+    values = df[model_column].fillna("").astype(str)
+    return values.map(is_chamini_sp_model) | values.str.contains("ChaminiSP|Chamini6|chamini_sp|chamini6", case=False, na=False)
+
+
+def _verification_match_columns(df):
+    match_column = "本数字一致数" if "本数字一致数" in df else None
+    bonus_column = "ボーナス一致数" if "ボーナス一致数" in df else ("ボーナス一致" if "ボーナス一致" in df else None)
+    return match_column, bonus_column
+
+
+def _prepare_balance_verification_rows(reports, draw_size):
+    columns = [
+        "balance_score",
+        "balance_grade",
+        "本数字一致数",
+        "ボーナス一致数",
+        "総一致数",
+        "balance_result_class",
+        "balance_details_json",
+    ]
+    if reports is None or reports.empty:
+        return pd.DataFrame(columns=columns)
+    df = reports.copy()
+    if "使用モデル" in df:
+        df = df[_chamini_sp_mask(df, "使用モデル")].copy()
+    if df.empty or "balance_score" not in df:
+        return pd.DataFrame(columns=columns)
+    df["balance_score"] = pd.to_numeric(df["balance_score"], errors="coerce")
+    df = df[df["balance_score"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    match_column, bonus_column = _verification_match_columns(df)
+    df["本数字一致数"] = pd.to_numeric(df[match_column], errors="coerce").fillna(0) if match_column else 0
+    if bonus_column == "ボーナス一致":
+        df["ボーナス一致数"] = df[bonus_column].astype(str).map(lambda value: 1 if value.strip() == "あり" else 0)
+    elif bonus_column:
+        df["ボーナス一致数"] = pd.to_numeric(df[bonus_column], errors="coerce").fillna(0)
+    else:
+        df["ボーナス一致数"] = 0
+    if "総一致数" in df:
+        df["総一致数"] = pd.to_numeric(df["総一致数"], errors="coerce").fillna(df["本数字一致数"] + df["ボーナス一致数"])
+    else:
+        df["総一致数"] = df["本数字一致数"] + df["ボーナス一致数"]
+    if "balance_grade" not in df:
+        df["balance_grade"] = "unknown"
+    df["balance_grade"] = df["balance_grade"].fillna("").replace("", "unknown")
+    if "balance_result_class" not in df:
+        df["balance_result_class"] = df.apply(
+            lambda row: classify_balance_result(row.get("balance_score"), row.get("本数字一致数"), draw_size),
+            axis=1,
+        )
+    if "balance_details_json" not in df:
+        df["balance_details_json"] = ""
+    return df
+
+
+def build_chamini_sp_performance_summary(reports, draw_size):
+    columns = ["項目", "値"]
+    if reports is None or reports.empty or "使用モデル" not in reports:
+        return pd.DataFrame([{"項目": "状態", "値": "ChaminiSP検証データがまだ不足しています"}], columns=columns)
+    df = reports[_chamini_sp_mask(reports, "使用モデル")].copy()
+    if df.empty:
+        return pd.DataFrame([{"項目": "状態", "値": "ChaminiSP検証データがまだ不足しています"}], columns=columns)
+    match_column, bonus_column = _verification_match_columns(df)
+    if match_column is None:
+        return pd.DataFrame([{"項目": "状態", "値": "一致数列がないため集計できません"}], columns=columns)
+    matches = pd.to_numeric(df[match_column], errors="coerce").fillna(0)
+    if bonus_column == "ボーナス一致":
+        bonus = df[bonus_column].astype(str).map(lambda value: 1 if value.strip() == "あり" else 0)
+    elif bonus_column:
+        bonus = pd.to_numeric(df[bonus_column], errors="coerce").fillna(0)
+    else:
+        bonus = pd.Series([0] * len(df), index=df.index)
+    total = matches + bonus
+    rows = [
+        {"項目": "検証件数", "値": int(len(df))},
+        {"項目": "平均本数字一致数", "値": rounded_or_none(matches.mean())},
+        {"項目": "平均総一致数", "値": rounded_or_none(total.mean())},
+        {"項目": "最大一致数", "値": int(matches.max()) if len(matches) else 0},
+        {"項目": "3個以上一致率", "値": f"{round(float((matches >= 3).mean() * 100), 1)}%"},
+        {"項目": "直近成績", "値": rounded_or_none(matches.tail(5).mean())},
+        {"項目": "長期成績", "値": rounded_or_none(matches.mean())},
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_balance_hypothesis_performance(reports, draw_size):
+    overview_columns = ["項目", "値"]
+    grade_columns = ["balance_grade", "件数", "平均本数字一致数", "平均ボーナス一致数", "平均総一致数", "最大本数字一致数", "3個以上一致率"]
+    group_columns = ["score_group", "件数", "平均balance_score", "平均本数字一致数", "平均総一致数"]
+    subscore_columns = ["subscore", "検証件数", "平均スコア", "平均一致数", "高スコア群の平均一致数", "低スコア群の平均一致数"]
+    df = _prepare_balance_verification_rows(reports, draw_size)
+    if df.empty:
+        return {
+            "overview": pd.DataFrame([{"項目": "状態", "値": "検証データがまだ不足しています"}], columns=overview_columns),
+            "grade": pd.DataFrame(columns=grade_columns),
+            "score_groups": pd.DataFrame(columns=group_columns),
+            "subscores": pd.DataFrame(columns=subscore_columns),
+        }
+
+    scores = pd.to_numeric(df["balance_score"], errors="coerce").dropna()
+    matches = pd.to_numeric(df["本数字一致数"], errors="coerce").fillna(0)
+    correlation_text = "サンプル不足"
+    if len(scores) >= MIN_CORRELATION_SAMPLES and scores.nunique() > 1 and matches.nunique() > 1:
+        correlation = float(scores.corr(matches.loc[scores.index]))
+        correlation_text = rounded_or_none(correlation, 3)
+    high_group = df[df["balance_score"] >= BALANCE_HIGH_SCORE_THRESHOLD]
+    low_group = df[df["balance_score"] < BALANCE_HIGH_SCORE_THRESHOLD]
+    overview = pd.DataFrame(
+        [
+            {"項目": "検証件数", "値": int(len(df))},
+            {"項目": "平均balance_score", "値": rounded_or_none(scores.mean())},
+            {"項目": "高スコア閾値", "値": BALANCE_HIGH_SCORE_THRESHOLD},
+            {"項目": "高スコア群の平均本数字一致数", "値": rounded_or_none(high_group["本数字一致数"].mean()) if not high_group.empty else None},
+            {"項目": "低スコア群の平均本数字一致数", "値": rounded_or_none(low_group["本数字一致数"].mean()) if not low_group.empty else None},
+            {"項目": "相関", "値": correlation_text},
+            {"項目": "相関サンプル数", "値": int(len(scores))},
+        ],
+        columns=overview_columns,
+    )
+
+    grade_rows = []
+    for grade, group in df.groupby("balance_grade", dropna=False):
+        main = pd.to_numeric(group["本数字一致数"], errors="coerce").fillna(0)
+        bonus = pd.to_numeric(group["ボーナス一致数"], errors="coerce").fillna(0)
+        total = pd.to_numeric(group["総一致数"], errors="coerce").fillna(main + bonus)
+        grade_rows.append(
+            {
+                "balance_grade": str(grade or "unknown"),
+                "件数": int(len(group)),
+                "平均本数字一致数": rounded_or_none(main.mean()),
+                "平均ボーナス一致数": rounded_or_none(bonus.mean()),
+                "平均総一致数": rounded_or_none(total.mean()),
+                "最大本数字一致数": int(main.max()) if len(main) else 0,
+                "3個以上一致率": f"{round(float((main >= 3).mean() * 100), 1)}%",
+            }
+        )
+    grade_df = pd.DataFrame(grade_rows, columns=grade_columns).sort_values("件数", ascending=False).reset_index(drop=True)
+
+    group_rows = []
+    for label, group in [("high_score", high_group), ("low_score", low_group)]:
+        main = pd.to_numeric(group["本数字一致数"], errors="coerce").fillna(0)
+        total = pd.to_numeric(group["総一致数"], errors="coerce").fillna(main)
+        group_rows.append(
+            {
+                "score_group": label,
+                "件数": int(len(group)),
+                "平均balance_score": rounded_or_none(group["balance_score"].mean()) if not group.empty else None,
+                "平均本数字一致数": rounded_or_none(main.mean()) if not group.empty else None,
+                "平均総一致数": rounded_or_none(total.mean()) if not group.empty else None,
+            }
+        )
+
+    subscore_rows = []
+    for subscore_key in ("odd_even", "high_low", "sum", "consecutive", "last_digit", "tens_group", "hot_cold", "gap", "bonus_neighbor", "ball_set"):
+        values = []
+        hits = []
+        for _, row in df.iterrows():
+            details = parse_json_text(row.get("balance_details_json"), {})
+            score = details.get(subscore_key) if isinstance(details, dict) else None
+            try:
+                score = float(score)
+            except (TypeError, ValueError):
+                continue
+            values.append(score)
+            hits.append(float(row.get("本数字一致数", 0) or 0))
+        if not values:
+            continue
+        value_series = pd.Series(values)
+        hit_series = pd.Series(hits)
+        high = hit_series[value_series >= BALANCE_HIGH_SCORE_THRESHOLD]
+        low = hit_series[value_series < BALANCE_HIGH_SCORE_THRESHOLD]
+        subscore_rows.append(
+            {
+                "subscore": subscore_key,
+                "検証件数": int(len(values)),
+                "平均スコア": rounded_or_none(value_series.mean()),
+                "平均一致数": rounded_or_none(hit_series.mean()),
+                "高スコア群の平均一致数": rounded_or_none(high.mean()) if len(high) else None,
+                "低スコア群の平均一致数": rounded_or_none(low.mean()) if len(low) else None,
+            }
+        )
+
+    return {
+        "overview": overview,
+        "grade": grade_df,
+        "score_groups": pd.DataFrame(group_rows, columns=group_columns),
+        "subscores": pd.DataFrame(subscore_rows, columns=subscore_columns),
+    }
+
+
+def build_unverified_chamini_sp_predictions(predictions, official_results=None, reports=None, draw_size=6, number_max=None):
+    columns = ["予想ID", "開催回", "抽せん日", "候補番号", "使用モデル", "予想番号", "balance_score", "balance_grade", "検証済みか"]
+    if predictions is None or predictions.empty or "使用モデル" not in predictions:
+        return pd.DataFrame(columns=columns)
+    df = predictions[_chamini_sp_mask(predictions, "使用モデル")].copy()
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    df = ensure_balance_columns(df)
+    if "開催回" in df:
+        df["開催回"] = pd.to_numeric(df["開催回"], errors="coerce").fillna(0).astype(int)
+    verified_ids = set()
+    verified_keys = set()
+    if reports is not None and not reports.empty:
+        if "予想ID" in reports:
+            verified_ids = set(reports["予想ID"].astype(str).str.strip())
+        if "検証キー" in reports:
+            verified_keys = set(reports["検証キー"].astype(str).str.strip())
+    draw_dates = {}
+    if official_results is not None and not official_results.empty and "開催回" in official_results:
+        result_df = official_results.copy()
+        result_df["開催回"] = pd.to_numeric(result_df["開催回"], errors="coerce").fillna(0).astype(int)
+        date_column = "抽せん日" if "抽せん日" in result_df else ("日付" if "日付" in result_df else None)
+        if date_column:
+            draw_dates = result_df.drop_duplicates("開催回", keep="last").set_index("開催回")[date_column].to_dict()
+    rows = []
+    seen = set()
+    for _, row in df.iterrows():
+        prediction_id = str(row.get("予想ID", "")).strip()
+        candidate_no = safe_int(row.get("候補番号"))
+        model_name = str(row.get("使用モデル", "")).strip()
+        key = f"{prediction_id}__{model_name}__{candidate_no}"
+        dedupe_key = (prediction_id, candidate_no, model_name, str(row.get("予想番号", "")))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        rows.append(
+            {
+                "予想ID": prediction_id,
+                "開催回": safe_int(row.get("開催回")),
+                "抽せん日": draw_dates.get(safe_int(row.get("開催回")), ""),
+                "候補番号": candidate_no,
+                "使用モデル": CHAMINI_SP_GOD_MODE_LABEL,
+                "予想番号": numbers_to_text(parse_numbers(row.get("予想番号"), number_max)) if number_max else str(row.get("予想番号", "")),
+                "balance_score": row.get("balance_score", ""),
+                "balance_grade": row.get("balance_grade", ""),
+                "検証済みか": "済" if prediction_id in verified_ids or key in verified_keys else "未検証",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns).sort_values(["開催回", "候補番号"], ascending=[False, True]).reset_index(drop=True)
+
+
 def _verification_column_set(reports):
     return {
         "draw": _column_at(reports, 1),
@@ -3007,6 +3467,9 @@ def build_model_performance_weights(reports, draw_size, lottery_type="", model_h
 
     df = df.copy()
     df[model_column] = df[model_column].fillna("").astype(str)
+    df[model_column] = df[model_column].map(
+        lambda value: CHAMINI_SP_GOD_MODE_LABEL if is_chamini_sp_model(value) else value
+    )
     ai_scores = model_history_ai_scores(model_history)
     weight_rows = []
     for model_key, label in ARL_MODEL_LABELS.items():

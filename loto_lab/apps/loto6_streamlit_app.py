@@ -27,6 +27,8 @@ from arl_research_engine import (
     ANTI_POPULAR_EXPECTED_VALUE_LABEL,
     ARL_MODEL_LABELS,
     BACKTEST_SUMMARY_COLUMNS,
+    BALANCE_PREDICTION_COLUMNS,
+    BALANCE_VERIFICATION_COLUMNS,
     CHAMINI6_GOD_MODE_KEY,
     CHAMINI6_GOD_MODE_LABEL,
     CONTINUOUS_WIN_RESEARCH_COLUMNS,
@@ -41,11 +43,13 @@ from arl_research_engine import (
     add_verification_metrics,
     ai_improvement_weight_rows,
     anti_popular_verification_fields,
+    attach_balance_verification_fields,
     apply_ai_improvement_weights,
     apply_prediction_pattern_roles,
     append_winning_condition_history,
     build_ai_improvement_summary,
     build_ai_improvement_weight_summary,
+    build_balance_hypothesis_performance,
     build_condition_success_table,
     build_contribution_ranking,
     build_contribution_rows,
@@ -67,8 +71,11 @@ from arl_research_engine import (
     build_purchase_group_summary,
     build_purchase_summary,
     build_research_flow_table,
+    build_chamini_sp_performance_summary,
     build_ticket_strategy_rows,
+    build_unverified_chamini_sp_predictions,
     build_winning_condition_report,
+    balance_prediction_fields_from_pick,
     evaluate_purchase_history,
     extract_video_hypothesis,
     format_contribution_detail,
@@ -162,7 +169,7 @@ AI_SCORE_DISPLAY_COLUMNS = [
     "ボーナス傾向スコア",
     "AI改善理由",
 ]
-PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
+PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時", *BALANCE_PREDICTION_COLUMNS]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
     "予想ID",
@@ -202,6 +209,7 @@ VERIFICATION_COLUMNS = [
     "逆算分析",
     "改善案",
     "次回の仮説",
+    *BALANCE_VERIFICATION_COLUMNS,
 ]
 BACKTEST_MODELS = dict(ARL_MODEL_LABELS)
 MODEL_SETTING_COLUMNS = ["設定名", "モデルキー", "モデル名", "根拠", "更新日時"]
@@ -1932,7 +1940,7 @@ def prediction_reason_with_pattern(pick):
 
 
 def save_prediction_picks_detailed(picks, target_round, model_name="score_balance_v1"):
-    id_col, draw_col, date_col, candidate_col, numbers_col, model_col, reason_col, saved_col = PREDICTION_COLUMNS
+    id_col, draw_col, date_col, candidate_col, numbers_col, model_col, reason_col, saved_col = PREDICTION_COLUMNS[:8]
     predictions = read_csv(PREDICTIONS_CSV, PREDICTION_COLUMNS)
     existing_keys = set()
     existing_ids = set()
@@ -1965,18 +1973,18 @@ def save_prediction_picks_detailed(picks, target_round, model_name="score_balanc
         if key in existing_keys or prediction_id in existing_ids:
             skipped += 1
             continue
-        rows.append(
-            {
-                id_col: prediction_id,
-                draw_col: int(target_round),
-                date_col: prediction_date,
-                candidate_col: index,
-                numbers_col: number_text,
-                model_col: row_model_name,
-                reason_col: prediction_reason_with_pattern(pick),
-                saved_col: now_text(),
-            }
-        )
+        row = {
+            id_col: prediction_id,
+            draw_col: int(target_round),
+            date_col: prediction_date,
+            candidate_col: index,
+            numbers_col: number_text,
+            model_col: row_model_name,
+            reason_col: prediction_reason_with_pattern(pick),
+            saved_col: now_text(),
+        }
+        row.update(balance_prediction_fields_from_pick(pick))
+        rows.append(row)
         existing_keys.add(key)
         existing_ids.add(prediction_id)
 
@@ -2199,7 +2207,7 @@ def build_verification_report_row(prediction_row, official_row, support_map=None
     high_low_diff = actual_summary["low"] - predicted_summary["low"]
     condition_gap = build_missing_excess_conditions(predicted, actual, 43)
 
-    return {
+    report = {
         "予想ID": prediction_row["予想ID"],
         "開催回": to_int(prediction_row["開催回"]),
         "検証日": today_text(),
@@ -2234,6 +2242,7 @@ def build_verification_report_row(prediction_row, official_row, support_map=None
         "改善案": build_improvement_plan(predicted, actual),
         "次回の仮説": build_next_hypothesis(predicted, actual),
     }
+    return attach_balance_verification_fields(report, prediction_row, draw_size=6)
 
 
 def verify_predictions_for_round(round_no=None):
@@ -2854,6 +2863,27 @@ def render_prediction_lab():
         else:
             st.markdown("**モデル成績ランキング**")
             st.dataframe(dashboard, width="stretch", hide_index=True)
+            with st.expander("ChaminiSP / バランス仮説 研究成績", expanded=False):
+                st.markdown("**ChaminiSP God Mode 総合成績**")
+                st.dataframe(build_chamini_sp_performance_summary(reports, draw_size=6), width="stretch", hide_index=True)
+                balance_stats = build_balance_hypothesis_performance(reports, draw_size=6)
+                st.markdown("**balance hypothesis 研究成績**")
+                st.dataframe(balance_stats["overview"], width="stretch", hide_index=True)
+                if not balance_stats["grade"].empty:
+                    st.markdown("**grade別成績**")
+                    st.dataframe(balance_stats["grade"], width="stretch", hide_index=True)
+                if not balance_stats["score_groups"].empty:
+                    st.markdown("**高スコア・低スコア群比較**")
+                    st.dataframe(balance_stats["score_groups"], width="stretch", hide_index=True)
+                if not balance_stats["subscores"].empty:
+                    st.markdown("**サブスコア別研究成績**")
+                    st.dataframe(balance_stats["subscores"], width="stretch", hide_index=True)
+                unverified = build_unverified_chamini_sp_predictions(predictions, official_results, reports, draw_size=6, number_max=43)
+                st.markdown("**未検証のChaminiSP保存済み予想**")
+                if unverified.empty:
+                    st.info("未検証のChaminiSP予想はありません。")
+                else:
+                    st.dataframe(unverified, width="stretch", hide_index=True)
             st.markdown("**モデル貢献度ランキング**")
             if ranking.empty:
                 st.info("貢献度ランキングは、的中数字の要因分析後に表示されます。")

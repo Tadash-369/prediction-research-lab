@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-10 Ver1.7
+
+- ChaminiSP新規予測保存時に `balance_score`、`balance_grade`、評価理由、警告、詳細JSONを保存できるようにしました。
+- 検証CSVへ予測時点のバランス仮説情報を引き継ぎ、`総一致数` と `balance_result_class` を研究用区分として保存できるようにしました。
+- ChaminiSP God Modeの総合成績と、balance hypothesisの研究成績を分離して集計できるようにしました。
+- grade別成績、高スコア/低スコア群比較、相関サンプル数の表示を追加しました。
+- AI改善レポートへ流れる失敗要因・改善案・次回仮説に、バランス仮説の成功/失敗要因を研究メモとして連携するようにしました。
+- 旧 `chamini6_god_mode` / `Chamini6 God Mode` はChaminiSPとして互換集計し、既存研究データの一括変換や自動重み変更は行いません。
+
 ## 2026-07-10 Ver1.6
 
 - 現行表示名を `ChaminiSP God Mode`、新規保存用の内部キーを `chamini_sp_god_mode` に更新しました。

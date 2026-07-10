@@ -9,9 +9,12 @@ import pandas as pd
 
 from arl_research_engine import (
     ARL_MODEL_LABELS,
+    BALANCE_PREDICTION_COLUMNS,
+    BALANCE_VERIFICATION_COLUMNS,
     CONTRIBUTION_COLUMNS,
     RESEARCH_CYCLE_COLUMNS,
     add_verification_metrics,
+    attach_balance_verification_fields,
     append_winning_condition_history,
     build_contribution_rows,
     build_effective_conditions,
@@ -47,7 +50,7 @@ BACKUP_DIR = DATA_DIR / "backups"
 AI_IMPROVEMENT_DIR = DATA_DIR / "ai_improvement"
 BASE_DIR = LOTO_LAB_DIR
 
-PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時"]
+PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時", *BALANCE_PREDICTION_COLUMNS]
 LOTO6_OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "球セット", "登録元", "保存日時"]
 LOTO7_OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "登録元", "保存日時"]
 LOTO6_NUMBER_COLUMNS = ["第1数字", "第2数字", "第3数字", "第4数字", "第5数字", "第6数字"]
@@ -94,6 +97,7 @@ LOTO7_VERIFICATION_COLUMNS = [
     "逆算分析",
     "改善案",
     "次回の仮説",
+    *BALANCE_VERIFICATION_COLUMNS,
 ]
 
 MODEL_NAME_REPLACEMENTS = {
@@ -412,9 +416,14 @@ def collect_csv_safety_diagnostics():
             )
             continue
         missing = _missing_columns(df, columns or [])
+        optional_balance_columns = set(BALANCE_PREDICTION_COLUMNS + BALANCE_VERIFICATION_COLUMNS)
+        required_missing = [column for column in missing if column not in optional_balance_columns]
+        optional_missing = [column for column in missing if column in optional_balance_columns]
         details = []
-        if missing:
-            details.append(f"不足列: {', '.join(map(str, missing[:6]))}")
+        if required_missing:
+            details.append(f"不足列: {', '.join(map(str, required_missing[:6]))}")
+        if optional_missing:
+            details.append("balance研究列は新規保存・検証時に補完されます")
         if not df.empty and len(df.columns):
             round_dupes = _duplicate_count(df, [df.columns[0]])
             if "results" in name and round_dupes:
@@ -432,7 +441,7 @@ def collect_csv_safety_diagnostics():
                 details.append(f"検証キー重複: {key_dupes}行")
         if not details:
             details.append(f"読み込みOK / 最新回: {_latest_draw_text(df)} / 行数: {len(df)}")
-        status = "needs_attention" if missing or any("重複" in detail for detail in details) else "ok"
+        status = "needs_attention" if required_missing or any("重複" in detail for detail in details) else "ok"
         rows.append(
             {
                 "対象": name,
@@ -705,7 +714,7 @@ def build_loto7_report_row(prediction_row, official_row, support_map=None):
     high_low_gap = f"予想 低{predicted_summary['low']}:高{predicted_summary['high']} / 実際 低{actual_summary['low']}:高{actual_summary['high']}"
     consecutive_text = f"予想{predicted_summary['consecutive']}組 / 実際{actual_summary['consecutive']}組"
 
-    return {
+    report = {
         "検証キー": verification_key(prediction_id, model_name, candidate_no),
         "予想ID": prediction_id,
         "開催回": safe_int(prediction_row.get("開催回")),
@@ -746,6 +755,7 @@ def build_loto7_report_row(prediction_row, official_row, support_map=None):
         "改善案": " / ".join(improvements),
         "次回の仮説": build_next_hypothesis(predicted, actual),
     }
+    return attach_balance_verification_fields(report, prediction_row, draw_size=7)
 
 
 def historical_loto7_context_before_round(round_no):
