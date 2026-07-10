@@ -31,6 +31,7 @@ from arl_research_engine import (
     build_ai_improvement_weight_summary,
     build_ai_improvement_summary,
     build_balance_hypothesis_performance,
+    build_balance_verification_diagnostics,
     build_chamini_sp_performance_summary,
     build_condition_success_table,
     build_contribution_ranking,
@@ -49,6 +50,73 @@ from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode,
 
 BASE_DIR = LOTO_LAB_DIR
 PURCHASES_CSV = DATA_DIR / "purchases.csv"
+
+
+def render_balance_research_details(balance_stats, diagnostics):
+    st.caption("この結果は過去データ上の研究評価です。当選を保証するものではありません。")
+    periods = balance_stats.get("periods", pd.DataFrame())
+    if not periods.empty:
+        st.markdown("**直近・長期比較**")
+        st.dataframe(periods, width="stretch", hide_index=True)
+    grade = balance_stats.get("grade", pd.DataFrame())
+    if not grade.empty and {"balance_grade", "平均本数字一致数"}.issubset(grade.columns):
+        st.markdown("**grade別 平均本数字一致数**")
+        st.bar_chart(grade.set_index("balance_grade")[["平均本数字一致数"]], use_container_width=True)
+    score_groups = balance_stats.get("score_groups", pd.DataFrame())
+    if not score_groups.empty and {"score_group", "平均本数字一致数"}.issubset(score_groups.columns):
+        st.markdown("**高スコア群・低スコア群 比較**")
+        st.bar_chart(score_groups.set_index("score_group")[["平均本数字一致数"]], use_container_width=True)
+    ranking = balance_stats.get("subscore_ranking", pd.DataFrame())
+    if not ranking.empty:
+        st.markdown("**バランス仮説サブスコア研究ランキング**")
+        st.dataframe(ranking, width="stretch", hide_index=True)
+        if {"項目名", "参考差分"}.issubset(ranking.columns):
+            chart_df = ranking[["項目名", "参考差分"]].copy()
+            chart_df["参考差分"] = pd.to_numeric(chart_df["参考差分"], errors="coerce")
+            chart_df = chart_df.dropna()
+            if not chart_df.empty:
+                st.bar_chart(chart_df.set_index("項目名"), use_container_width=True)
+    if diagnostics is not None and not diagnostics.empty:
+        st.markdown("**検証漏れ診断（読み取り専用）**")
+        st.dataframe(diagnostics, width="stretch", hide_index=True)
+
+
+def balance_home_row(label, predictions, official, reports, draw_size, number_max):
+    stats = build_balance_hypothesis_performance(reports, draw_size=draw_size)
+    overview = stats.get("overview", pd.DataFrame())
+    timeline = stats.get("timeline", pd.DataFrame())
+    unverified = build_unverified_chamini_sp_predictions(
+        predictions,
+        official,
+        reports,
+        draw_size=draw_size,
+        number_max=number_max,
+    )
+
+    def value_for(name):
+        if overview.empty or "項目" not in overview or "値" not in overview:
+            return "-"
+        matched = overview[overview["項目"] == name]
+        if matched.empty:
+            return "-"
+        value = matched.iloc[0]["値"]
+        return "-" if value == "" else value
+
+    latest_draw = "-"
+    if not timeline.empty and "開催回" in timeline:
+        draws = pd.to_numeric(timeline["開催回"], errors="coerce").dropna()
+        if not draws.empty:
+            latest_draw = int(draws.max())
+
+    return {
+        "対象": label,
+        "ChaminiSP検証件数": value_for("検証件数"),
+        "平均本数字一致数": value_for("平均本数字一致数"),
+        "平均balance_score": value_for("平均balance_score"),
+        "3個以上一致率": value_for("3個以上一致率"),
+        "未検証件数": len(unverified),
+        "最新検証回": latest_draw,
+    }
 
 
 def read_csv(path, columns=None):
@@ -313,6 +381,15 @@ def render_home():
                 st.caption(f"{label} 第{target_round}回 / 状態: {fixed_status}")
                 display_dataframe(fixed_predictions, width="stretch", hide_index=True)
 
+    balance_overview = pd.DataFrame(
+        [
+            balance_home_row("ロト6", loto6_predictions, loto6_official, loto6_reports, 6, 43),
+            balance_home_row("ロト7", loto7_predictions, loto7_official, loto7_reports, 7, 37),
+        ]
+    )
+    st.markdown("**ChaminiSP / バランス仮説 研究概要**")
+    display_dataframe(balance_overview, width="stretch", hide_index=True)
+
     score_overview = pd.DataFrame(
         [
             score_csv_overview("ロト6", DATA_DIR / "loto6_next_number_scores.csv", 43),
@@ -489,6 +566,8 @@ def render_loto_lab(name, prediction_file, result_file, report_file, contributio
                     st.info("未検証のChaminiSP予想はありません。")
                 else:
                     display_dataframe(unverified, width="stretch", hide_index=True)
+                diagnostics = build_balance_verification_diagnostics(predictions, official, reports, draw_size=draw_size, number_max=number_max)
+                render_balance_research_details(balance_stats, diagnostics)
     with tabs[2]:
         ranking = build_contribution_ranking(contributions)
         if ranking.empty:

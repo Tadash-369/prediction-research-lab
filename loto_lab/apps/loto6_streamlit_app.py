@@ -50,6 +50,7 @@ from arl_research_engine import (
     build_ai_improvement_summary,
     build_ai_improvement_weight_summary,
     build_balance_hypothesis_performance,
+    build_balance_verification_diagnostics,
     build_condition_success_table,
     build_contribution_ranking,
     build_contribution_rows,
@@ -91,6 +92,45 @@ from arl_research_engine import (
     weighted_model_text,
 )
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value
+
+
+def render_balance_research_details(balance_stats, diagnostics):
+    st.caption("この結果は過去データ上の研究評価です。当選を保証するものではありません。")
+    periods = balance_stats.get("periods", pd.DataFrame())
+    if not periods.empty:
+        st.markdown("**直近・長期比較**")
+        st.dataframe(periods, width="stretch", hide_index=True)
+    grade = balance_stats.get("grade", pd.DataFrame())
+    if not grade.empty and {"balance_grade", "平均本数字一致数"}.issubset(grade.columns):
+        st.markdown("**grade別 平均本数字一致数**")
+        st.bar_chart(grade.set_index("balance_grade")[["平均本数字一致数"]], use_container_width=True)
+    score_groups = balance_stats.get("score_groups", pd.DataFrame())
+    if not score_groups.empty and {"score_group", "平均本数字一致数"}.issubset(score_groups.columns):
+        st.markdown("**高スコア群・低スコア群 比較**")
+        st.bar_chart(score_groups.set_index("score_group")[["平均本数字一致数"]], use_container_width=True)
+    ranking = balance_stats.get("subscore_ranking", pd.DataFrame())
+    if not ranking.empty:
+        st.markdown("**バランス仮説サブスコア研究ランキング**")
+        st.dataframe(ranking, width="stretch", hide_index=True)
+        if {"項目名", "参考差分"}.issubset(ranking.columns):
+            chart_df = ranking[["項目名", "参考差分"]].copy()
+            chart_df["参考差分"] = pd.to_numeric(chart_df["参考差分"], errors="coerce")
+            chart_df = chart_df.dropna()
+            if not chart_df.empty:
+                st.bar_chart(chart_df.set_index("項目名"), use_container_width=True)
+    timeline = balance_stats.get("timeline", pd.DataFrame())
+    if not timeline.empty and {"開催回", "balance_score", "本数字一致数"}.issubset(timeline.columns):
+        score_line = timeline[["開催回", "balance_score"]].dropna()
+        match_line = timeline[["開催回", "本数字一致数"]].dropna()
+        if len(score_line) >= 2:
+            st.markdown("**開催回ごとのbalance_score**")
+            st.line_chart(score_line.set_index("開催回"), use_container_width=True)
+        if len(match_line) >= 2:
+            st.markdown("**開催回ごとの本数字一致数**")
+            st.line_chart(match_line.set_index("開催回"), use_container_width=True)
+    if diagnostics is not None and not diagnostics.empty:
+        st.markdown("**検証漏れ診断（読み取り専用）**")
+        st.dataframe(diagnostics, width="stretch", hide_index=True)
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -2884,6 +2924,8 @@ def render_prediction_lab():
                     st.info("未検証のChaminiSP予想はありません。")
                 else:
                     st.dataframe(unverified, width="stretch", hide_index=True)
+                diagnostics = build_balance_verification_diagnostics(predictions, official_results, reports, draw_size=6, number_max=43)
+                render_balance_research_details(balance_stats, diagnostics)
             st.markdown("**モデル貢献度ランキング**")
             if ranking.empty:
                 st.info("貢献度ランキングは、的中数字の要因分析後に表示されます。")
