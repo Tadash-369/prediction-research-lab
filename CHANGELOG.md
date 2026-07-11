@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-11 Ver1.11
+
+- Ver1.10のレビュー履歴から採用候補・保留・却下・未判定の最新判定を読み込み、本番反映前dry-runを行えるようにしました。
+- Current重みと選択候補重みの差分、重み整合性、安全検証、回別比較、ローリング比較、ドリフト確認、採用準備スコアを追加しました。
+- 本番設定変更プレビュー、dry-runパッチプレビュー、ロールバック案、採用準備JSON、dry-run CSVレポートを追加しました。
+- dry-run承認・変更準備承認の履歴保存を、レビュー履歴とは別の `balance_weight_approval_history.csv` として明示ボタン操作に限定しました。
+- Ver1.11でも本番重み、`balance_hypothesis_engine.py`、既存予測CSV、検証CSV、研究CSV/JSONLへの自動反映は行いません。
+
 ## 2026-07-11 Ver1.10
 
 - バランス仮説の候補重みについて、Current / Conservative / Balanced / Experimental を同一開催回内で再スコアし、トップ候補、Top3平均、一致数、同点1位を確認できる詳細ランキング評価を追加しました。

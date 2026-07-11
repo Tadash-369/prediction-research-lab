@@ -86,6 +86,7 @@ from arl_research_engine import (
     weighted_model_text,
 )
 from balance_weight_research import build_balance_weight_research
+from balance_weight_adoption_ui import render_adoption_dry_run_ui
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value
 
@@ -152,6 +153,15 @@ def render_balance_research_details(balance_stats, diagnostics, reports=None, dr
         weight_research=weight_research,
         show_core_tables=False,
     )
+    render_adoption_dry_run_ui(
+        reports,
+        game="loto7",
+        review_history_path=WEIGHT_REVIEW_HISTORY_CSV,
+        approval_history_path=WEIGHT_APPROVAL_HISTORY_CSV,
+        key_prefix="loto7_balance_adoption",
+        allow_write=not is_light_smoke_mode(),
+        light_smoke=is_light_smoke_mode(),
+    )
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -166,6 +176,7 @@ CONTINUOUS_WIN_RESEARCH_CSV = DATA_DIR / "continuous_win_research.csv"
 BACKTEST_SUMMARY_CSV = DATA_DIR / "backtest_summary.csv"
 MODEL_WEIGHT_HISTORY_CSV = AI_IMPROVEMENT_DIR / "model_weight_history.csv"
 WEIGHT_REVIEW_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_review_history.csv"
+WEIGHT_APPROVAL_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_approval_history.csv"
 OFFICIAL_RESULTS_CSV = DATA_DIR / "loto7_results.csv"
 VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
 MODEL_SETTINGS_CSV = DATA_DIR / "loto7_model_settings.csv"

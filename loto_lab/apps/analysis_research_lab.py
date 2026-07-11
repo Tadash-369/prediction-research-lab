@@ -46,12 +46,15 @@ from arl_research_engine import (
     weighted_model_text,
 )
 from balance_weight_research import build_balance_weight_research
+from balance_weight_adoption_ui import render_adoption_overview
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value, run_maintenance
 
 
 BASE_DIR = LOTO_LAB_DIR
 PURCHASES_CSV = DATA_DIR / "purchases.csv"
+WEIGHT_REVIEW_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_review_history.csv"
+WEIGHT_APPROVAL_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_approval_history.csv"
 
 
 def render_balance_research_details(balance_stats, diagnostics, reports=None, draw_size=6):
@@ -416,6 +419,11 @@ def render_home():
     )
     st.markdown("**ChaminiSP / バランス仮説 研究概要**")
     display_dataframe(balance_overview, width="stretch", hide_index=True)
+    render_adoption_overview(
+        WEIGHT_REVIEW_HISTORY_CSV,
+        WEIGHT_APPROVAL_HISTORY_CSV,
+        games=["loto6", "loto7"],
+    )
 
     score_overview = pd.DataFrame(
         [

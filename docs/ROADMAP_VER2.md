@@ -1,5 +1,29 @@
 # ROADMAP Ver2
 
+## Ver1.11: 本番反映前dry-run・採用準備パッケージ・承認確認
+
+目的:
+
+- Ver1.10で保存されたレビュー履歴を読み込み、採用候補に選ばれた重みを本番へ反映した場合の影響を事前確認する。
+- 本番重み、設定ファイル、予測CSV、検証CSV、研究CSV/JSONLは変更しない。
+- dry-run結果、ロールバック案、承認状態を研究上の採用準備情報として整理する。
+
+実装方針:
+
+- 最新判定は `game + candidate_weights_hash + weights_version` を候補識別キーとして、`reviewed_at` と行順で安全に解決する。
+- 候補重みJSONは辞書として読み込み、不正JSON、旧列欠損、空履歴でも例外終了しない。
+- Current / Candidate の重み差分、必須キー、合計値、hash、game、weights version を検査し、blocked候補はdry-runしない。
+- dry-runは保存済みサブスコアへメモリ上で候補重みを適用し、元の `balance_score` やCSVを変更しない。
+- 設定変更プレビューとpatchプレビューはテキスト表示のみで、`balance_hypothesis_engine.py` や設定ファイルへ適用しない。
+- 承認履歴はレビュー履歴とは分離し、明示フォーム送信時のみ `loto_lab/data/weight_research/balance_weight_approval_history.csv` へ追記する。
+- 採用準備JSON/CSVはダウンロード用であり、自動反映用ファイルではない。
+
+確認ポイント:
+
+- top、loto6、loto7でHTTP 200になること。
+- 軽量スモークではdry-runの重い処理と履歴保存を省略すること。
+- Ver1.11で本番反映ボタン、設定更新ボタン、自動Git操作を追加しないこと。
+
 ## Ver1.10: 候補重みの詳細評価・手動レビュー・研究エクスポート
 
 目的:
