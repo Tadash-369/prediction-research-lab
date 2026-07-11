@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from datetime import datetime
+import hashlib
 import json
 import math
+from pathlib import Path
 
 import pandas as pd
 
 
 BALANCE_WEIGHT_RESEARCH_VERSION = "balance_weight_research_v1"
+BALANCE_WEIGHT_REVIEW_VERSION = "balance_weight_review_v1"
 MIN_WEIGHT_RESEARCH_SAMPLES = 10
 MIN_WEIGHT_RECOMMENDATION_SAMPLES = 20
 MAX_CONSERVATIVE_WEIGHT_DELTA = 0.02
@@ -153,6 +157,20 @@ def _report_columns(df):
     }
 
 
+def _now_text():
+    return datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+
+
+def _stable_json(data):
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _csv_text(df):
+    if df is None or df.empty:
+        return ""
+    return df.to_csv(index=False, encoding="utf-8-sig")
+
+
 def get_current_balance_weights():
     rows = []
     for key, weight in CURRENT_BALANCE_WEIGHTS.items():
@@ -169,6 +187,8 @@ def get_current_balance_weights():
 
 def _prepare_research_rows(reports):
     columns = [
+        "verification_key",
+        "prediction_id",
         "draw_no",
         "candidate_no",
         "model_name",
@@ -209,6 +229,8 @@ def _prepare_research_rows(reports):
         else:
             details_status = "missing"
         prepared = {
+            "verification_key": row.get(cols.get("key"), "") if cols.get("key") in df else "",
+            "prediction_id": row.get(cols.get("id"), "") if cols.get("id") in df else "",
             "draw_no": _safe_int(row.get(cols.get("draw"))) if cols.get("draw") in df else 0,
             "candidate_no": _safe_int(row.get(cols.get("candidate"))) if cols.get("candidate") in df else 0,
             "model_name": row.get(cols.get("model"), "") if cols.get("model") in df else "",
@@ -220,7 +242,10 @@ def _prepare_research_rows(reports):
             "details_status": details_status,
         }
         for key in SUBSCORE_LABELS:
-            prepared[key] = _subscore_from_details(details, key)
+            subscore = _subscore_from_details(details, key)
+            if subscore is None and key in df:
+                subscore = _safe_float(row.get(key))
+            prepared[key] = subscore
         rows.append(prepared)
     return pd.DataFrame(rows, columns=columns)
 
@@ -632,23 +657,684 @@ def build_balance_failure_research(research_df, simulation_df):
     return pd.DataFrame(rows)
 
 
+def _report_columns(df):
+    """Column detector override that supports both current Japanese CSVs and legacy mojibake labels."""
+    key_col = _find_column(df, ["検証キー", "verification_key"], fallback_index=0, contains=["検証", "verification"])
+    key_first = bool(df is not None and len(df.columns) and key_col == df.columns[0])
+    return {
+        "key": key_col,
+        "id": _find_column(df, ["予想ID", "prediction_id"], fallback_index=1 if key_first else 0, contains=["予想id", "prediction_id"]),
+        "draw": _find_column(df, ["開催回", "draw_no", "draw"], fallback_index=2 if key_first else 1, contains=["開催", "draw"]),
+        "candidate": _find_column(df, ["候補番号", "candidate_no", "candidate"], fallback_index=5 if key_first else 3, contains=["候補", "candidate"]),
+        "model": _find_column(df, ["使用モデル", "model_name", "model"], fallback_index=6 if key_first else 3, contains=["使用モデル", "model"]),
+        "main_match": _find_column(df, ["本数字一致数", "main_match"], fallback_index=11 if key_first else 7, contains=["本数字一致", "main_match"]),
+        "bonus_match": _find_column(df, ["ボーナス一致数", "bonus_match"], fallback_index=14 if key_first else 9, contains=["ボーナス一致", "bonus_match"]),
+        "total_match": _find_column(df, ["総一致数", "total_match"], contains=["総一致", "total_match"]),
+        "balance_score": _find_column(df, ["balance_score"]),
+        "balance_grade": _find_column(df, ["balance_grade"]),
+        "details": _find_column(df, ["balance_details_json"]),
+    }
+
+
+def _scenario_weights(candidate_weights_df, scenario):
+    if candidate_weights_df is None or candidate_weights_df.empty:
+        return CURRENT_BALANCE_WEIGHTS.copy()
+    group = candidate_weights_df[candidate_weights_df["scenario"] == scenario]
+    if group.empty:
+        return CURRENT_BALANCE_WEIGHTS.copy()
+    weights = OrderedDict()
+    for _, row in group.iterrows():
+        key = str(row.get("subscore_key", "")).strip()
+        if key in CURRENT_BALANCE_WEIGHTS:
+            weights[key] = _safe_float(row.get("candidate_weight"), CURRENT_BALANCE_WEIGHTS[key])
+    for key, value in CURRENT_BALANCE_WEIGHTS.items():
+        weights.setdefault(key, value)
+    return _normalize_weights(weights)
+
+
+def candidate_weights_hash(weights):
+    if isinstance(weights, pd.DataFrame):
+        if "subscore_key" in weights and "candidate_weight" in weights:
+            data = OrderedDict(
+                (str(row["subscore_key"]), _round(row["candidate_weight"], 6))
+                for _, row in weights.sort_values("subscore_key").iterrows()
+            )
+        else:
+            data = weights.to_dict(orient="records")
+    else:
+        data = OrderedDict((str(key), _round(value, 6)) for key, value in dict(weights).items())
+    return hashlib.sha256(_stable_json(data).encode("utf-8")).hexdigest()
+
+
+def _candidate_weights_json(weights):
+    return _stable_json(OrderedDict((key, _round(value, 6)) for key, value in dict(weights).items()))
+
+
+def _ranking_columns():
+    return [
+        "draw_no",
+        "candidate_type",
+        "prediction_id",
+        "candidate_no",
+        "model_name",
+        "calculated_score",
+        "rank",
+        "tie_count",
+        "is_tied_top",
+        "candidate_count",
+        "main_match",
+        "bonus_match",
+        "total_match",
+        "balance_score",
+    ]
+
+
+def _ranking_summary_columns():
+    return [
+        "draw_no",
+        "candidate_type",
+        "candidate_count",
+        "top_candidate_no",
+        "top_candidate_prediction_id",
+        "top_tie_count",
+        "is_tied_top",
+        "top_candidate_main_match_count",
+        "top_candidate_average_match",
+        "top3_candidate_average_match",
+        "best_actual_hit_candidate_rank",
+        "best_actual_candidate_no",
+        "best_actual_match_count",
+        "best_actual_is_rank1",
+        "best_actual_within_top3",
+    ]
+
+
+def _prepare_rankable_rows(reports):
+    prepared = _prepare_research_rows(reports)
+    if prepared.empty:
+        return prepared
+    prepared = prepared.copy()
+    prepared["draw_no"] = pd.to_numeric(prepared["draw_no"], errors="coerce")
+    prepared = prepared[prepared["draw_no"].notna() & (prepared["draw_no"] > 0)].copy()
+    if prepared.empty:
+        return prepared
+    for column in ("candidate_no", "main_match", "bonus_match", "total_match", "balance_score"):
+        if column in prepared:
+            prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
+    dedupe_columns = [column for column in ("draw_no", "prediction_id", "candidate_no", "model_name") if column in prepared]
+    if dedupe_columns:
+        prepared = prepared.drop_duplicates(subset=dedupe_columns, keep="first")
+    return prepared
+
+
+def build_candidate_ranking_rows(reports, candidate_weights_df):
+    prepared = _prepare_rankable_rows(reports)
+    if prepared.empty or candidate_weights_df is None or candidate_weights_df.empty:
+        return pd.DataFrame(columns=_ranking_columns())
+
+    rows = []
+    scenarios = list(dict.fromkeys(candidate_weights_df["scenario"].astype(str)))
+    for scenario in scenarios:
+        weights = _scenario_weights(candidate_weights_df, scenario)
+        scored = prepared.copy()
+        scored["calculated_score"] = scored.apply(lambda row: _weighted_score(row, weights), axis=1)
+        scored = scored[scored["calculated_score"].notna()].copy()
+        if scored.empty:
+            continue
+        scored["candidate_count"] = scored.groupby("draw_no")["candidate_no"].transform("count")
+        scored = scored[scored["candidate_count"] > 1].copy()
+        if scored.empty:
+            continue
+        scored["score_key"] = pd.to_numeric(scored["calculated_score"], errors="coerce").round(6)
+        scored["rank"] = scored.groupby("draw_no")["score_key"].rank(method="dense", ascending=False).astype(int)
+        scored["tie_count"] = scored.groupby(["draw_no", "score_key"])["candidate_no"].transform("count").astype(int)
+        scored["is_tied_top"] = (scored["rank"] == 1) & (scored["tie_count"] > 1)
+        for _, row in scored.iterrows():
+            rows.append(
+                {
+                    "draw_no": _safe_int(row.get("draw_no")),
+                    "candidate_type": scenario,
+                    "prediction_id": str(row.get("prediction_id", "") or ""),
+                    "candidate_no": _safe_int(row.get("candidate_no")),
+                    "model_name": str(row.get("model_name", "") or ""),
+                    "calculated_score": _round(row.get("calculated_score")),
+                    "rank": _safe_int(row.get("rank")),
+                    "tie_count": _safe_int(row.get("tie_count")),
+                    "is_tied_top": bool(row.get("is_tied_top")),
+                    "candidate_count": _safe_int(row.get("candidate_count")),
+                    "main_match": _round(row.get("main_match")),
+                    "bonus_match": _round(row.get("bonus_match")),
+                    "total_match": _round(row.get("total_match")),
+                    "balance_score": _round(row.get("balance_score")),
+                }
+            )
+    return pd.DataFrame(rows, columns=_ranking_columns())
+
+
+def build_per_draw_candidate_ranking(reports, candidate_weights_df):
+    return build_candidate_ranking_rows(reports, candidate_weights_df)
+
+
+def _candidate_display(series):
+    values = []
+    for value in series:
+        number = _safe_int(value, None)
+        values.append(str(number) if number is not None else str(value))
+    return "|".join(values)
+
+
+def _prediction_display(series):
+    values = [str(value) for value in series if str(value).strip()]
+    return "|".join(values)
+
+
+def build_per_draw_ranking_summary(ranking_df):
+    if ranking_df is None or ranking_df.empty:
+        return pd.DataFrame(columns=_ranking_summary_columns())
+    rows = []
+    for (draw_no, scenario), group in ranking_df.groupby(["draw_no", "candidate_type"], sort=True):
+        group = group.copy()
+        top = group[group["rank"] == 1].copy()
+        top3 = group[group["rank"] <= 3].copy()
+        best_match = pd.to_numeric(group["main_match"], errors="coerce").max()
+        best_rows = group[pd.to_numeric(group["main_match"], errors="coerce") == best_match].copy()
+        best_rank = int(pd.to_numeric(best_rows["rank"], errors="coerce").min()) if not best_rows.empty else None
+        rows.append(
+            {
+                "draw_no": _safe_int(draw_no),
+                "candidate_type": scenario,
+                "candidate_count": int(pd.to_numeric(group["candidate_no"], errors="coerce").count()),
+                "top_candidate_no": _candidate_display(top["candidate_no"]) if not top.empty else "",
+                "top_candidate_prediction_id": _prediction_display(top["prediction_id"]) if not top.empty else "",
+                "top_tie_count": int(len(top)),
+                "is_tied_top": bool(len(top) > 1 or top.get("is_tied_top", pd.Series(dtype=bool)).any()),
+                "top_candidate_main_match_count": _round(pd.to_numeric(top["main_match"], errors="coerce").mean()) if not top.empty else None,
+                "top_candidate_average_match": _round(pd.to_numeric(top["main_match"], errors="coerce").mean()) if not top.empty else None,
+                "top3_candidate_average_match": _round(pd.to_numeric(top3["main_match"], errors="coerce").mean()) if not top3.empty else None,
+                "best_actual_hit_candidate_rank": best_rank,
+                "best_actual_candidate_no": _candidate_display(best_rows["candidate_no"]) if not best_rows.empty else "",
+                "best_actual_match_count": _round(best_match),
+                "best_actual_is_rank1": bool(best_rank == 1) if best_rank is not None else False,
+                "best_actual_within_top3": bool(best_rank is not None and best_rank <= 3),
+            }
+        )
+    return pd.DataFrame(rows, columns=_ranking_summary_columns())
+
+
+def _split_candidate_set(value):
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    return {token for token in text.replace(",", "|").split("|") if token.strip()}
+
+
+def build_ranking_stability_summary(ranking_df, summary_df=None):
+    columns = [
+        "candidate_type",
+        "evaluation_count",
+        "ranking_stability_score",
+        "rank_change_mean",
+        "rank_change_max",
+        "top_candidate_switch_rate",
+        "top_candidate_fixed_rate",
+        "tie_rate",
+    ]
+    if ranking_df is None or ranking_df.empty:
+        return pd.DataFrame(columns=columns)
+    if summary_df is None or summary_df.empty:
+        summary_df = build_per_draw_ranking_summary(ranking_df)
+    current = ranking_df[ranking_df["candidate_type"] == "current"]
+    current_ranks = {}
+    for _, row in current.iterrows():
+        current_ranks[(row["draw_no"], row["candidate_no"])] = _safe_float(row["rank"], 0.0)
+    current_top = {}
+    if summary_df is not None and not summary_df.empty:
+        for _, row in summary_df[summary_df["candidate_type"] == "current"].iterrows():
+            current_top[row["draw_no"]] = _split_candidate_set(row.get("top_candidate_no"))
+
+    rows = []
+    for scenario, group in ranking_df.groupby("candidate_type", sort=False):
+        changes = []
+        for _, row in group.iterrows():
+            base_rank = current_ranks.get((row["draw_no"], row["candidate_no"]))
+            if base_rank is not None:
+                changes.append(abs(_safe_float(row["rank"], 0.0) - base_rank))
+        scenario_summary = summary_df[summary_df["candidate_type"] == scenario] if summary_df is not None and not summary_df.empty else pd.DataFrame()
+        switch_values = []
+        tie_values = []
+        for _, row in scenario_summary.iterrows():
+            draw_no = row.get("draw_no")
+            if draw_no in current_top:
+                switch_values.append(_split_candidate_set(row.get("top_candidate_no")) != current_top[draw_no])
+            tie_values.append(bool(row.get("is_tied_top")))
+        switch_rate = sum(switch_values) / len(switch_values) if switch_values else 0.0
+        tie_rate = sum(tie_values) / len(tie_values) if tie_values else 0.0
+        rank_change_mean = sum(changes) / len(changes) if changes else 0.0
+        rank_change_max = max(changes) if changes else 0.0
+        stability_score = _clamp(100 - rank_change_mean * 12 - switch_rate * 35 - tie_rate * 10)
+        rows.append(
+            {
+                "candidate_type": scenario,
+                "evaluation_count": int(len(scenario_summary)),
+                "ranking_stability_score": _round(stability_score),
+                "rank_change_mean": _round(rank_change_mean),
+                "rank_change_max": _round(rank_change_max),
+                "top_candidate_switch_rate": _percent(switch_rate),
+                "top_candidate_fixed_rate": _percent(1 - switch_rate),
+                "tie_rate": _percent(tie_rate),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _aggregate_ranking_summary(summary_df):
+    columns = [
+        "evaluation_count",
+        "top1_mean_match",
+        "top3_mean_match",
+        "best_candidate_top1_rate",
+        "best_candidate_top3_rate",
+        "tie_rate",
+    ]
+    if summary_df is None or summary_df.empty:
+        return {column: 0 if column == "evaluation_count" else None for column in columns}
+    return {
+        "evaluation_count": int(len(summary_df)),
+        "top1_mean_match": _round(pd.to_numeric(summary_df["top_candidate_average_match"], errors="coerce").mean()),
+        "top3_mean_match": _round(pd.to_numeric(summary_df["top3_candidate_average_match"], errors="coerce").mean()),
+        "best_candidate_top1_rate": _round(summary_df["best_actual_is_rank1"].astype(bool).mean()),
+        "best_candidate_top3_rate": _round(summary_df["best_actual_within_top3"].astype(bool).mean()),
+        "tie_rate": _round(summary_df["is_tied_top"].astype(bool).mean()),
+    }
+
+
+def build_rolling_weight_evaluation(reports, windows=(5, 10, 20)):
+    columns = [
+        "window_size",
+        "train_start",
+        "train_end",
+        "test_start",
+        "test_end",
+        "candidate_type",
+        "evaluation_count",
+        "top1_mean_match",
+        "top3_mean_match",
+        "best_candidate_top1_rate",
+        "best_candidate_top3_rate",
+        "ranking_stability_score",
+        "ranking_stability_variance",
+        "top1_mean_match_delta",
+        "top3_mean_match_delta",
+        "best_candidate_top1_rate_delta",
+        "best_candidate_top3_rate_delta",
+        "ranking_stability_delta",
+        "note",
+    ]
+    prepared = _prepare_rankable_rows(reports)
+    if prepared.empty:
+        return pd.DataFrame(columns=columns)
+    draws = sorted(int(value) for value in pd.to_numeric(prepared["draw_no"], errors="coerce").dropna().unique())
+    if len(draws) < 3:
+        return pd.DataFrame(columns=columns)
+
+    all_rows = []
+    for requested_window in windows:
+        window = min(int(requested_window), max(1, len(draws) - 1))
+        if window < 2:
+            continue
+        test_summaries = []
+        train_ranges = []
+        for test_index in range(window, len(draws)):
+            train_draws = draws[test_index - window : test_index]
+            test_draw = draws[test_index]
+            train_df = prepared[prepared["draw_no"].isin(train_draws)].copy()
+            test_df = prepared[prepared["draw_no"] == test_draw].copy()
+            if train_df.empty or test_df.empty:
+                continue
+            research = evaluate_subscore_research(train_df)
+            candidate_weights, _ = generate_candidate_weights(research)
+            ranking = build_per_draw_candidate_ranking(test_df, candidate_weights)
+            if ranking.empty:
+                continue
+            summary = build_per_draw_ranking_summary(ranking)
+            if summary.empty:
+                continue
+            summary["train_start"] = min(train_draws)
+            summary["train_end"] = max(train_draws)
+            summary["test_draw"] = test_draw
+            test_summaries.append(summary)
+            train_ranges.append((min(train_draws), max(train_draws), test_draw))
+        if not test_summaries:
+            continue
+        merged = pd.concat(test_summaries, ignore_index=True)
+        stability = build_ranking_stability_summary(
+            pd.concat(
+                [
+                    build_per_draw_candidate_ranking(
+                        prepared[prepared["draw_no"] == row["test_draw"]],
+                        generate_candidate_weights(evaluate_subscore_research(prepared[prepared["draw_no"].isin(range(row["train_start"], row["train_end"] + 1))]))[0],
+                    )
+                    for _, row in merged[["train_start", "train_end", "test_draw"]].drop_duplicates().iterrows()
+                ],
+                ignore_index=True,
+            )
+        )
+        stability_map = {}
+        if not stability.empty:
+            stability_map = dict(zip(stability["candidate_type"], pd.to_numeric(stability["ranking_stability_score"], errors="coerce")))
+        current_metrics = _aggregate_ranking_summary(merged[merged["candidate_type"] == "current"])
+        current_stability = _safe_float(stability_map.get("current"), 100.0)
+        for scenario, group in merged.groupby("candidate_type", sort=False):
+            metrics = _aggregate_ranking_summary(group)
+            stability_score = _safe_float(stability_map.get(scenario), current_stability)
+            all_rows.append(
+                {
+                    "window_size": int(window),
+                    "train_start": min(item[0] for item in train_ranges),
+                    "train_end": max(item[1] for item in train_ranges),
+                    "test_start": min(item[2] for item in train_ranges),
+                    "test_end": max(item[2] for item in train_ranges),
+                    "candidate_type": scenario,
+                    "evaluation_count": metrics["evaluation_count"],
+                    "top1_mean_match": metrics["top1_mean_match"],
+                    "top3_mean_match": metrics["top3_mean_match"],
+                    "best_candidate_top1_rate": metrics["best_candidate_top1_rate"],
+                    "best_candidate_top3_rate": metrics["best_candidate_top3_rate"],
+                    "ranking_stability_score": _round(stability_score),
+                    "ranking_stability_variance": None,
+                    "top1_mean_match_delta": _round((_safe_float(metrics["top1_mean_match"], 0.0) - _safe_float(current_metrics["top1_mean_match"], 0.0))),
+                    "top3_mean_match_delta": _round((_safe_float(metrics["top3_mean_match"], 0.0) - _safe_float(current_metrics["top3_mean_match"], 0.0))),
+                    "best_candidate_top1_rate_delta": _round((_safe_float(metrics["best_candidate_top1_rate"], 0.0) - _safe_float(current_metrics["best_candidate_top1_rate"], 0.0))),
+                    "best_candidate_top3_rate_delta": _round((_safe_float(metrics["best_candidate_top3_rate"], 0.0) - _safe_float(current_metrics["best_candidate_top3_rate"], 0.0))),
+                    "ranking_stability_delta": _round(stability_score - current_stability),
+                    "note": "research_only_no_production_apply",
+                }
+            )
+    result = pd.DataFrame(all_rows, columns=columns)
+    if not result.empty:
+        variance = result.groupby("candidate_type")["ranking_stability_score"].transform(lambda values: _round(pd.to_numeric(values, errors="coerce").var(ddof=0), 6))
+        result["ranking_stability_variance"] = variance
+    return result
+
+
+def build_production_readiness_checklist(weight_research):
+    research = weight_research.get("subscore_research", pd.DataFrame()) if isinstance(weight_research, dict) else pd.DataFrame()
+    rolling = weight_research.get("rolling_evaluation", pd.DataFrame()) if isinstance(weight_research, dict) else pd.DataFrame()
+    ranking_summary = weight_research.get("per_draw_ranking_summary", pd.DataFrame()) if isinstance(weight_research, dict) else pd.DataFrame()
+    sample_count = int(pd.to_numeric(research.get("evaluation_count", pd.Series(dtype=float)), errors="coerce").max()) if research is not None and not research.empty and "evaluation_count" in research else 0
+    rolling_count = int(pd.to_numeric(rolling.get("evaluation_count", pd.Series(dtype=float)), errors="coerce").max()) if rolling is not None and not rolling.empty and "evaluation_count" in rolling else 0
+    tie_rate = _safe_float(ranking_summary["is_tied_top"].astype(bool).mean(), 0.0) if ranking_summary is not None and not ranking_summary.empty and "is_tied_top" in ranking_summary else 0.0
+    rows = [
+        {
+            "check_item": "sample_count",
+            "status": "pass" if sample_count >= MIN_WEIGHT_RECOMMENDATION_SAMPLES else "hold",
+            "value": sample_count,
+            "required": MIN_WEIGHT_RECOMMENDATION_SAMPLES,
+            "note": "Manual review only. Production weights are not changed by Ver1.10.",
+        },
+        {
+            "check_item": "rolling_evaluation_count",
+            "status": "pass" if rolling_count > 0 else "hold",
+            "value": rolling_count,
+            "required": 1,
+            "note": "Rolling checks must use past draws only.",
+        },
+        {
+            "check_item": "tie_rate",
+            "status": "review" if tie_rate > 0 else "pass",
+            "value": _percent(tie_rate),
+            "required": "review tied top ranks",
+            "note": "Tied top ranks are not treated as a single clear winner.",
+        },
+        {
+            "check_item": "manual_decision",
+            "status": "required",
+            "value": "unreviewed",
+            "required": "candidate_for_adoption / hold / rejected",
+            "note": "A manual decision can be saved to review history without changing predictions.",
+        },
+        {
+            "check_item": "production_apply",
+            "status": "blocked",
+            "value": "not_available",
+            "required": "separate future version",
+            "note": "Ver1.10 intentionally has no production apply button or auto-apply path.",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_review_candidates(weight_research, game=""):
+    columns = [
+        "review_id",
+        "game",
+        "candidate_type",
+        "weights_version",
+        "candidate_weights_hash",
+        "created_at",
+        "sample_count",
+        "rolling_evaluation_count",
+        "top1_mean_match",
+        "top3_mean_match",
+        "best_candidate_top1_rate",
+        "best_candidate_top3_rate",
+        "current_comparison_json",
+        "decision",
+    ]
+    if not isinstance(weight_research, dict):
+        return pd.DataFrame(columns=columns)
+    candidate_weights = weight_research.get("candidate_weights", pd.DataFrame())
+    if candidate_weights is None or candidate_weights.empty:
+        return pd.DataFrame(columns=columns)
+    rolling = weight_research.get("rolling_evaluation", pd.DataFrame())
+    simulation = weight_research.get("simulation", pd.DataFrame())
+    research = weight_research.get("subscore_research", pd.DataFrame())
+    sample_count = int(pd.to_numeric(research.get("evaluation_count", pd.Series(dtype=float)), errors="coerce").max()) if research is not None and not research.empty and "evaluation_count" in research else 0
+    rows = []
+    for scenario in dict.fromkeys(candidate_weights["scenario"].astype(str)):
+        if scenario == "current":
+            continue
+        weights = _scenario_weights(candidate_weights, scenario)
+        weight_hash = candidate_weights_hash(weights)
+        rolling_row = pd.DataFrame()
+        if rolling is not None and not rolling.empty:
+            rolling_row = rolling[rolling["candidate_type"] == scenario].tail(1)
+        sim_row = pd.DataFrame()
+        if simulation is not None and not simulation.empty:
+            sim_row = simulation[simulation["scenario"] == scenario].tail(1)
+        top1 = _safe_float(rolling_row.iloc[0].get("top1_mean_match")) if not rolling_row.empty else (_safe_float(sim_row.iloc[0].get("top_candidate_avg_match")) if not sim_row.empty else None)
+        top3 = _safe_float(rolling_row.iloc[0].get("top3_mean_match")) if not rolling_row.empty else None
+        comparison = {}
+        if not rolling_row.empty:
+            for key in ("top1_mean_match_delta", "top3_mean_match_delta", "best_candidate_top1_rate_delta", "best_candidate_top3_rate_delta", "ranking_stability_delta"):
+                comparison[key] = _safe_float(rolling_row.iloc[0].get(key))
+        rows.append(
+            {
+                "review_id": f"balance-review-{game or 'unknown'}-{scenario}-{weight_hash[:12]}",
+                "game": game,
+                "candidate_type": scenario,
+                "weights_version": BALANCE_WEIGHT_RESEARCH_VERSION,
+                "candidate_weights_hash": weight_hash,
+                "created_at": _now_text(),
+                "sample_count": sample_count,
+                "rolling_evaluation_count": _safe_int(rolling_row.iloc[0].get("evaluation_count")) if not rolling_row.empty else 0,
+                "top1_mean_match": _round(top1),
+                "top3_mean_match": _round(top3),
+                "best_candidate_top1_rate": _round(rolling_row.iloc[0].get("best_candidate_top1_rate")) if not rolling_row.empty else None,
+                "best_candidate_top3_rate": _round(rolling_row.iloc[0].get("best_candidate_top3_rate")) if not rolling_row.empty else None,
+                "current_comparison_json": _stable_json(comparison),
+                "decision": "unreviewed",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+REVIEW_HISTORY_COLUMNS = [
+    "review_id",
+    "reviewed_at",
+    "game",
+    "candidate_type",
+    "weights_version",
+    "candidate_weights_json",
+    "candidate_weights_hash",
+    "decision",
+    "review_comment",
+    "sample_count",
+    "rolling_evaluation_count",
+    "top1_mean_match",
+    "top3_mean_match",
+    "best_candidate_top1_rate",
+    "best_candidate_top3_rate",
+    "current_comparison_json",
+    "reviewer",
+]
+
+
+def build_manual_review_row(weight_research, game, candidate_type, decision, review_comment="", reviewer=""):
+    if decision not in {"candidate_for_adoption", "hold", "rejected", "unreviewed"}:
+        decision = "unreviewed"
+    candidates = build_review_candidates(weight_research, game=game)
+    matched = candidates[candidates["candidate_type"] == candidate_type] if not candidates.empty else pd.DataFrame()
+    if matched.empty:
+        return None
+    row = matched.iloc[0].to_dict()
+    weights = _scenario_weights(weight_research.get("candidate_weights", pd.DataFrame()), candidate_type)
+    return {
+        "review_id": row.get("review_id", ""),
+        "reviewed_at": _now_text(),
+        "game": game,
+        "candidate_type": candidate_type,
+        "weights_version": BALANCE_WEIGHT_RESEARCH_VERSION,
+        "candidate_weights_json": _candidate_weights_json(weights),
+        "candidate_weights_hash": row.get("candidate_weights_hash", candidate_weights_hash(weights)),
+        "decision": decision,
+        "review_comment": str(review_comment or ""),
+        "sample_count": row.get("sample_count", 0),
+        "rolling_evaluation_count": row.get("rolling_evaluation_count", 0),
+        "top1_mean_match": row.get("top1_mean_match"),
+        "top3_mean_match": row.get("top3_mean_match"),
+        "best_candidate_top1_rate": row.get("best_candidate_top1_rate"),
+        "best_candidate_top3_rate": row.get("best_candidate_top3_rate"),
+        "current_comparison_json": row.get("current_comparison_json", "{}"),
+        "reviewer": str(reviewer or ""),
+    }
+
+
+def read_review_history(path):
+    target = Path(path)
+    if not target.exists():
+        return pd.DataFrame(columns=REVIEW_HISTORY_COLUMNS)
+    for encoding in ("utf-8-sig", "utf-8", "cp932"):
+        try:
+            df = pd.read_csv(target, encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        df = pd.read_csv(target)
+    for column in REVIEW_HISTORY_COLUMNS:
+        if column not in df:
+            df[column] = ""
+    return df[REVIEW_HISTORY_COLUMNS]
+
+
+def append_review_history(path, review_row):
+    if not review_row:
+        return False, "review row is empty"
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    history = read_review_history(target)
+    row_df = pd.DataFrame([{column: review_row.get(column, "") for column in REVIEW_HISTORY_COLUMNS}])
+    updated = pd.concat([history, row_df], ignore_index=True)
+    updated.to_csv(target, index=False, encoding="utf-8-sig")
+    return True, f"saved review history: {review_row.get('review_id', '')}"
+
+
+def build_review_export_package(weight_research, game, candidate_type):
+    if not isinstance(weight_research, dict):
+        weight_research = {}
+    candidate_weights_df = weight_research.get("candidate_weights", pd.DataFrame())
+    current_weights = _scenario_weights(candidate_weights_df, "current")
+    candidate_weights = _scenario_weights(candidate_weights_df, candidate_type)
+    differences = OrderedDict((key, _round(candidate_weights.get(key, 0.0) - current_weights.get(key, 0.0), 6)) for key in CURRENT_BALANCE_WEIGHTS)
+    review_candidates = build_review_candidates(weight_research, game=game)
+    review_row = review_candidates[review_candidates["candidate_type"] == candidate_type]
+    metadata = review_row.iloc[0].to_dict() if not review_row.empty else {}
+    per_draw = weight_research.get("per_draw_ranking_summary", pd.DataFrame())
+    per_draw = per_draw[per_draw["candidate_type"] == candidate_type] if per_draw is not None and not per_draw.empty and "candidate_type" in per_draw else pd.DataFrame()
+    rolling = weight_research.get("rolling_evaluation", pd.DataFrame())
+    rolling = rolling[rolling["candidate_type"] == candidate_type] if rolling is not None and not rolling.empty and "candidate_type" in rolling else pd.DataFrame()
+    return {
+        "game": game,
+        "candidate_type": candidate_type,
+        "generated_at": _now_text(),
+        "weights_version": BALANCE_WEIGHT_RESEARCH_VERSION,
+        "review_version": BALANCE_WEIGHT_REVIEW_VERSION,
+        "candidate_weights_hash": metadata.get("candidate_weights_hash", candidate_weights_hash(candidate_weights)),
+        "confidence": {
+            "sample_count": metadata.get("sample_count", 0),
+            "rolling_evaluation_count": metadata.get("rolling_evaluation_count", 0),
+            "decision": metadata.get("decision", "unreviewed"),
+        },
+        "current_weights": dict(current_weights),
+        "candidate_weights": dict(candidate_weights),
+        "differences": dict(differences),
+        "subscore_research": weight_research.get("subscore_research", pd.DataFrame()).to_dict(orient="records") if isinstance(weight_research.get("subscore_research"), pd.DataFrame) else [],
+        "per_draw_ranking_evaluation": per_draw.to_dict(orient="records"),
+        "rolling_evaluation": rolling.to_dict(orient="records"),
+        "current_comparison": json.loads(metadata.get("current_comparison_json", "{}")) if str(metadata.get("current_comparison_json", "")).strip() else {},
+        "ai_improvement_failure_analysis": weight_research.get("failure_research", pd.DataFrame()).to_dict(orient="records") if isinstance(weight_research.get("failure_research"), pd.DataFrame) else [],
+        "production_note": "research_export_only_no_production_apply",
+    }
+
+
+def review_export_json_bytes(package):
+    return json.dumps(package, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+def review_export_csv_bytes(package):
+    rows = []
+    for key in ("game", "candidate_type", "generated_at", "weights_version", "review_version", "candidate_weights_hash", "production_note"):
+        rows.append({"section": "metadata", "field": key, "value": package.get(key, "")})
+    for section in ("confidence", "current_weights", "candidate_weights", "differences", "current_comparison"):
+        values = package.get(section, {})
+        if isinstance(values, dict):
+            for key, value in values.items():
+                rows.append({"section": section, "field": key, "value": value})
+    for section in ("subscore_research", "per_draw_ranking_evaluation", "rolling_evaluation", "ai_improvement_failure_analysis"):
+        values = package.get(section, [])
+        for index, item in enumerate(values, start=1):
+            rows.append({"section": section, "field": f"row_{index}", "value": _stable_json(item)})
+    df = pd.DataFrame(rows, columns=["section", "field", "value"])
+    return ("\ufeff" + df.to_csv(index=False)).encode("utf-8")
+
+
 def build_balance_weight_research(reports, draw_size=6):
     current_weights = get_current_balance_weights()
     research = evaluate_subscore_research(reports)
     candidate_weights, candidate_summary = generate_candidate_weights(research)
     simulation = simulate_candidate_weights(reports, candidate_weights)
     failure_research = build_balance_failure_research(research, simulation)
-    return {
+    per_draw_ranking = build_per_draw_candidate_ranking(reports, candidate_weights)
+    per_draw_ranking_summary = build_per_draw_ranking_summary(per_draw_ranking)
+    ranking_stability = build_ranking_stability_summary(per_draw_ranking, per_draw_ranking_summary)
+    rolling_evaluation = build_rolling_weight_evaluation(reports)
+    result = {
         "current_weights": current_weights,
         "subscore_research": research,
         "candidate_weights": candidate_weights,
         "candidate_summary": candidate_summary,
         "simulation": simulation,
         "failure_research": failure_research,
+        "per_draw_ranking": per_draw_ranking,
+        "per_draw_ranking_summary": per_draw_ranking_summary,
+        "ranking_stability": ranking_stability,
+        "rolling_evaluation": rolling_evaluation,
         "metadata": pd.DataFrame(
             [
                 {
                     "weights_version": BALANCE_WEIGHT_RESEARCH_VERSION,
+                    "review_version": BALANCE_WEIGHT_REVIEW_VERSION,
                     "draw_size": draw_size,
                     "min_research_samples": MIN_WEIGHT_RESEARCH_SAMPLES,
                     "min_recommendation_samples": MIN_WEIGHT_RECOMMENDATION_SAMPLES,
@@ -656,4 +1342,9 @@ def build_balance_weight_research(reports, draw_size=6):
                 }
             ]
         ),
+    }
+    result["review_candidates"] = build_review_candidates(result)
+    result["production_checklist"] = build_production_readiness_checklist(result)
+    return {
+        **result,
     }

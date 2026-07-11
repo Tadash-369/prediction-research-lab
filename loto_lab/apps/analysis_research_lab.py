@@ -46,6 +46,7 @@ from arl_research_engine import (
     weighted_model_text,
 )
 from balance_weight_research import build_balance_weight_research
+from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value, run_maintenance
 
 
@@ -95,6 +96,16 @@ def render_balance_research_details(balance_stats, diagnostics, reports=None, dr
         st.dataframe(weight_research["simulation"], width="stretch", hide_index=True)
         st.markdown("**AI改善向け失敗分類**")
         st.dataframe(weight_research["failure_research"], width="stretch", hide_index=True)
+    render_balance_weight_research_ui(
+        reports,
+        draw_size=draw_size,
+        game="top",
+        review_history_path=None,
+        key_prefix=f"top_balance_weight_{draw_size}",
+        allow_review=False,
+        weight_research=weight_research,
+        show_core_tables=False,
+    )
 
 
 def balance_home_row(label, predictions, official, reports, draw_size, number_max):
