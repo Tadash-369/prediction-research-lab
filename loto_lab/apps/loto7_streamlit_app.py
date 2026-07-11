@@ -85,11 +85,13 @@ from arl_research_engine import (
     validate_purchase_numbers,
     weighted_model_text,
 )
+from balance_weight_research import build_balance_weight_research
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value
 
 
-def render_balance_research_details(balance_stats, diagnostics):
+def render_balance_research_details(balance_stats, diagnostics, reports=None, draw_size=7):
     st.caption("この結果は過去データ上の研究評価です。当選を保証するものではありません。")
+    st.caption("Ver1.9の候補重みは研究用の比較値です。本番重みには自動反映されません。")
     periods = balance_stats.get("periods", pd.DataFrame())
     if not periods.empty:
         st.markdown("**直近・長期比較**")
@@ -125,6 +127,20 @@ def render_balance_research_details(balance_stats, diagnostics):
     if diagnostics is not None and not diagnostics.empty:
         st.markdown("**検証漏れ診断（読み取り専用）**")
         st.dataframe(diagnostics, width="stretch", hide_index=True)
+    weight_research = build_balance_weight_research(reports, draw_size=draw_size)
+    with st.expander("バランス仮説 重み改善研究（読み取り専用）", expanded=False):
+        st.markdown("**現行研究用ウェイト**")
+        st.dataframe(weight_research["current_weights"], width="stretch", hide_index=True)
+        st.markdown("**サブスコア貢献度研究**")
+        st.dataframe(weight_research["subscore_research"], width="stretch", hide_index=True)
+        st.markdown("**改善候補ウェイト概要**")
+        st.dataframe(weight_research["candidate_summary"], width="stretch", hide_index=True)
+        st.markdown("**Conservative / Balanced / Experimental 候補重み**")
+        st.dataframe(weight_research["candidate_weights"], width="stretch", hide_index=True)
+        st.markdown("**候補重みシミュレーション**")
+        st.dataframe(weight_research["simulation"], width="stretch", hide_index=True)
+        st.markdown("**AI改善向け失敗分類**")
+        st.dataframe(weight_research["failure_research"], width="stretch", hide_index=True)
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -2330,7 +2346,7 @@ def render_lab():
                 else:
                     st.dataframe(unverified, width="stretch", hide_index=True)
                 diagnostics = build_balance_verification_diagnostics(predictions, official, reports, draw_size=7, number_max=37)
-                render_balance_research_details(balance_stats, diagnostics)
+                render_balance_research_details(balance_stats, diagnostics, reports=reports, draw_size=7)
             st.markdown("**モデル貢献度ランキング**")
             if ranking.empty:
                 st.info("貢献度ランキングは、的中数字の要因分析後に表示されます。")
