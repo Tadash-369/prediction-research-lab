@@ -33,9 +33,16 @@ Thumbs.db
 loto6_*_frames/
 loto7_*_frames/
 
+# Runtime settings
+loto_lab/runtime/model_settings.csv
+loto_lab/runtime/loto7_model_settings.csv
+loto_lab/runtime/*.tmp
+loto_lab/runtime/*.bak
+
 # Local data backups
 分析研究所/data/backups/
 loto_lab/data/backups/
 
 # Regeneratable lottery score outputs
 loto_lab/data/*_next_number_scores.csv
+loto_lab/data/model_settings.csv

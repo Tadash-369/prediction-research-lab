@@ -91,6 +91,7 @@ from balance_weight_research import build_balance_weight_research
 from balance_weight_adoption_ui import render_adoption_dry_run_ui
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value
+from runtime_settings import diagnose_runtime_setting, read_runtime_setting, save_runtime_setting
 
 
 def render_balance_research_details(balance_stats, diagnostics, reports=None, draw_size=7):
@@ -167,6 +168,8 @@ def render_balance_research_details(balance_stats, diagnostics, reports=None, dr
 
 
 BASE_DIR = LOTO_LAB_DIR
+RUNTIME_DIR = BASE_DIR / "runtime"
+CONFIG_TEMPLATE_DIR = BASE_DIR / "config_templates"
 RESULTS_CSV = DATA_DIR / "loto7.csv"
 SCORES_CSV = DATA_DIR / "loto7_next_number_scores.csv"
 PREDICTIONS_CSV = DATA_DIR / "loto7_predictions.csv"
@@ -181,7 +184,8 @@ WEIGHT_REVIEW_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_revie
 WEIGHT_APPROVAL_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_approval_history.csv"
 OFFICIAL_RESULTS_CSV = DATA_DIR / "loto7_results.csv"
 VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
-MODEL_SETTINGS_CSV = DATA_DIR / "loto7_model_settings.csv"
+MODEL_SETTINGS_CSV = RUNTIME_DIR / "loto7_model_settings.csv"
+MODEL_SETTINGS_TEMPLATE_CSV = CONFIG_TEMPLATE_DIR / "loto7_model_settings.template.csv"
 CONTRIBUTIONS_CSV = VERIFICATION_DIR / "loto7_model_contributions.csv"
 RESEARCH_CYCLES_CSV = VERIFICATION_DIR / "loto7_research_cycles.csv"
 VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
@@ -316,33 +320,29 @@ def model_key_from_name(model_name):
 
 
 def read_active_model_setting():
-    settings = read_csv(MODEL_SETTINGS_CSV, MODEL_SETTING_COLUMNS)
-    if settings.empty:
-        return None
-    active = settings[settings["設定名"] == "active_loto7_prediction"]
-    if active.empty:
-        return None
-    row = active.tail(1).iloc[0]
-    return {
-        "model_key": str(row["モデルキー"]),
-        "model_name": str(row["モデル名"]),
-        "reason": str(row["根拠"]),
-    }
+    setting, _ = read_runtime_setting(
+        MODEL_SETTINGS_CSV,
+        MODEL_SETTINGS_TEMPLATE_CSV,
+        MODEL_SETTING_COLUMNS,
+        "active_loto7_prediction",
+        MODEL_LABELS,
+    )
+    return setting
 
 
 def save_active_model_setting(model_key, reason):
     model_name = MODEL_LABELS.get(model_key, model_key)
-    settings = read_csv(MODEL_SETTINGS_CSV, MODEL_SETTING_COLUMNS)
-    settings = settings[settings["設定名"] != "active_loto7_prediction"] if not settings.empty else settings
-    row = {
-        "設定名": "active_loto7_prediction",
-        "モデルキー": model_key,
-        "モデル名": model_name,
-        "根拠": reason,
-        "更新日時": now_text(),
-    }
-    settings = pd.concat([settings, pd.DataFrame([row])], ignore_index=True)
-    save_csv(settings, MODEL_SETTINGS_CSV, MODEL_SETTING_COLUMNS)
+    return save_runtime_setting(
+        MODEL_SETTINGS_CSV,
+        MODEL_SETTINGS_TEMPLATE_CSV,
+        MODEL_SETTING_COLUMNS,
+        "active_loto7_prediction",
+        model_key,
+        model_name,
+        reason,
+        MODEL_LABELS,
+        now_text(),
+    )
 
 
 def to_int(value, default=0):
@@ -370,6 +370,38 @@ def app_light_smoke_mode():
         return False
 
 
+def runtime_setting_diagnostic():
+    return diagnose_runtime_setting(
+        MODEL_SETTINGS_CSV,
+        MODEL_SETTINGS_TEMPLATE_CSV,
+        MODEL_SETTING_COLUMNS,
+        "active_loto7_prediction",
+        MODEL_LABELS,
+        create=False,
+    )
+
+
+def render_runtime_setting_diagnostics(lottery_label="ロト7"):
+    with st.expander(f"{lottery_label} 実行時設定診断（読み取り専用）", expanded=False):
+        diagnostic = runtime_setting_diagnostic()
+        st.caption("この診断は読み取り専用です。表示しても実行時設定CSVや研究CSVは更新されません。")
+        st.write(f"保存先: {Path(diagnostic['path']).relative_to(BASE_DIR)}")
+        cols = st.columns(4)
+        cols[0].metric("状態", diagnostic.get("status", "-"))
+        cols[1].metric("runtime", "あり" if diagnostic.get("runtime_dir_exists") else "なし")
+        cols[2].metric("CSV", "あり" if diagnostic.get("runtime_file_exists") else "なし")
+        cols[3].metric("Git管理対象", diagnostic.get("git_managed", "いいえ"))
+        st.write(f"設定名: {diagnostic.get('setting_name', '-')}")
+        model_name = diagnostic.get("model_name") or "-"
+        model_key = diagnostic.get("model_key") or "-"
+        st.write(f"モデル: {model_name}（{model_key}）")
+        reason = diagnostic.get("reason") or "-"
+        st.caption(f"根拠: {reason}")
+        errors = diagnostic.get("errors") or []
+        if errors:
+            st.warning(" / ".join(map(str, errors)))
+
+
 def render_prediction_flow_diagnostics(lottery_key="loto7", lottery_label="ロト7"):
     with st.expander(f"{lottery_label} 保存・検証フロー診断（読み取り専用）", expanded=False):
         try:
@@ -387,6 +419,7 @@ def render_prediction_flow_diagnostics(lottery_key="loto7", lottery_label="ロ�
             return
         st.caption("この診断は読み取り専用です。表示しても loto7_predictions.csv や検証履歴CSVは更新されません。")
         st.dataframe(filtered, width="stretch", hide_index=True)
+    render_runtime_setting_diagnostics(lottery_label)
 
 
 def render_light_smoke_overview():
