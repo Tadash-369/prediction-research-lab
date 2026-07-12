@@ -49,12 +49,28 @@ from balance_weight_research import build_balance_weight_research
 from balance_weight_adoption_ui import render_adoption_overview
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value, run_maintenance
+from runtime_settings import diagnose_runtime_setting
 
 
 BASE_DIR = LOTO_LAB_DIR
 PURCHASES_CSV = DATA_DIR / "purchases.csv"
 WEIGHT_REVIEW_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_review_history.csv"
 WEIGHT_APPROVAL_HISTORY_CSV = DATA_DIR / "weight_research" / "balance_weight_approval_history.csv"
+RUNTIME_SETTING_COLUMNS = ["設定名", "モデルキー", "モデル名", "根拠", "更新日時"]
+RUNTIME_HEALTH_CONFIGS = [
+    {
+        "label": "ロト6",
+        "runtime": BASE_DIR / "runtime" / "model_settings.csv",
+        "template": BASE_DIR / "config_templates" / "model_settings.template.csv",
+        "setting_name": "active_next_prediction",
+    },
+    {
+        "label": "ロト7",
+        "runtime": BASE_DIR / "runtime" / "loto7_model_settings.csv",
+        "template": BASE_DIR / "config_templates" / "loto7_model_settings.template.csv",
+        "setting_name": "active_loto7_prediction",
+    },
+]
 
 
 def render_balance_research_details(balance_stats, diagnostics, reports=None, draw_size=6):
@@ -212,6 +228,7 @@ def app_light_smoke_mode():
 def render_light_smoke_overview():
     st.success("PRL_LIGHT_SMOKE=1: 分析研究所トップ軽量スモークモードで起動しています。")
     st.caption("重い集計や保守実行ボタンを避け、読み取り専用の基本診断だけを表示します。")
+    render_runtime_settings_health()
     diagnostics = collect_csv_safety_diagnostics()
     tab_summary, tab_diagnostics = st.tabs(["基本構造", "CSV安全診断"])
     with tab_summary:
@@ -315,6 +332,83 @@ def ai_weight_overview(label, lottery_type):
     }
 
 
+def _runtime_status_renderer(status):
+    if status == "healthy":
+        return st.success
+    if status in {"warning", "fallback"}:
+        return st.warning
+    if status == "missing":
+        return st.info
+    return st.error
+
+
+def render_runtime_health_card(config):
+    try:
+        diagnosis = diagnose_runtime_setting(
+            config["runtime"],
+            config["template"],
+            RUNTIME_SETTING_COLUMNS,
+            config["setting_name"],
+            LOTO_MODEL_LABELS,
+            create=False,
+        )
+    except Exception as exc:
+        st.error(f"{config['label']} runtime設定診断を読み込めませんでした。")
+        st.caption(str(exc))
+        return
+
+    status = diagnosis.get("status", "error")
+    status_label = diagnosis.get("status_label", "不明")
+    _runtime_status_renderer(status)(f"状態: {status_label}")
+    st.write(f"現在採用中のモデル: {diagnosis.get('model_name') or '-'}")
+    st.write(f"モデルキー: {diagnosis.get('model_key') or '-'}")
+    st.write(f"設定理由: {diagnosis.get('reason') or '-'}")
+    st.write(f"更新日時: {diagnosis.get('updated_at') or '未設定'}")
+    st.write(f"保存先: {diagnosis.get('display_path') or '-'}")
+
+    detail_cols = st.columns(3)
+    detail_cols[0].metric("runtime", "あり" if diagnosis.get("runtime_dir_exists") else "なし")
+    detail_cols[1].metric("設定CSV", "あり" if diagnosis.get("runtime_file_exists") else "なし")
+    detail_cols[2].metric("読込", "可能" if diagnosis.get("readable") else "不可")
+    st.write(f"必須列: {'正常' if diagnosis.get('required_columns_ok') else '不備'}")
+    st.write(f"テンプレート: {diagnosis.get('template_status_label', '不明')}")
+    st.write(f"Git管理: {diagnosis.get('git_managed', '判定不能')}")
+    if diagnosis.get("fallback_active"):
+        fallback_key = diagnosis.get("fallback_model_key") or "machine_learning"
+        fallback_name = LOTO_MODEL_LABELS.get(fallback_key, fallback_key)
+        if config["label"] == "ロト7":
+            fallback_text = f"あり（事前分析のbest_key、または{fallback_name} [{fallback_key}]）"
+        else:
+            fallback_text = f"あり（{fallback_name} [{fallback_key}]）"
+        st.warning(f"フォールバック: {fallback_text}")
+    else:
+        st.write("フォールバック: なし")
+
+    warnings = diagnosis.get("warnings") or []
+    errors = diagnosis.get("errors") or []
+    if warnings or errors:
+        with st.expander("診断詳細", expanded=False):
+            if warnings:
+                st.warning(" / ".join(map(str, warnings)))
+            if errors:
+                st.error(" / ".join(map(str, errors)))
+            safe_details = dict(diagnosis)
+            safe_details["path"] = diagnosis.get("display_path", "")
+            safe_details.pop("display_path", None)
+            st.json(safe_details)
+
+
+def render_runtime_settings_health():
+    st.markdown("**システム健全性**")
+    st.markdown("**実行時設定診断（読み取り専用）**")
+    st.caption("runtime設定・template・.gitignoreを読み取り、設定の健全性だけを確認します。診断によるファイル更新はありません。")
+    cols = st.columns(2)
+    for column, config in zip(cols, RUNTIME_HEALTH_CONFIGS):
+        with column:
+            st.markdown(f"**{config['label']} runtime設定**")
+            render_runtime_health_card(config)
+
+
 def purchase_summary_row(label, summary):
     return {
         "対象": label,
@@ -364,6 +458,8 @@ def render_home():
     cols[1].metric("ロト7 最新検証回", latest_round_text(loto7_reports))
     cols[2].metric("ドキュメント", len(docs))
     cols[3].metric("バックアップ", len(backups))
+
+    render_runtime_settings_health()
 
     summary = pd.DataFrame(
         [

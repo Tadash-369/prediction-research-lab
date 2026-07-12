@@ -597,7 +597,7 @@ def render_runtime_setting_diagnostics(lottery_label="ロト6"):
         st.caption("この診断は読み取り専用です。表示しても実行時設定CSVや研究CSVは更新されません。")
         st.write(f"保存先: {Path(diagnostic['path']).relative_to(BASE_DIR)}")
         cols = st.columns(4)
-        cols[0].metric("状態", diagnostic.get("status", "-"))
+        cols[0].metric("状態", diagnostic.get("status_label", diagnostic.get("status", "-")))
         cols[1].metric("runtime", "あり" if diagnostic.get("runtime_dir_exists") else "なし")
         cols[2].metric("CSV", "あり" if diagnostic.get("runtime_file_exists") else "なし")
         cols[3].metric("Git管理対象", diagnostic.get("git_managed", "いいえ"))
