@@ -34,6 +34,7 @@ from arl_research_engine import (
     RESEARCH_CYCLE_COLUMNS,
     TICKET_STRATEGY_COLUMNS,
     VIDEO_HYPOTHESIS_COLUMNS,
+    AI_IMPROVEMENT_NORMAL_MODEL_FALLBACK_TEXT,
     add_verification_metrics,
     ai_improvement_weight_rows,
     anti_popular_verification_fields,
@@ -76,6 +77,7 @@ from arl_research_engine import (
     format_contribution_detail,
     generate_anti_popular_expected_value_picks,
     generate_chamini6_god_mode_picks,
+    is_corrupted_model_name,
     load_winning_condition_history,
     merge_contribution_rows,
     merge_research_cycle_rows,
@@ -214,6 +216,7 @@ AI_SCORE_DISPLAY_COLUMNS = [
     "AI改善理由",
 ]
 PREDICTION_COLUMNS = ["予想ID", "開催回", "予想日", "候補番号", "予想番号", "使用モデル", "予想理由", "保存日時", *BALANCE_PREDICTION_COLUMNS]
+PREDICTION_SAVE_TEXT_GUARD_COLUMNS = ["使用モデル", "予想理由"]
 OFFICIAL_RESULT_COLUMNS = ["開催回", "抽せん日", "本数字", "ボーナス数字", "登録元", "保存日時"]
 VERIFICATION_COLUMNS = [
     "検証キー",
@@ -417,6 +420,37 @@ def verification_key(prediction_id, model_name, candidate_no):
 
 def numbers_to_text(numbers):
     return "-".join(f"{int(number):02d}" for number in sorted(numbers))
+
+
+def text_has_suspect_question_mark(value):
+    if value is None:
+        return False
+    try:
+        if pd.isna(value) == True:
+            return False
+    except Exception:
+        pass
+    return "?" in str(value)
+
+
+def find_prediction_save_text_issues(rows):
+    issues = []
+    for row_index, row in enumerate(rows, start=1):
+        candidate_no = row.get("候補番号", row_index)
+        prediction_id = row.get("予想ID", "-")
+        for column in PREDICTION_SAVE_TEXT_GUARD_COLUMNS:
+            value = row.get(column, "")
+            if column == "使用モデル":
+                has_issue = is_corrupted_model_name(value)
+            else:
+                has_issue = text_has_suspect_question_mark(value)
+            if not has_issue:
+                continue
+            preview = str(value).replace("\n", " ")[:80]
+            issues.append(
+                f"候補{candidate_no} / {column} / {prediction_id}: 破損疑い文字 '?' を検出しました（{preview}）"
+            )
+    return issues
 
 
 def parse_number_text(value):
@@ -1277,10 +1311,16 @@ def generate_ai_weighted_prediction_picks(score_df, results, weight_summary, dra
     if score_df.empty or results.empty:
         return []
     weighted_df = apply_ai_improvement_weights(score_df, weight_summary)
-    if weighted_df.empty or not (weight_summary or {}).get("available"):
+    valid_model_weights = {
+        key: weight
+        for key, weight in ((weight_summary or {}).get("model_weights", {}) or {}).items()
+        if not is_corrupted_model_name(key)
+    }
+    if weighted_df.empty or not (weight_summary or {}).get("available") or not valid_model_weights:
+        fallback_reason = (weight_summary or {}).get("fallback_reason") or AI_IMPROVEMENT_NORMAL_MODEL_FALLBACK_TEXT
         picks = generate_next_score_prediction_picks(score_df, results, draw_size, pick_count)
         for pick in picks:
-            pick["reason"] = "AI改善履歴が不足しているため、通常の候補スコア活用予測にフォールバックしています。" + pick["reason"]
+            pick["reason"] = f"{fallback_reason}。通常の候補スコア活用予測にフォールバックしています。" + pick["reason"]
         return picks
 
     weighted_df = weighted_df.copy().sort_values(["AI改善後スコア", "総合スコア", "数字"], ascending=[False, False, True]).reset_index(drop=True)
@@ -1548,12 +1588,17 @@ def save_prediction_picks(picks, target_round, model_key, model_name):
         }
         row.update(balance_prediction_fields_from_pick(pick))
         rows.append(row)
+    corruption_issues = find_prediction_save_text_issues(rows)
+    if corruption_issues:
+        errors.append("予想理由または使用モデルに破損疑い文字があるため、今回の予測保存を中止しました。CSVには書き込んでいません。")
+        errors.extend(corruption_issues)
+        return {"saved": 0, "skipped": skipped, "errors": errors, "blocked": True, "corruption_issues": corruption_issues}
     if rows:
         predictions = pd.concat([predictions, pd.DataFrame(rows)], ignore_index=True)
         predictions["開催回"] = predictions["開催回"].map(to_int)
         predictions["候補番号"] = predictions["候補番号"].map(to_int)
         save_csv(predictions.sort_values(["開催回", "候補番号", "使用モデル", "保存日時"]), PREDICTIONS_CSV, PREDICTION_COLUMNS)
-    return {"saved": len(rows), "skipped": skipped, "errors": errors}
+    return {"saved": len(rows), "skipped": skipped, "errors": errors, "blocked": False, "corruption_issues": []}
 
 
 def render_next_score_prediction(score_df, results, target_round):
@@ -1592,6 +1637,20 @@ def render_ai_improvement_weight_summary(weight_summary):
     st.write(f"直近の改善仮説: {hypothesis}")
     if not (weight_summary or {}).get("available"):
         st.info("AI改善重みが十分でないため、AI改善反映予測は通常の候補スコア活用予測にフォールバックします。")
+    with st.expander("AI改善履歴のモデル名健全性（読み取り専用）", expanded=False):
+        health = (weight_summary or {}).get("model_name_health", {}) or {}
+        health_cols = st.columns(5)
+        health_cols[0].metric("読み込み", int(health.get("loaded_model_names", 0) or 0))
+        health_cols[1].metric("有効", int(health.get("valid_model_names", 0) or 0))
+        health_cols[2].metric("欠損", int(health.get("missing_model_names", 0) or 0))
+        health_cols[3].metric("破損疑い", int(health.get("corrupted_model_names", 0) or 0))
+        health_cols[4].metric("フォールバック", "あり" if (weight_summary or {}).get("fallback_active") else "なし")
+        examples = list(health.get("corrupted_examples", []) or [])[:3]
+        if examples:
+            st.caption("代表例（最大3件）: " + " / ".join(map(str, examples)))
+        fallback_reason = str((weight_summary or {}).get("fallback_reason", "") or "")
+        if fallback_reason:
+            st.caption(f"フォールバック理由: {fallback_reason}")
 
 
 def render_ai_weighted_prediction(score_df, results, target_round, weight_summary):

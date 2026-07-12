@@ -33,6 +33,10 @@ ANTI_POPULAR_EXPECTED_VALUE_KEY = "anti_popular_expected_value"
 ANTI_POPULAR_EXPECTED_VALUE_LABEL = "人と被りにくい期待値最大化モデル"
 CHAMINI6_GOD_MODE_KEY = CHAMINI_SP_GOD_MODE_KEY
 CHAMINI6_GOD_MODE_LABEL = CHAMINI_SP_GOD_MODE_LABEL
+MODEL_NAME_STATUS_VALID = "valid"
+MODEL_NAME_STATUS_MISSING = "missing"
+MODEL_NAME_STATUS_CORRUPTED = "corrupted"
+AI_IMPROVEMENT_NORMAL_MODEL_FALLBACK_TEXT = "AI改善履歴に利用可能な正常モデル名がないため、通常予測を使用"
 
 LOTO_MODEL_LABELS = OrderedDict(
     [
@@ -2144,12 +2148,80 @@ def load_winning_condition_history(history_dir, lottery_type=None):
     return main_df, model_df
 
 
-def canonical_model_from_name(model_name):
+def classify_model_name_integrity(model_name):
+    if model_name is None:
+        return {"status": MODEL_NAME_STATUS_MISSING, "text": "", "reason": "empty"}
+    try:
+        if pd.isna(model_name) == True:
+            return {"status": MODEL_NAME_STATUS_MISSING, "text": "", "reason": "empty"}
+    except Exception:
+        pass
     text = str(model_name or "").strip()
     if not text or text.lower() in {"nan", "none", "-"}:
+        return {"status": MODEL_NAME_STATUS_MISSING, "text": "", "reason": "empty"}
+    if "?" in text:
+        return {"status": MODEL_NAME_STATUS_CORRUPTED, "text": text, "reason": "contains_question_mark"}
+    return {"status": MODEL_NAME_STATUS_VALID, "text": text, "reason": ""}
+
+
+def is_corrupted_model_name(model_name):
+    return classify_model_name_integrity(model_name)["status"] == MODEL_NAME_STATUS_CORRUPTED
+
+
+def empty_model_name_health():
+    return {
+        "loaded_model_names": 0,
+        "valid_model_names": 0,
+        "missing_model_names": 0,
+        "corrupted_model_names": 0,
+        "corrupted_examples": [],
+    }
+
+
+def record_model_name_health(health, model_name):
+    status = classify_model_name_integrity(model_name)
+    if status["status"] == MODEL_NAME_STATUS_VALID:
+        health["loaded_model_names"] += 1
+        health["valid_model_names"] += 1
+    elif status["status"] == MODEL_NAME_STATUS_CORRUPTED:
+        health["loaded_model_names"] += 1
+        health["corrupted_model_names"] += 1
+        example = status["text"]
+        if example and example not in health["corrupted_examples"] and len(health["corrupted_examples"]) < 3:
+            health["corrupted_examples"].append(example)
+    else:
+        health["missing_model_names"] += 1
+    return status
+
+
+def collect_model_name_health(history, model_history=None):
+    health = empty_model_name_health()
+    for column in ("useful_models", "weak_models", "weight_up_models", "weight_down_models"):
+        if history is None or history.empty or column not in history:
+            continue
+        for value in history[column].tolist():
+            names = split_model_names(value)
+            if not names:
+                record_model_name_health(health, value)
+                continue
+            for name in names:
+                record_model_name_health(health, name)
+    if model_history is not None and not model_history.empty and "model_name" in model_history:
+        for value in model_history["model_name"].tolist():
+            record_model_name_health(health, value)
+    return health
+
+
+def canonical_model_from_name(model_name):
+    integrity = classify_model_name_integrity(model_name)
+    if integrity["status"] != MODEL_NAME_STATUS_VALID:
         return None, ""
+    text = integrity["text"]
     if text.startswith("custom:"):
-        return text, text.split("custom:", 1)[1]
+        custom_name = text.split("custom:", 1)[1].strip()
+        if classify_model_name_integrity(custom_name)["status"] != MODEL_NAME_STATUS_VALID:
+            return None, ""
+        return f"custom:{custom_name}", custom_name
     key = canonical_model_key(text)
     if key in ARL_MODEL_LABELS:
         return key, model_label(key)
@@ -2191,7 +2263,7 @@ def model_counter_from_column(df, column):
     counter = Counter()
     if df is None or df.empty or column not in df:
         return counter
-    for value in df[column].fillna("").tolist():
+    for value in df[column].tolist():
         for name in split_model_names(value):
             key, _ = canonical_model_from_name(name)
             if key:
@@ -2272,6 +2344,9 @@ def build_ai_improvement_weight_summary(history_dir, lottery_type=None):
             "latest_created_at": "-",
             "latest_hypothesis": "-",
             "model_weights": {},
+            "model_name_health": empty_model_name_health(),
+            "fallback_active": True,
+            "fallback_reason": "AI改善履歴を読み込めませんでした。",
             "recent5_weight_up": Counter(),
             "recent10_weight_up": Counter(),
             "recent5_weight_down": Counter(),
@@ -2286,6 +2361,12 @@ def build_ai_improvement_weight_summary(history_dir, lottery_type=None):
     history = sorted_improvement_history(history)
     recent5 = history.tail(5)
     recent10 = history.tail(10)
+    model_name_health = collect_model_name_health(history, model_history)
+    if model_name_health["corrupted_model_names"]:
+        warnings.append(
+            f"AI改善履歴に破損疑いのモデル名が{model_name_health['corrupted_model_names']}件あります。"
+            "該当モデルは重み計算から除外します。"
+        )
 
     recent5_weight_up = model_counter_from_column(recent5, "weight_up_models")
     recent10_weight_up = model_counter_from_column(recent10, "weight_up_models")
@@ -2326,8 +2407,15 @@ def build_ai_improvement_weight_summary(history_dir, lottery_type=None):
     model_weights = {
         key: round(clamp_float(score, -0.28, 0.28), 4)
         for key, score in weight_scores.items()
-        if abs(score) >= 0.005
+        if abs(score) >= 0.005 and not is_corrupted_model_name(key)
     }
+    fallback_active = not bool(model_weights)
+    fallback_reason = ""
+    if fallback_active:
+        fallback_reason = AI_IMPROVEMENT_NORMAL_MODEL_FALLBACK_TEXT
+        if history.empty and model_history.empty:
+            fallback_reason = "AI改善履歴がまだないため、通常予測を使用"
+        warnings.append(fallback_reason)
     if history.empty:
         latest = {}
     else:
@@ -2342,6 +2430,9 @@ def build_ai_improvement_weight_summary(history_dir, lottery_type=None):
         "latest_created_at": latest.get("created_at", "-") if latest else "-",
         "latest_hypothesis": latest.get("next_hypothesis", "-") if latest else "-",
         "model_weights": model_weights,
+        "model_name_health": model_name_health,
+        "fallback_active": fallback_active,
+        "fallback_reason": fallback_reason,
         "recent5_weight_up": recent5_weight_up,
         "recent10_weight_up": recent10_weight_up,
         "recent5_weight_down": recent5_weight_down,
@@ -2386,9 +2477,13 @@ def weighted_model_text(model_weights, positive=True, limit=5):
         return "-"
     parts = []
     for key, weight in items:
+        if is_corrupted_model_name(key):
+            continue
         _, label = canonical_model_from_name(key)
+        if is_corrupted_model_name(label):
+            continue
         parts.append(f"{label or model_label(key)}({weight:+.3f})")
-    return " / ".join(parts)
+    return " / ".join(parts) if parts else AI_IMPROVEMENT_NORMAL_MODEL_FALLBACK_TEXT
 
 
 def score_row_model_adjustment(row, model_key, model_weight):
@@ -2411,7 +2506,11 @@ def apply_ai_improvement_weights(score_df, weight_summary):
     weighted = score_df.copy()
     if "総合スコア" not in weighted.columns:
         weighted["総合スコア"] = pd.to_numeric(weighted.get("スコア", 0), errors="coerce").fillna(0)
-    model_weights = (weight_summary or {}).get("model_weights", {})
+    model_weights = {
+        key: weight
+        for key, weight in ((weight_summary or {}).get("model_weights", {}) or {}).items()
+        if not is_corrupted_model_name(key)
+    }
     if not model_weights:
         weighted["AI改善加点"] = 0.0
         weighted["AI改善後スコア"] = pd.to_numeric(weighted["総合スコア"], errors="coerce").fillna(0).round(3)
