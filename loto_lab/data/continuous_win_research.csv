@@ -1,0 +1,4 @@
+﻿prediction_date,target_draw,lottery_type,numbers,ticket_role,adopted_models,prediction_score,low_popularity_score,actual_numbers,bonus_numbers,matched_count,bonus_matched_count,missed_numbers,hit_numbers,expected_value,failure_reason,improvement_plan,next_hypothesis,created_at
+2026/07/11,2119,loto6,06-08-21-27-35-36,本命・安定型,ベイズ推定 / 機械学習モデル / マルコフ連鎖 / 出現頻度分析,83.562,88.587,,,,,,,0.884,結果待ち,抽選結果登録後に自動検証,本命・安定型の重みと低人気条件を次回も検証,2026/07/11 22:37:24
+2026/07/11,2119,loto6,05-06-21-27-36-42,直近トレンド型,ベイズ推定 / マルコフ連鎖 / 機械学習モデル / 出現頻度分析,83.34,86.133,,,,,,,0.823,結果待ち,抽選結果登録後に自動検証,直近トレンド型の重みと低人気条件を次回も検証,2026/07/11 22:37:24
+2026/07/11,2119,loto6,05-06-21-24-36-43,高額当選狙い・低人気型,マルコフ連鎖 / ベイズ推定 / 機械学習モデル / 出現頻度分析,82.853,86.787,,,,,,,0.794,結果待ち,抽選結果登録後に自動検証,高額当選狙い・低人気型の重みと低人気条件を次回も検証,2026/07/11 22:37:24

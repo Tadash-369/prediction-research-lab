@@ -1,0 +1,4 @@
+﻿lottery_type,target_draw,prediction_date,ticket_no,numbers,low_popularity_score,birthday_bias_score,consecutive_score,regularity_score,last_digit_score,sum_balance_score,past_similarity_score,visual_neatness_score,risk_level,created_at
+loto6,2119,2026/07/11,1,06-08-21-27-35-36,88.587,74.667,100.0,100.0,100.0,100.0,54.0,100.0,低,2026/07/11 22:37:24
+loto6,2119,2026/07/11,2,05-06-21-27-36-42,86.133,74.667,100.0,100.0,100.0,100.0,38.667,100.0,低,2026/07/11 22:37:24
+loto6,2119,2026/07/11,3,05-06-21-24-36-43,86.787,74.667,100.0,88.0,100.0,100.0,54.0,100.0,低,2026/07/11 22:37:24
