@@ -100,9 +100,11 @@ from runtime_settings import (
     fallback_cause_code_from_diagnosis,
     read_runtime_setting,
     record_fallback_event,
+    resolve_fallback_events,
     runtime_state_token_from_diagnosis,
     save_runtime_setting,
     select_prediction_model,
+    should_auto_resolve_fallback,
 )
 
 
@@ -625,6 +627,21 @@ def record_prediction_fallback(diagnosis, decision, target_round):
         )
     except Exception as exc:
         return {"success": False, "recorded": False, "duplicate_suppressed": False, "errors": [str(exc)]}
+
+
+def resolve_prediction_fallback(decision, target_round):
+    try:
+        return resolve_fallback_events(
+            FALLBACK_EVENTS_CSV,
+            game="loto6",
+            occurrence_location="loto6_prediction_generation",
+            adopted_model_key=decision["selected_model_key"],
+            adopted_model_name=decision["selected_model_name"],
+            resolution_source="runtime_prediction_generation",
+            target_round=target_round,
+        )
+    except Exception as exc:
+        return {"success": False, "resolved": False, "resolved_count": 0, "errors": [str(exc)]}
 
 
 def render_runtime_setting_diagnostics(lottery_label="ロト6"):
@@ -2613,6 +2630,15 @@ def render_prediction_picks(scores, results, target_round):
         st.warning(f"runtime設定を利用できなかったため、{active_model_name}へ安全に切り替えました。")
         if not audit_result.get("success"):
             st.caption("Fallback監査ログを保存できませんでしたが、予想処理は継続しています。")
+    elif should_auto_resolve_fallback(model_decision, active_model_key):
+        recovery_result = resolve_prediction_fallback(model_decision, target_round)
+        if recovery_result.get("resolved_count", 0):
+            st.success(
+                f"runtime設定が正常に復旧し、{active_model_name}を標準買い目生成に再採用しました。"
+                f"未復旧fallbackイベント{recovery_result['resolved_count']}件を自動復旧済みに更新しました。"
+            )
+        elif not recovery_result.get("success"):
+            st.warning("Fallbackイベントの復旧更新に失敗しましたが、予想処理は継続しています。")
 
     if best_model_key and not pre_summary.empty:
         best_row = pre_summary[pre_summary["モデル"] == BACKTEST_MODELS[best_model_key]].iloc[0]

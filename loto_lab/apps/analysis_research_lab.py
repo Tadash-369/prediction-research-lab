@@ -51,9 +51,11 @@ from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value, run_maintenance
 from runtime_settings import (
     diagnose_fallback_events,
+    diagnose_fallback_lifecycle,
     diagnose_runtime_setting,
     diagnose_runtime_setting_history,
     read_fallback_events,
+    read_fallback_lifecycle,
     read_runtime_setting_history,
 )
 
@@ -495,6 +497,61 @@ def render_fallback_event_audit(config):
         st.error(" / ".join(map(str, errors)))
 
 
+def render_fallback_recovery_lifecycle(config):
+    diagnosis = diagnose_fallback_lifecycle(config["fallback_events"])
+    lifecycle = read_fallback_lifecycle(config["fallback_events"], game=config["game"], limit=10)
+    status = diagnosis.get("status", "error")
+    status_label = diagnosis.get("status_label", "不明")
+    if status in {"healthy", "missing"}:
+        st.success("Fallback lifecycleイベントはありません。" if status == "missing" else f"Lifecycle状態: {status_label}")
+    elif status == "critical":
+        st.error(f"Lifecycle状態: {status_label}")
+    elif status == "warning":
+        st.warning(f"Lifecycle状態: {status_label}")
+    else:
+        st.error(f"Lifecycle状態: {status_label}")
+
+    summary = st.columns(4)
+    summary[0].metric("未復旧", diagnosis.get("unresolved_count", 0))
+    summary[1].metric("自動復旧", diagnosis.get("auto_resolved_count", 0))
+    summary[2].metric("平均復旧時間", f"{diagnosis['average_recovery_hours']}時間" if diagnosis.get("average_recovery_hours") is not None else "-")
+    summary[3].metric("最大復旧時間", f"{diagnosis['max_recovery_hours']}時間" if diagnosis.get("max_recovery_hours") is not None else "-")
+    duration = st.columns(4)
+    duration[0].metric("最古未復旧", f"{diagnosis['oldest_unresolved_hours']}時間" if diagnosis.get("oldest_unresolved_hours") is not None else "-")
+    duration[1].metric("24時間以上", diagnosis.get("attention_24h_count", 0))
+    duration[2].metric("72時間以上", diagnosis.get("warning_72h_count", 0))
+    duration[3].metric("168時間以上", diagnosis.get("critical_168h_count", 0))
+    st.write(f"直近復旧日時: {diagnosis.get('latest_recovery_at') or '-'}")
+    st.caption(f"再発回数: {diagnosis.get('recurrence_definition')}")
+
+    cause_summary = diagnosis.get("cause_summary")
+    if isinstance(cause_summary, pd.DataFrame) and not cause_summary.empty:
+        st.markdown("**原因別再発分析**")
+        st.dataframe(cause_summary, width="stretch", hide_index=True)
+    if not lifecycle.empty:
+        with st.expander("最新10件のFallback lifecycle", expanded=False):
+            display_columns = [
+                "イベントID",
+                "発生日時",
+                "復旧状態",
+                "復旧日時",
+                "復旧時間（時間）",
+                "継続時間（時間）",
+                "未復旧レベル",
+                "原因コード",
+                "代替モデル名",
+                "対象開催回",
+            ]
+            st.dataframe(lifecycle.reindex(columns=display_columns), width="stretch", hide_index=True)
+
+    warnings = diagnosis.get("warnings") or []
+    errors = diagnosis.get("errors") or []
+    if warnings:
+        st.warning(" / ".join(map(str, warnings)))
+    if errors:
+        st.error(" / ".join(map(str, errors)))
+
+
 def render_runtime_settings_health():
     st.markdown("**システム健全性**")
     st.markdown("**実行時設定診断（読み取り専用）**")
@@ -516,6 +573,12 @@ def render_runtime_settings_health():
     for tab, config in zip(fallback_tabs, RUNTIME_HEALTH_CONFIGS):
         with tab:
             render_fallback_event_audit(config)
+
+    st.markdown("**Fallback Recovery Lifecycle（読み取り専用）**")
+    lifecycle_tabs = st.tabs([config["label"] for config in RUNTIME_HEALTH_CONFIGS])
+    for tab, config in zip(lifecycle_tabs, RUNTIME_HEALTH_CONFIGS):
+        with tab:
+            render_fallback_recovery_lifecycle(config)
 
 
 def purchase_summary_row(label, summary):

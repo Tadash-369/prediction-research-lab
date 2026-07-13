@@ -87,6 +87,11 @@ FALLBACK_METHODS = {
     "other",
 }
 FALLBACK_RECOVERY_STATES = {"unresolved", "resolved", "auto_resolved", "ignored"}
+FALLBACK_LIFECYCLE_THRESHOLDS_HOURS = {
+    "attention": 24,
+    "warning": 72,
+    "critical": 168,
+}
 RUNTIME_DIAGNOSIS_STATUS_LABELS = {
     "healthy": "正常",
     "warning": "注意",
@@ -105,6 +110,14 @@ RUNTIME_HISTORY_STATUS_LABELS = {
 FALLBACK_EVENT_STATUS_LABELS = {
     "healthy": "正常",
     "warning": "注意",
+    "missing": "イベントなし",
+    "corrupted": "破損",
+    "error": "読込エラー",
+}
+FALLBACK_LIFECYCLE_STATUS_LABELS = {
+    "healthy": "正常",
+    "warning": "注意",
+    "critical": "重大",
     "missing": "イベントなし",
     "corrupted": "破損",
     "error": "読込エラー",
@@ -896,6 +909,13 @@ def _write_fallback_events_atomic(events, path):
         ids = check["イベントID"].map(_clean_runtime_value)
         if ids.eq("").any() or ids.duplicated().any():
             raise ValueError("FallbackイベントIDが空、または重複しています。")
+        recovery_states = check["復旧状態"].map(_clean_runtime_value)
+        if (~recovery_states.isin(FALLBACK_RECOVERY_STATES)).any():
+            raise ValueError("Fallbackイベントに不正な復旧状態があります。")
+        recovery_times = check["復旧日時"].map(_clean_runtime_value)
+        recovered = recovery_states.isin({"resolved", "auto_resolved"})
+        if (recovered & recovery_times.eq("")).any():
+            raise ValueError("復旧済みイベントに復旧日時がありません。")
         if len(check) != len(output):
             raise ValueError("FallbackイベントCSVの行数検証に失敗しました。")
         tmp_path.replace(path)
@@ -1123,6 +1143,318 @@ def diagnose_fallback_events(events_csv, stale_hours=24):
         diagnostic["warnings"].append("モデル名に破損疑い文字 '?' を含むイベントがあります。")
     if diagnostic["stale_unresolved_count"]:
         diagnostic["warnings"].append("24時間を超える未復旧イベントがあります。")
+    return diagnostic
+
+
+def should_auto_resolve_fallback(model_decision, actual_model_key=None):
+    decision = model_decision or {}
+    selected_key = _clean_runtime_value(decision.get("selected_model_key"))
+    actual_key = _clean_runtime_value(actual_model_key) if actual_model_key is not None else selected_key
+    return bool(
+        decision.get("runtime_usable")
+        and not decision.get("fallback_active")
+        and decision.get("selection_source") == "runtime"
+        and selected_key
+        and actual_key == selected_key
+    )
+
+
+def _fallback_now(now=None):
+    value = pd.to_datetime(now, errors="coerce") if now is not None else pd.Timestamp.now()
+    return pd.Timestamp.now() if pd.isna(value) else value
+
+
+def _join_fallback_note(existing_note, new_note):
+    existing_note = _clean_runtime_value(existing_note)
+    new_note = _clean_runtime_value(new_note)
+    if not existing_note:
+        return new_note
+    if not new_note or new_note in existing_note:
+        return existing_note
+    return f"{existing_note} | {new_note}"
+
+
+def resolve_fallback_events(
+    events_csv,
+    game,
+    occurrence_location,
+    adopted_model_key,
+    adopted_model_name,
+    resolution_source="runtime_prediction_generation",
+    target_round=None,
+    now=None,
+):
+    result = {
+        "success": False,
+        "resolved": False,
+        "resolved_count": 0,
+        "resolved_event_ids": [],
+        "resolution_time": "",
+        "warnings": [],
+        "errors": [],
+    }
+    game = _clean_runtime_value(game)
+    occurrence_location = _clean_runtime_value(occurrence_location)
+    adopted_model_key = _clean_runtime_value(adopted_model_key)
+    adopted_model_name = _clean_runtime_value(adopted_model_name)
+    if game not in RUNTIME_HISTORY_GAMES:
+        result["errors"].append("ゲーム名が不正です。")
+        return result
+    if occurrence_location not in FALLBACK_OCCURRENCE_LOCATIONS:
+        result["errors"].append("発生箇所が不正です。")
+        return result
+    if not adopted_model_key or not adopted_model_name or "?" in adopted_model_name:
+        result["errors"].append("採用モデルが空、または破損しています。")
+        return result
+
+    path = Path(events_csv)
+    if not path.exists():
+        result["success"] = True
+        return result
+    try:
+        events = _read_fallback_event_csv(path)
+        missing = _missing_columns(events, FALLBACK_EVENT_COLUMNS)
+        if missing:
+            raise ValueError("既存FallbackイベントCSVの不足列: " + ", ".join(missing))
+        events = events.reindex(columns=FALLBACK_EVENT_COLUMNS).copy()
+        for column in FALLBACK_EVENT_COLUMNS:
+            events[column] = events[column].astype("object")
+        states = events["復旧状態"].map(_clean_runtime_value)
+        target = (
+            events["ゲーム"].map(_clean_runtime_value).eq(game)
+            & events["発生箇所"].map(_clean_runtime_value).eq(occurrence_location)
+            & states.eq("unresolved")
+        )
+        if not target.any():
+            result["success"] = True
+            return result
+
+        resolution_dt = _fallback_now(now)
+        resolution_text = resolution_dt.strftime("%Y/%m/%d %H:%M:%S")
+        source = _clean_runtime_value(resolution_source) or "runtime_prediction_generation"
+        round_text = _clean_runtime_value(target_round)
+        note = f"正常runtime設定 {adopted_model_key} / {adopted_model_name}を標準買い目生成で採用し復旧"
+        note += f"（復旧元: {source}"
+        if round_text:
+            note += f"、対象開催回: {round_text}"
+        note += "）"
+        resolved_ids = events.loc[target, "イベントID"].map(_clean_runtime_value).tolist()
+        events.loc[target, "復旧状態"] = "auto_resolved"
+        events.loc[target, "復旧日時"] = resolution_text
+        events.loc[target, "備考"] = events.loc[target, "備考"].map(lambda value: _join_fallback_note(value, note))
+        _write_fallback_events_atomic(events, path)
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        return result
+    result.update(
+        success=True,
+        resolved=True,
+        resolved_count=len(resolved_ids),
+        resolved_event_ids=resolved_ids,
+        resolution_time=resolution_text,
+    )
+    return result
+
+
+def _fallback_lifecycle_frame(events, now=None):
+    frame = events.reindex(columns=FALLBACK_EVENT_COLUMNS).copy()
+    if frame.empty:
+        for column in ("復旧時間（分）", "復旧時間（時間）", "継続時間（時間）", "継続日数", "未復旧レベル"):
+            frame[column] = pd.Series(dtype="object")
+        return frame
+    current = _fallback_now(now)
+    occurred = pd.to_datetime(frame["発生日時"], errors="coerce")
+    recovered_at = pd.to_datetime(frame["復旧日時"], errors="coerce")
+    states = frame["復旧状態"].map(_clean_runtime_value)
+    recovered = states.isin({"resolved", "auto_resolved"})
+    unresolved = states.eq("unresolved")
+    recovery_minutes = (recovered_at - occurred).dt.total_seconds() / 60.0
+    recovery_minutes = recovery_minutes.where(recovered & recovery_minutes.ge(0))
+    continuing_hours = ((current - occurred).dt.total_seconds() / 3600.0).clip(lower=0)
+    continuing_hours = continuing_hours.where(unresolved)
+    frame["復旧時間（分）"] = recovery_minutes.round(1)
+    frame["復旧時間（時間）"] = (recovery_minutes / 60.0).round(2)
+    frame["継続時間（時間）"] = continuing_hours.round(2)
+    frame["継続日数"] = (continuing_hours / 24.0).round(2)
+
+    def unresolved_level(hours):
+        if pd.isna(hours):
+            return ""
+        if hours >= FALLBACK_LIFECYCLE_THRESHOLDS_HOURS["critical"]:
+            return "critical"
+        if hours >= FALLBACK_LIFECYCLE_THRESHOLDS_HOURS["warning"]:
+            return "warning"
+        if hours >= FALLBACK_LIFECYCLE_THRESHOLDS_HOURS["attention"]:
+            return "attention"
+        return "normal"
+
+    frame["未復旧レベル"] = frame["継続時間（時間）"].map(unresolved_level)
+    return frame
+
+
+def read_fallback_lifecycle(events_csv, game=None, limit=None, now=None):
+    events = read_fallback_events(events_csv, game=game)
+    lifecycle = _fallback_lifecycle_frame(events, now=now)
+    if limit is not None:
+        try:
+            lifecycle = lifecycle.head(max(0, int(limit)))
+        except (TypeError, ValueError):
+            pass
+    return lifecycle.reset_index(drop=True)
+
+
+def build_fallback_cause_summary(events, now=None):
+    lifecycle = _fallback_lifecycle_frame(events, now=now)
+    columns = [
+        "原因コード",
+        "総発生件数",
+        "再発回数",
+        "未復旧件数",
+        "復旧件数",
+        "平均復旧時間",
+        "最大復旧時間",
+        "直近発生日時",
+        "直近復旧日時",
+    ]
+    if lifecycle.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for cause_code, group in lifecycle.groupby(lifecycle["原因コード"].map(_clean_runtime_value), dropna=False):
+        states = group["復旧状態"].map(_clean_runtime_value)
+        recovery_hours = pd.to_numeric(group["復旧時間（時間）"], errors="coerce").dropna()
+        occurred = pd.to_datetime(group["発生日時"], errors="coerce").dropna()
+        recovered_at = pd.to_datetime(group["復旧日時"], errors="coerce").dropna()
+        rows.append(
+            {
+                "原因コード": cause_code or "unknown_runtime_error",
+                "総発生件数": int(len(group)),
+                "再発回数": max(0, int(len(group)) - 1),
+                "未復旧件数": int(states.eq("unresolved").sum()),
+                "復旧件数": int(states.isin({"resolved", "auto_resolved"}).sum()),
+                "平均復旧時間": round(float(recovery_hours.mean()), 2) if not recovery_hours.empty else "",
+                "最大復旧時間": round(float(recovery_hours.max()), 2) if not recovery_hours.empty else "",
+                "直近発生日時": occurred.max().strftime("%Y/%m/%d %H:%M:%S") if not occurred.empty else "",
+                "直近復旧日時": recovered_at.max().strftime("%Y/%m/%d %H:%M:%S") if not recovered_at.empty else "",
+            }
+        )
+    summary = pd.DataFrame(rows, columns=columns)
+    summary["_latest"] = pd.to_datetime(summary["直近発生日時"], errors="coerce")
+    summary = summary.sort_values(["未復旧件数", "再発回数", "_latest"], ascending=[False, False, False])
+    return summary.drop(columns=["_latest"]).reset_index(drop=True)
+
+
+def diagnose_fallback_lifecycle(events_csv, now=None):
+    path = Path(events_csv)
+    diagnostic = {
+        "path": str(path),
+        "display_path": _display_path(path),
+        "status": "missing",
+        "status_label": FALLBACK_LIFECYCLE_STATUS_LABELS["missing"],
+        "event_count": 0,
+        "unresolved_count": 0,
+        "auto_resolved_count": 0,
+        "resolved_count": 0,
+        "ignored_count": 0,
+        "missing_recovery_datetime_count": 0,
+        "unresolved_with_recovery_datetime_count": 0,
+        "recovery_before_occurrence_count": 0,
+        "datetime_parse_error_count": 0,
+        "invalid_recovery_state_count": 0,
+        "average_recovery_hours": None,
+        "max_recovery_hours": None,
+        "attention_24h_count": 0,
+        "warning_72h_count": 0,
+        "critical_168h_count": 0,
+        "oldest_unresolved_at": "",
+        "oldest_unresolved_hours": None,
+        "latest_recovery_at": "",
+        "recurrence_count": 0,
+        "recurrence_definition": "原因コード別の総発生件数から初回1件を除いた簡易集計",
+        "cause_summary": pd.DataFrame(),
+        "warnings": [],
+        "errors": [],
+    }
+    if not path.exists():
+        return diagnostic
+    try:
+        events = _read_fallback_event_csv(path)
+    except Exception as exc:
+        diagnostic["status"] = "error"
+        diagnostic["status_label"] = FALLBACK_LIFECYCLE_STATUS_LABELS["error"]
+        diagnostic["errors"].append(str(exc))
+        return diagnostic
+    missing = _missing_columns(events, FALLBACK_EVENT_COLUMNS)
+    if missing:
+        diagnostic["status"] = "corrupted"
+        diagnostic["status_label"] = FALLBACK_LIFECYCLE_STATUS_LABELS["corrupted"]
+        diagnostic["errors"].append("不足列: " + ", ".join(missing))
+        return diagnostic
+
+    events = events.reindex(columns=FALLBACK_EVENT_COLUMNS)
+    lifecycle = _fallback_lifecycle_frame(events, now=now)
+    states = events["復旧状態"].map(_clean_runtime_value)
+    occurred_text = events["発生日時"].map(_clean_runtime_value)
+    recovery_text = events["復旧日時"].map(_clean_runtime_value)
+    occurred = pd.to_datetime(occurred_text, errors="coerce")
+    recovered_at = pd.to_datetime(recovery_text, errors="coerce")
+    recovered = states.isin({"resolved", "auto_resolved"})
+    unresolved = states.eq("unresolved")
+    diagnostic["event_count"] = int(len(events))
+    diagnostic["unresolved_count"] = int(unresolved.sum())
+    diagnostic["auto_resolved_count"] = int(states.eq("auto_resolved").sum())
+    diagnostic["resolved_count"] = int(states.eq("resolved").sum())
+    diagnostic["ignored_count"] = int(states.eq("ignored").sum())
+    diagnostic["missing_recovery_datetime_count"] = int((recovered & recovery_text.eq("")).sum())
+    diagnostic["unresolved_with_recovery_datetime_count"] = int((unresolved & recovery_text.ne("")).sum())
+    diagnostic["recovery_before_occurrence_count"] = int((recovered & recovered_at.notna() & occurred.notna() & recovered_at.lt(occurred)).sum())
+    diagnostic["datetime_parse_error_count"] = int(occurred.isna().sum() + (recovery_text.ne("") & recovered_at.isna()).sum())
+    diagnostic["invalid_recovery_state_count"] = int((~states.isin(FALLBACK_RECOVERY_STATES)).sum())
+    recovery_hours = pd.to_numeric(lifecycle["復旧時間（時間）"], errors="coerce").dropna()
+    if not recovery_hours.empty:
+        diagnostic["average_recovery_hours"] = round(float(recovery_hours.mean()), 2)
+        diagnostic["max_recovery_hours"] = round(float(recovery_hours.max()), 2)
+    continuing = pd.to_numeric(lifecycle["継続時間（時間）"], errors="coerce")
+    diagnostic["attention_24h_count"] = int(continuing.ge(FALLBACK_LIFECYCLE_THRESHOLDS_HOURS["attention"]).sum())
+    diagnostic["warning_72h_count"] = int(continuing.ge(FALLBACK_LIFECYCLE_THRESHOLDS_HOURS["warning"]).sum())
+    diagnostic["critical_168h_count"] = int(continuing.ge(FALLBACK_LIFECYCLE_THRESHOLDS_HOURS["critical"]).sum())
+    unresolved_times = occurred[unresolved & occurred.notna()]
+    if not unresolved_times.empty:
+        diagnostic["oldest_unresolved_at"] = unresolved_times.min().strftime("%Y/%m/%d %H:%M:%S")
+        diagnostic["oldest_unresolved_hours"] = round(float(continuing[unresolved].max()), 2)
+    valid_recovery = recovered_at[recovered & recovered_at.notna()]
+    if not valid_recovery.empty:
+        diagnostic["latest_recovery_at"] = valid_recovery.max().strftime("%Y/%m/%d %H:%M:%S")
+    cause_summary = build_fallback_cause_summary(events, now=now)
+    diagnostic["cause_summary"] = cause_summary
+    diagnostic["recurrence_count"] = int(pd.to_numeric(cause_summary.get("再発回数", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+
+    corrupted = any(
+        diagnostic[key]
+        for key in (
+            "missing_recovery_datetime_count",
+            "unresolved_with_recovery_datetime_count",
+            "recovery_before_occurrence_count",
+            "datetime_parse_error_count",
+            "invalid_recovery_state_count",
+        )
+    )
+    if corrupted:
+        diagnostic["status"] = "corrupted"
+    elif diagnostic["critical_168h_count"]:
+        diagnostic["status"] = "critical"
+    elif diagnostic["unresolved_count"] or diagnostic["attention_24h_count"] or diagnostic["warning_72h_count"]:
+        diagnostic["status"] = "warning"
+    else:
+        diagnostic["status"] = "healthy"
+    diagnostic["status_label"] = "イベントなし" if events.empty else FALLBACK_LIFECYCLE_STATUS_LABELS[diagnostic["status"]]
+    if diagnostic["attention_24h_count"]:
+        diagnostic["warnings"].append("24時間以上継続している未復旧イベントがあります。")
+    if diagnostic["warning_72h_count"]:
+        diagnostic["warnings"].append("72時間以上継続している未復旧イベントがあります。")
+    if diagnostic["critical_168h_count"]:
+        diagnostic["warnings"].append("168時間以上継続している重大な未復旧イベントがあります。")
+    if corrupted:
+        diagnostic["warnings"].append("Fallback lifecycleの日時または復旧状態に矛盾があります。")
     return diagnostic
 
 
