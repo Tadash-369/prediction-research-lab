@@ -20,7 +20,7 @@ import pandas as pd
 import streamlit as st
 
 from accuracy_baseline import load_accuracy_baseline, planned_report_files, save_accuracy_baseline_report
-from prospective_evidence import generate_preview, load_game_context, model_catalog as prospective_model_catalog
+from prospective_evidence import compare_previews, generate_preview, load_game_context, model_catalog as prospective_model_catalog
 from prospective_evidence import planned_batch_path, save_batch as save_prospective_batch, scan_evidence
 from arl_research_engine import (
     CONTRIBUTION_COLUMNS,
@@ -1117,7 +1117,14 @@ def render_prospective_evidence():
         diagnosis = contexts[game]["diagnosis"]
         if st.button("メモリ上で予測プレビュー", disabled=not diagnosis["prospective"] or not selected_models, key="prospective_preview"):
             with st.spinner("既存モデルから研究用予測を生成しています..."):
-                st.session_state["prospective_preview_result"] = generate_preview(contexts[game]["context"], diagnosis, selected_models)
+                new_result = generate_preview(contexts[game]["context"], diagnosis, selected_models)
+                previous_result = st.session_state.get("prospective_preview_result")
+                previous_game = st.session_state.get("prospective_preview_game")
+                st.session_state["prospective_reproducibility"] = (
+                    compare_previews(previous_result["records"], new_result["records"])
+                    if previous_result and previous_game == game else None
+                )
+                st.session_state["prospective_preview_result"] = new_result
                 st.session_state["prospective_preview_game"] = game
 
         preview_result = st.session_state.get("prospective_preview_result")
@@ -1130,6 +1137,21 @@ def render_prospective_evidence():
             display_dataframe(preview, width="stretch", hide_index=True)
             if preview_result["errors"]:
                 st.warning(f"モデル実行エラー {len(preview_result['errors'])}件。他モデルの結果は維持しています。")
+            comparison = st.session_state.get("prospective_reproducibility")
+            if comparison:
+                st.markdown("**再現性確認**")
+                comparison_cols = st.columns(4)
+                comparison_cols[0].metric("Prediction fingerprint一致", comparison["matched_records"])
+                comparison_cols[1].metric("不一致", comparison["mismatched_records"])
+                comparison_cols[2].metric("不足モデル", len(comparison["missing_models"]))
+                comparison_cols[3].metric("追加モデル", len(comparison["extra_models"]))
+                if comparison["reproducible"]:
+                    st.success("Evidence ID・予測番号・seed・入力hash・commit・Prediction fingerprintは一致しています。")
+                else:
+                    st.error("再現性比較に不一致があります。保存は無効です。")
+                    st.json(comparison["mismatch_details"])
+                st.caption(f"生成日時差: {comparison['generation_time_first']} → {comparison['generation_time_second']}")
+                st.caption("Record hashは生成日時を含む完全性検査値のため、別プレビュー間では一致不要です。")
 
         existing = scan_evidence(PROSPECTIVE_EVIDENCE_DIR, {
             "loto6": read_csv(DATA_DIR / "results.csv"), "loto7": read_csv(DATA_DIR / "loto7_results.csv")})
@@ -1150,7 +1172,8 @@ def render_prospective_evidence():
             "保存不可理由": " / ".join(diagnosis["reasons"])}])
         st.markdown("**保存前安全確認**")
         display_dataframe(safety, width="stretch", hide_index=True)
-        can_save = diagnosis["prospective"] and not preview.empty and duplicate_count == 0 and preview_game == game
+        comparison = st.session_state.get("prospective_reproducibility")
+        can_save = diagnosis["prospective"] and not preview.empty and duplicate_count == 0 and preview_game == game and (not comparison or comparison["reproducible"])
         confirmed = st.checkbox("不変の研究証拠バッチとして保存する", disabled=not can_save, key="prospective_save_confirm")
         if st.button("研究証拠を原子的に保存", disabled=not can_save or not confirmed, key="prospective_save"):
             try:

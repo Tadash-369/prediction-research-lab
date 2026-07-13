@@ -17,14 +17,21 @@ import pandas as pd
 from arl_research_engine import LOTO_MODEL_LABELS, build_model_scores, model_candidate_numbers
 
 
-EVIDENCE_COLUMNS = [
+LEGACY_EVIDENCE_COLUMNS = [
     "evidence_id", "game", "開催回", "抽せん日", "予測生成日時", "保存日時", "使用モデル", "正規化モデル名",
     "モデルバージョン", "重みバージョン", "使用seed", "再現性レベル", "候補番号", "予測番号", "予測口数",
     "入力データ最終開催回", "入力データ最終抽せん日", "入力データ件数", "入力データSHA-256", "実行コードcommit hash",
     "実行環境識別情報", "予測生成経路", "予測生成オプション", "prospective判定", "抽せん前保存判定", "保存状態",
     "レコードSHA-256", "バッチSHA-256", "備考",
 ]
-RECORD_HASH_EXCLUDED = {"レコードSHA-256", "バッチSHA-256"}
+PREDICTION_FINGERPRINT_COLUMN = "予測fingerprint SHA-256"
+EVIDENCE_COLUMNS = LEGACY_EVIDENCE_COLUMNS[:26] + [PREDICTION_FINGERPRINT_COLUMN] + LEGACY_EVIDENCE_COLUMNS[26:]
+PREDICTION_FINGERPRINT_COLUMNS = [
+    "game", "開催回", "抽せん日", "使用モデル", "正規化モデル名", "モデルバージョン", "重みバージョン", "使用seed",
+    "候補番号", "予測番号", "予測口数", "入力データ最終開催回", "入力データ最終抽せん日", "入力データ件数",
+    "入力データSHA-256", "実行コードcommit hash", "予測生成経路", "再現性レベル", "予測生成オプション",
+]
+RECORD_HASH_EXCLUDED = {"レコードSHA-256", "バッチSHA-256", PREDICTION_FINGERPRINT_COLUMN}
 EVIDENCE_INTEGER_COLUMNS = {"開催回", "候補番号", "予測口数", "入力データ最終開催回", "入力データ件数"}
 EVIDENCE_BOOLEAN_COLUMNS = {"prospective判定", "抽せん前保存判定"}
 EVIDENCE_SEED_COLUMN = "使用seed"
@@ -196,6 +203,12 @@ def calculate_record_sha256(record: dict[str, Any]) -> str:
     return sha256_bytes(_canonical_json(canonicalize_evidence_record(record)))
 
 
+def calculate_prediction_fingerprint(record: dict[str, Any]) -> str:
+    normalized = normalize_evidence_record(record)
+    payload = {column: normalized[column] for column in PREDICTION_FINGERPRINT_COLUMNS}
+    return sha256_bytes(_canonical_json(payload))
+
+
 def _record_hash(record: dict[str, Any]) -> str:
     return calculate_record_sha256(record)
 
@@ -216,6 +229,40 @@ def calculate_evidence_id(identity: dict[str, Any]) -> str:
 
 def _batch_hash(records: list[dict[str, Any]]) -> str:
     return sha256_bytes("\n".join(sorted(str(record["レコードSHA-256"]) for record in records)).encode("ascii"))
+
+
+def _fingerprint_set_hash(records: list[dict[str, Any]] | pd.DataFrame) -> str:
+    if isinstance(records, pd.DataFrame):
+        records = records.to_dict("records")
+    return sha256_bytes("\n".join(sorted(str(record[PREDICTION_FINGERPRINT_COLUMN]) for record in records)).encode("ascii"))
+
+
+def compare_previews(first: pd.DataFrame, second: pd.DataFrame) -> dict[str, Any]:
+    key_columns = ["正規化モデル名", "候補番号"]
+    compared_columns = ["予測番号", "使用seed", "evidence_id", PREDICTION_FINGERPRINT_COLUMN, "入力データSHA-256", "実行コードcommit hash", "モデルバージョン", "重みバージョン"]
+    first_records = [normalize_evidence_record(row) for row in first.to_dict("records")] if first is not None else []
+    second_records = [normalize_evidence_record(row) for row in second.to_dict("records")] if second is not None else []
+    first_map = {tuple(record[column] for column in key_columns): record for record in first_records}
+    second_map = {tuple(record[column] for column in key_columns): record for record in second_records}
+    missing = sorted(first_map.keys() - second_map.keys())
+    extra = sorted(second_map.keys() - first_map.keys())
+    details = []
+    matched = 0
+    for key in sorted(first_map.keys() & second_map.keys()):
+        differences = {column: {"first": first_map[key][column], "second": second_map[key][column]} for column in compared_columns if first_map[key][column] != second_map[key][column]}
+        if differences:
+            details.append({"model": key[0], "candidate": key[1], "differences": differences})
+        else:
+            matched += 1
+    return {
+        "reproducible": not missing and not extra and not details,
+        "compared_records": len(first_map.keys() & second_map.keys()), "matched_records": matched,
+        "mismatched_records": len(details), "missing_models": [key[0] for key in missing], "extra_models": [key[0] for key in extra],
+        "mismatch_details": details,
+        "generation_time_first": sorted({record["予測生成日時"] for record in first_records}),
+        "generation_time_second": sorted({record["予測生成日時"] for record in second_records}),
+        "record_hash_required_to_match": False,
+    }
 
 
 def model_catalog() -> pd.DataFrame:
@@ -332,9 +379,10 @@ def generate_preview(context: dict[str, Any], diagnosis: dict[str, Any], selecte
             "入力データ最終抽せん日": diagnosis["input_latest_date"], "入力データ件数": diagnosis["input_count"], "入力データSHA-256": diagnosis["input_hash"],
             "実行コードcommit hash": diagnosis["commit_hash"], "実行環境識別情報": environment, "予測生成経路": "arl_research_engine.build_model_scores",
             "予測生成オプション": json.dumps({"draw_size": config["draw_size"], "number_max": config["number_max"], "ticket_count": 1}, ensure_ascii=False, sort_keys=True),
-            "prospective判定": True, "抽せん前保存判定": True, "保存状態": "preview", "レコードSHA-256": "", "バッチSHA-256": "", "備考": "本番買い目・正式予測履歴とは分離",
+            "prospective判定": True, "抽せん前保存判定": True, "保存状態": "preview", PREDICTION_FINGERPRINT_COLUMN: "", "レコードSHA-256": "", "バッチSHA-256": "", "備考": "本番買い目・正式予測履歴とは分離",
         }
         record = normalize_evidence_record(record)
+        record[PREDICTION_FINGERPRINT_COLUMN] = calculate_prediction_fingerprint(record)
         record["レコードSHA-256"] = calculate_record_sha256(record)
         records.append(record)
     return {"records": pd.DataFrame(records, columns=EVIDENCE_COLUMNS), "errors": errors, "model_status": catalog}
@@ -367,7 +415,8 @@ def verify_batch(batch_dir: Path) -> dict[str, Any]:
     except Exception as exc:
         return {"status": "corrupted", "reasons": [str(exc)], "records": pd.DataFrame()}
     reasons = []
-    if list(frame.columns) != EVIDENCE_COLUMNS:
+    legacy_schema = list(frame.columns) == LEGACY_EVIDENCE_COLUMNS
+    if list(frame.columns) not in (EVIDENCE_COLUMNS, LEGACY_EVIDENCE_COLUMNS):
         reasons.append("CSV schema mismatch")
     if len(frame) != int(manifest.get("record_count", -1)):
         reasons.append("record count mismatch")
@@ -383,6 +432,11 @@ def verify_batch(batch_dir: Path) -> dict[str, Any]:
         except ValueError as exc:
             reasons.append(f"invalid schema: {exc}")
             continue
+        calculated_fingerprint = calculate_prediction_fingerprint(record)
+        if not record[PREDICTION_FINGERPRINT_COLUMN]:
+            record[PREDICTION_FINGERPRINT_COLUMN] = calculated_fingerprint
+        elif record[PREDICTION_FINGERPRINT_COLUMN] != calculated_fingerprint:
+            reasons.append(f"prediction fingerprint mismatch: {record.get('evidence_id', '')}")
         records.append(record)
         if calculate_record_sha256(record) != record.get("レコードSHA-256", ""):
             reasons.append(f"record hash mismatch: {record.get('evidence_id', '')}")
@@ -398,9 +452,14 @@ def verify_batch(batch_dir: Path) -> dict[str, Any]:
             reasons.append(f"required value missing: {record.get('evidence_id', '')}")
     if records and _batch_hash(records) != manifest.get("batch_sha256"):
         reasons.append("batch hash mismatch")
+    if not legacy_schema and records:
+        if int(manifest.get("fingerprint_count", -1)) != len(records):
+            reasons.append("fingerprint count mismatch")
+        if manifest.get("fingerprint_set_sha256") != _fingerprint_set_hash(records):
+            reasons.append("fingerprint set hash mismatch")
     normalized_frame = pd.DataFrame(records, columns=EVIDENCE_COLUMNS)
     status = "invalid_schema" if any(reason.startswith("invalid schema:") for reason in reasons) else "invalid_hash" if reasons else "valid"
-    return {"status": status, "reasons": reasons, "records": normalized_frame, "manifest": manifest}
+    return {"status": status, "reasons": reasons, "records": normalized_frame, "manifest": manifest, "schema_status": "legacy_schema" if legacy_schema else "current"}
 
 
 def save_batch(preview: pd.DataFrame, diagnosis: dict[str, Any], root: Path, saved_at: datetime | None = None, fail_stage: str = "") -> dict[str, Any]:
@@ -410,6 +469,12 @@ def save_batch(preview: pd.DataFrame, diagnosis: dict[str, Any], root: Path, sav
         raise ValueError("保存対象がありません")
     game = str(diagnosis["game"])
     normalized_preview = pd.DataFrame([normalize_evidence_record(record) for record in preview.to_dict("records")], columns=EVIDENCE_COLUMNS)
+    for index, record in normalized_preview.iterrows():
+        calculated = calculate_prediction_fingerprint(record.to_dict())
+        existing_fingerprint = record.get(PREDICTION_FINGERPRINT_COLUMN, "")
+        if existing_fingerprint and existing_fingerprint != calculated:
+            raise ValueError(f"prediction fingerprint mismatch: {record.get('evidence_id', '')}")
+        normalized_preview.at[index, PREDICTION_FINGERPRINT_COLUMN] = calculated
     if normalized_preview["evidence_id"].duplicated().any():
         raise ValueError("バッチ内でevidence_idが重複しています")
     existing = _existing_evidence_ids(root, game)
@@ -434,7 +499,7 @@ def save_batch(preview: pd.DataFrame, diagnosis: dict[str, Any], root: Path, sav
         csv_path = temp_dir / "predictions.csv"
         records = pd.DataFrame([normalize_evidence_record(record) for record in records.to_dict("records")], columns=EVIDENCE_COLUMNS)
         records.to_csv(csv_path, index=False, encoding="utf-8-sig")
-        manifest = {"schema_version": "1.0", "game": game, "draw_no": int(diagnosis["target_draw"]), "draw_date": diagnosis["draw_date"], "created_at": saved_at.isoformat(timespec="seconds"), "record_count": len(records), "batch_sha256": batch_hash, "file_sha256": sha256_file(csv_path), "commit_hash": diagnosis["commit_hash"], "input_data_sha256": diagnosis["input_hash"]}
+        manifest = {"schema_version": "2.0", "game": game, "draw_no": int(diagnosis["target_draw"]), "draw_date": diagnosis["draw_date"], "created_at": saved_at.isoformat(timespec="seconds"), "record_count": len(records), "batch_sha256": batch_hash, "file_sha256": sha256_file(csv_path), "commit_hash": diagnosis["commit_hash"], "input_data_sha256": diagnosis["input_hash"], "fingerprint_algorithm": "sha256-canonical-json-v1", "fingerprint_columns": PREDICTION_FINGERPRINT_COLUMNS, "fingerprint_count": len(records), "fingerprint_set_sha256": _fingerprint_set_hash(records)}
         manifest["manifest_sha256"] = sha256_bytes(_canonical_json(manifest))
         (temp_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         if fail_stage == "after_write":

@@ -39,6 +39,69 @@ def preview(game="loto6", commit=COMMIT_A, models=None):
 
 
 class ProspectiveEvidenceTests(unittest.TestCase):
+    def test_generation_time_changes_record_hash_not_prediction_fingerprint(self):
+        diag = diagnosis("loto7")
+        first = pe.generate_preview(context("loto7"), diag, ["frequency_analysis"], datetime(2026, 1, 2, 10, 0, 0))["records"].iloc[0].to_dict()
+        second = pe.generate_preview(context("loto7"), diag, ["frequency_analysis"], datetime(2026, 1, 2, 10, 0, 2))["records"].iloc[0].to_dict()
+        self.assertEqual(first["evidence_id"], second["evidence_id"])
+        self.assertEqual(pe.calculate_prediction_fingerprint(first), pe.calculate_prediction_fingerprint(second))
+        self.assertNotEqual(pe.calculate_record_sha256(first), pe.calculate_record_sha256(second))
+
+    def test_prediction_fingerprint_changes_for_semantic_inputs(self):
+        _, result = preview("loto7", models=["random_baseline"])
+        base = result["records"].iloc[0].to_dict()
+        baseline = pe.calculate_prediction_fingerprint(base)
+        changes = {
+            "予測番号": "01-02-03-04-05-06-07", "使用seed": 999,
+            "入力データSHA-256": "0" * 64, "実行コードcommit hash": COMMIT_B,
+            "モデルバージョン": "model:v2",
+        }
+        for column, value in changes.items():
+            self.assertNotEqual(baseline, pe.calculate_prediction_fingerprint({**base, column: value}), column)
+
+    def test_batch_timestamp_is_shared_and_cross_preview_comparison_succeeds(self):
+        diag = diagnosis("loto7")
+        first = pe.generate_preview(context("loto7"), diag, generated_at=datetime(2026, 1, 2, 10, 0, 0))["records"]
+        second = pe.generate_preview(context("loto7"), diag, generated_at=datetime(2026, 1, 2, 10, 0, 2))["records"]
+        self.assertEqual(first["予測生成日時"].nunique(), 1)
+        self.assertEqual(second["予測生成日時"].nunique(), 1)
+        comparison = pe.compare_previews(first, second)
+        self.assertTrue(comparison["reproducible"])
+        self.assertEqual(comparison["matched_records"], 16)
+        self.assertFalse(comparison["record_hash_required_to_match"])
+
+    def test_comparison_rejects_prediction_difference(self):
+        diag = diagnosis("loto7")
+        first = pe.generate_preview(context("loto7"), diag, ["frequency_analysis"])["records"]
+        second = first.copy()
+        second.at[0, "予測番号"] = "02-03-04-05-06-07-08"
+        second.at[0, pe.PREDICTION_FINGERPRINT_COLUMN] = pe.calculate_prediction_fingerprint(second.iloc[0].to_dict())
+        comparison = pe.compare_previews(first, second)
+        self.assertFalse(comparison["reproducible"])
+        self.assertEqual(comparison["mismatched_records"], 1)
+
+    def test_save_preserves_preview_identity_fingerprint_and_generation_time(self):
+        diag, result = preview("loto7", models=["frequency_analysis", "random_baseline"])
+        before = result["records"].set_index("evidence_id")
+        with tempfile.TemporaryDirectory() as directory, patch.object(pe, "build_model_scores") as generator:
+            saved = pe.save_batch(result["records"], diag, Path(directory), datetime(2026, 1, 2, 11))
+            generator.assert_not_called()
+            checked = pe.verify_batch(saved["path"])
+            after = checked["records"].set_index("evidence_id")
+            self.assertEqual(checked["manifest"]["schema_version"], "2.0")
+            self.assertEqual(checked["manifest"]["fingerprint_count"], 2)
+            self.assertEqual(before.index.tolist(), after.index.tolist())
+            self.assertEqual(before[pe.PREDICTION_FINGERPRINT_COLUMN].tolist(), after[pe.PREDICTION_FINGERPRINT_COLUMN].tolist())
+            self.assertEqual(before["予測生成日時"].tolist(), after["予測生成日時"].tolist())
+
+    def test_legacy_record_gets_fingerprint_in_memory(self):
+        _, result = preview(models=["frequency_analysis"])
+        legacy = result["records"].iloc[0].to_dict()
+        legacy.pop(pe.PREDICTION_FINGERPRINT_COLUMN)
+        normalized = pe.normalize_evidence_record(legacy)
+        self.assertEqual(normalized[pe.PREDICTION_FINGERPRINT_COLUMN], "")
+        self.assertTrue(pe.calculate_prediction_fingerprint(normalized))
+
     def test_integer_seed_csv_round_trip_preserves_record_hash(self):
         _, result = preview(models=["frequency_analysis", "random_baseline"])
         records = result["records"].copy()
