@@ -12,6 +12,7 @@ DOCS_DIR = LOTO_LAB_DIR / "docs"
 BACKUP_DIR = DATA_DIR / "backups"
 ACCURACY_BASELINE_DIR = DATA_DIR / "research" / "accuracy_baseline"
 PROSPECTIVE_EVIDENCE_DIR = DATA_DIR / "research" / "prospective_evidence"
+PROSPECTIVE_EVALUATION_DIR = DATA_DIR / "research" / "prospective_evidence_evaluations"
 
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
@@ -22,6 +23,7 @@ import streamlit as st
 from accuracy_baseline import load_accuracy_baseline, planned_report_files, save_accuracy_baseline_report
 from prospective_evidence import compare_previews, generate_preview, load_game_context, model_catalog as prospective_model_catalog
 from prospective_evidence import planned_batch_path, save_batch as save_prospective_batch, scan_evidence
+from evidence_evaluation import build_evaluation_preview, find_result_for_batch, planned_evaluation_path, save_evaluation
 from arl_research_engine import (
     CONTRIBUTION_COLUMNS,
     FUTURE_LOTO_MODEL_LABELS,
@@ -1163,6 +1165,48 @@ def render_prospective_evidence():
         status_cols[3].metric("破損・改変疑い", int((existing["integrity_status"] != "valid").sum()) if not existing.empty else 0)
         if not existing.empty:
             display_dataframe(existing, width="stretch", hide_index=True)
+
+        st.markdown("**Prospective Evidence 評価ブリッジ**")
+        batch_paths = sorted(set(existing["batch_path"])) if not existing.empty else []
+        bridge_rows, bridge_diagnoses = [], {}
+        result_frames = {"loto6": read_csv(DATA_DIR / "results.csv"), "loto7": read_csv(DATA_DIR / "loto7_results.csv")}
+        for batch_path in batch_paths:
+            batch_game = str(existing.loc[existing["batch_path"] == batch_path, "game"].iloc[0])
+            bridge = find_result_for_batch(Path(batch_path), result_frames[batch_game], batch_game, PROSPECTIVE_EVALUATION_DIR)
+            bridge_diagnoses[batch_path] = bridge
+            bridge_rows.append({"game": batch_game, "開催回": bridge["draw_no"], "抽せん日": bridge["draw_date"],
+                "Evidence integrity": bridge["integrity_status"], "評価状態": bridge["status"], "結果登録": "あり" if bridge.get("result_row") else "なし",
+                "evaluation_ready": bridge["evaluation_ready"], "評価不可理由": " / ".join(bridge["reasons"]), "既存評価件数": bridge["existing_evaluations"],
+                "元Batch SHA-256": bridge["source_batch_sha256"], "Fingerprint set SHA-256": bridge["source_fingerprint_set_sha256"],
+                "結果行SHA-256": bridge.get("result_row_sha256", ""), "バッチpath": batch_path})
+        if bridge_rows:
+            display_dataframe(pd.DataFrame(bridge_rows), width="stretch", hide_index=True)
+            selected_batch = st.selectbox("評価対象Evidenceバッチ", batch_paths, key="evidence_evaluation_batch")
+            selected_bridge = bridge_diagnoses[selected_batch]
+            if st.button("メモリ上で評価プレビュー", disabled=not selected_bridge["evaluation_ready"], key="evidence_evaluation_preview"):
+                st.session_state["evidence_evaluation_preview_result"] = build_evaluation_preview(Path(selected_batch), selected_bridge)
+                st.session_state["evidence_evaluation_preview_batch"] = selected_batch
+            evaluation_preview = st.session_state.get("evidence_evaluation_preview_result")
+            if evaluation_preview and st.session_state.get("evidence_evaluation_preview_batch") == selected_batch:
+                st.caption("単回結果です。長期性能ランキングには自動投入しません。")
+                display_dataframe(evaluation_preview["records"], width="stretch", hide_index=True)
+                display_dataframe(evaluation_preview["model_summary"], width="stretch", hide_index=True)
+            else:
+                evaluation_preview = None
+            evaluation_path = planned_evaluation_path(PROSPECTIVE_EVALUATION_DIR, selected_bridge["game"], selected_bridge["draw_no"] or 0)
+            st.caption(f"評価保存予定先: {evaluation_path}")
+            can_save_evaluation = selected_bridge["evaluation_ready"] and evaluation_preview is not None
+            confirm_evaluation = st.checkbox("別評価レポートとして原子的に保存する", disabled=not can_save_evaluation, key="evidence_evaluation_confirm")
+            if st.button("評価レポートを保存", disabled=not can_save_evaluation or not confirm_evaluation, key="evidence_evaluation_save"):
+                result_file = DATA_DIR / ("results.csv" if selected_bridge["game"] == "loto6" else "loto7_results.csv")
+                try:
+                    saved_evaluation = save_evaluation(evaluation_preview, selected_bridge, PROSPECTIVE_EVALUATION_DIR, result_file, PROJECT_ROOT)
+                except Exception as exc:
+                    st.error(f"評価レポートを保存できませんでした: {exc}")
+                else:
+                    st.success(f"{saved_evaluation['path']} に評価レポートを保存しました。")
+        else:
+            st.info("保存済みEvidenceバッチはありません。")
 
         target_path = planned_batch_path(PROSPECTIVE_EVIDENCE_DIR, game, diagnosis["target_draw"] or 0)
         safety = pd.DataFrame([{"game": game, "開催回": diagnosis["target_draw"], "抽せん日": diagnosis["draw_date"],
