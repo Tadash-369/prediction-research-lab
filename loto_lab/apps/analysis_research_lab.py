@@ -10,6 +10,7 @@ VERIFICATION_DIR = DATA_DIR / "verification"
 AI_IMPROVEMENT_DIR = DATA_DIR / "ai_improvement"
 DOCS_DIR = LOTO_LAB_DIR / "docs"
 BACKUP_DIR = DATA_DIR / "backups"
+ACCURACY_BASELINE_DIR = DATA_DIR / "research" / "accuracy_baseline"
 
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
@@ -17,6 +18,7 @@ if str(CORE_DIR) not in sys.path:
 import pandas as pd
 import streamlit as st
 
+from accuracy_baseline import load_accuracy_baseline, planned_report_files, save_accuracy_baseline_report
 from arl_research_engine import (
     CONTRIBUTION_COLUMNS,
     FUTURE_LOTO_MODEL_LABELS,
@@ -1009,6 +1011,84 @@ def render_roadmap():
     display_dataframe(roadmap, width="stretch", hide_index=True)
 
 
+def render_accuracy_baseline_research():
+    with st.expander("Phase2 予測精度研究", expanded=False):
+        st.caption("保存済み正式予測を同一条件で比較する研究基準線です。予測生成、本番重み、runtime設定は変更しません。")
+        st.write("通常表示では分析も保存も行いません。抽せん日より前の保存を確認できない予測は正式ランキングから隔離します。")
+        if st.button("読み取り専用で基準線を分析", key="accuracy_baseline_analyze"):
+            with st.spinner("正式予測と正式結果をメモリ上で照合しています..."):
+                st.session_state["accuracy_baseline_report"] = load_accuracy_baseline(DATA_DIR)
+
+        report = st.session_state.get("accuracy_baseline_report")
+        if not report:
+            st.info("分析はまだ実行されていません。研究実行ボタンを押すまでCSVやJSONは生成されません。")
+            return
+
+        summary = report["summary"]
+        st.markdown("**評価条件**")
+        st.write(summary["official_definition"])
+        st.caption(summary["same_day_policy"])
+        st.caption(summary["random_policy"])
+        st.warning(summary["marginal_policy"])
+
+        for game, label in (("loto6", "ロト6"), ("loto7", "ロト7")):
+            analysis = report["games"][game]
+            game_summary = summary["games"][game]
+            st.markdown(f"**{label} モデル別成績**")
+            metrics = st.columns(4)
+            metrics[0].metric("評価可能開催回", game_summary["eligible_draws"])
+            metrics[1].metric("評価予測口数", game_summary["eligible_predictions"])
+            metrics[2].metric("未検証", game_summary["unverified_predictions"])
+            metrics[3].metric("除外", game_summary["excluded_predictions"])
+            quality = analysis["quality"]
+            future_count = int((quality["issue_code"] == "future_data_suspected").sum()) if not quality.empty else 0
+            st.write(f"未来データ混入検査: 疑い {future_count}件。疑い行は停止せず隔離し、正式評価には含めません。")
+            if analysis["model_accuracy"].empty:
+                st.info(f"{label}は現在、正式評価条件を満たす予測がありません。")
+            else:
+                display_dataframe(analysis["model_accuracy"], width="stretch", hide_index=True)
+                if game_summary["insufficient_models"]:
+                    st.warning(f"データ不足モデル（順位対象外）: {', '.join(game_summary['insufficient_models'])}")
+
+            tabs = st.tabs(["短期・長期", "ランダム差", "安定性・効率", "重複・独自性", "限界貢献", "品質問題"])
+            with tabs[0]:
+                for name in ("直近10回", "直近30回", "長期成績"):
+                    ranking = analysis["rankings"].get(name)
+                    if ranking is not None:
+                        st.caption(f"{name}: 開催回単位の平均一致数。最低{summary['minimum_ranking_draws']}開催回未満は順位化しません。")
+                        display_dataframe(ranking, width="stretch", hide_index=True)
+            with tabs[1]:
+                st.caption("同じ開催回・同じ口数の固定seed研究用randomとの差です。区間が0をまたぐ場合、統計的優位性は未確認です。")
+                columns = ["model", "random_average_delta", "random_hit3_rate_delta", "random_best_delta", "random_coverage_delta", "random_wins", "random_ties", "random_losses", "random_delta_ci_low", "random_delta_ci_high", "statistical_advantage"]
+                display_dataframe(analysis["model_accuracy"].reindex(columns=columns), width="stretch", hide_index=True)
+            with tabs[2]:
+                st.caption("安定性は一致数標準偏差、口数効率は開催回カバレッジを口数で補正した値です。")
+                columns = ["model", "std_main_matches", "longest_poor_streak", "longest_good_streak", "average_ticket_efficiency", "data_status"]
+                display_dataframe(analysis["model_accuracy"].reindex(columns=columns), width="stretch", hide_index=True)
+            with tabs[3]:
+                st.caption("複数口を最適対応せず、開催回ごとの候補集合の和集合でJaccard類似度と独自率を測ります。")
+                display_dataframe(analysis["overlap"], width="stretch", hide_index=True)
+            with tabs[4]:
+                st.caption("全モデル、対象モデル除外、単独、random置換を比較する研究用近似です。正式アンサンブル結果ではありません。")
+                display_dataframe(analysis["marginal"], width="stretch", hide_index=True)
+            with tabs[5]:
+                st.caption("元データは自動修正しません。問題コードと対象識別情報だけを表示・保存します。")
+                display_dataframe(quality, width="stretch", hide_index=True)
+
+        st.markdown("**研究レポート保存（明示操作）**")
+        planned = planned_report_files(ACCURACY_BASELINE_DIR)
+        st.caption("保存先候補: " + str(ACCURACY_BASELINE_DIR))
+        display_dataframe(pd.DataFrame({"出力予定ファイル": [path.name for path in planned]}), width="stretch", hide_index=True)
+        confirmed = st.checkbox("上記の新規スナップショットを保存する", key="accuracy_baseline_save_confirm")
+        if st.button("研究レポートを保存", disabled=not confirmed, key="accuracy_baseline_save"):
+            try:
+                saved = save_accuracy_baseline_report(report, ACCURACY_BASELINE_DIR)
+            except Exception as exc:
+                st.error(f"研究レポートを保存できませんでした: {exc}")
+            else:
+                st.success(f"{saved['snapshot']} に {len(saved['files'])}ファイルを保存しました。")
+
+
 st.set_page_config(page_title=f"{PROJECT_JAPANESE_NAME} | {PROJECT_SHORT_NAME}", layout="wide")
 st.title(PROJECT_JAPANESE_NAME)
 st.caption(f"{PROJECT_ENGLISH_NAME}（{PROJECT_SHORT_NAME}）")
@@ -1028,6 +1108,8 @@ with st.expander("起動ガイド", expanded=False):
 
 with st.expander("開発ロードマップ", expanded=False):
     render_roadmap()
+
+render_accuracy_baseline_research()
 
 if lab == "ホーム":
     render_home()
