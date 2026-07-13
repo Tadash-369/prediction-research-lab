@@ -39,6 +39,70 @@ def preview(game="loto6", commit=COMMIT_A, models=None):
 
 
 class ProspectiveEvidenceTests(unittest.TestCase):
+    def test_integer_seed_csv_round_trip_preserves_record_hash(self):
+        _, result = preview(models=["frequency_analysis", "random_baseline"])
+        records = result["records"].copy()
+        records.loc[records["正規化モデル名"] == "random_baseline", "使用seed"] = 723
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "predictions.csv"
+            records.to_csv(path, index=False, encoding="utf-8-sig")
+            loaded = pe.read_evidence_csv(path)
+        random_before = records[records["正規化モデル名"] == "random_baseline"].iloc[0].to_dict()
+        random_after = loaded[loaded["正規化モデル名"] == "random_baseline"].iloc[0].to_dict()
+        self.assertEqual(random_after["使用seed"], "723")
+        self.assertEqual(pe._record_hash(random_before), pe._record_hash(random_after))
+
+    def test_seed_compatibility_values_share_hash_and_evidence_id(self):
+        _, result = preview(models=["random_baseline"])
+        base = result["records"].iloc[0].to_dict()
+        record_hashes = set()
+        evidence_ids = set()
+        for seed in (723, "723", 723.0):
+            record = {**base, "使用seed": seed}
+            record_hashes.add(pe.calculate_record_sha256(record))
+            evidence_ids.add(pe.calculate_evidence_id({"game": "loto7", "draw": 686, "model": "random_baseline", "candidate": 1, "numbers": [9, 10, 19, 20, 24, 29, 37], "input_hash": "f" * 64, "commit": COMMIT_A, "seed": seed}))
+        self.assertEqual(len(record_hashes), 1)
+        self.assertEqual(len(evidence_ids), 1)
+
+    def test_missing_seed_and_nan_normalize_to_empty_string(self):
+        _, result = preview(models=["frequency_analysis"])
+        base = result["records"].iloc[0].to_dict()
+        hashes = set()
+        for seed in ("", None, float("nan"), "None", "null", "nan", "unknown", "not_supported"):
+            normalized = pe.normalize_evidence_record({**base, "使用seed": seed})
+            self.assertEqual(normalized["使用seed"], "")
+            hashes.add(pe.calculate_record_sha256(normalized))
+        self.assertEqual(len(hashes), 1)
+
+    def test_invalid_seed_is_rejected(self):
+        _, result = preview(models=["random_baseline"])
+        with self.assertRaises(ValueError):
+            pe.normalize_evidence_record({**result["records"].iloc[0].to_dict(), "使用seed": "seed-723"})
+
+    def test_bool_and_integer_columns_are_canonical(self):
+        _, result = preview(models=["frequency_analysis"])
+        base = result["records"].iloc[0].to_dict()
+        first = pe.normalize_evidence_record({**base, "prospective判定": True, "抽せん前保存判定": "True", "開催回": 11, "候補番号": "1", "予測口数": 1.0})
+        second = pe.normalize_evidence_record({**base, "prospective判定": "1", "抽せん前保存判定": 1, "開催回": "11.0", "候補番号": 1.0, "予測口数": "1"})
+        self.assertEqual(first, second)
+        self.assertIsInstance(first["開催回"], int)
+        self.assertIsInstance(first["候補番号"], int)
+        self.assertIsInstance(first["prospective判定"], bool)
+
+    def test_saved_ids_record_hashes_and_batch_hash_survive_round_trip(self):
+        diag, result = preview(models=["frequency_analysis", "random_baseline"])
+        with tempfile.TemporaryDirectory() as directory:
+            saved = pe.save_batch(result["records"], diag, Path(directory), datetime(2026, 1, 2, 11))
+            checked = pe.verify_batch(saved["path"])
+            self.assertEqual(checked["status"], "valid")
+            self.assertEqual(set(result["records"]["evidence_id"]), set(checked["records"]["evidence_id"]))
+            self.assertTrue(all(pe.calculate_record_sha256(row) == row["レコードSHA-256"] for row in checked["records"].to_dict("records")))
+            self.assertEqual(pe._batch_hash(checked["records"].to_dict("records")), saved["batch_sha256"])
+
+    def test_prospective_evidence_directory_is_gitignored(self):
+        gitignore = (Path(__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("loto_lab/data/research/prospective_evidence/", gitignore.splitlines())
+
     def test_games_do_not_mix(self):
         _, l6 = preview("loto6", models=["frequency_analysis"])
         _, l7 = preview("loto7", models=["frequency_analysis"])

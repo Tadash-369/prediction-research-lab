@@ -50,3 +50,6 @@ loto_lab/data/backups/
 # Regeneratable lottery score outputs
 loto_lab/data/*_next_number_scores.csv
 loto_lab/data/model_settings.csv
+
+# Prospective evidence is immutable local research data
+loto_lab/data/research/prospective_evidence/

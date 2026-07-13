@@ -25,6 +25,11 @@ EVIDENCE_COLUMNS = [
     "レコードSHA-256", "バッチSHA-256", "備考",
 ]
 RECORD_HASH_EXCLUDED = {"レコードSHA-256", "バッチSHA-256"}
+EVIDENCE_INTEGER_COLUMNS = {"開催回", "候補番号", "予測口数", "入力データ最終開催回", "入力データ件数"}
+EVIDENCE_BOOLEAN_COLUMNS = {"prospective判定", "抽せん前保存判定"}
+EVIDENCE_SEED_COLUMN = "使用seed"
+EVIDENCE_STRING_COLUMNS = set(EVIDENCE_COLUMNS) - EVIDENCE_INTEGER_COLUMNS - EVIDENCE_BOOLEAN_COLUMNS - {EVIDENCE_SEED_COLUMN}
+MISSING_TEXT_VALUES = {"", "none", "null", "nan", "unknown", "not_supported"}
 GAME_CONFIGS = {
     "loto6": {"draw_size": 6, "number_max": 43, "main_columns": [f"第{i}数字" for i in range(1, 7)], "bonus_columns": ["BONUS数字"]},
     "loto7": {"draw_size": 7, "number_max": 37, "main_columns": [f"第{i}数字" for i in range(1, 8)], "bonus_columns": ["BONUS数字1", "BONUS数字2"]},
@@ -44,6 +49,19 @@ def read_csv_safely(path: Path) -> pd.DataFrame:
         except pd.errors.EmptyDataError:
             return pd.DataFrame()
     return pd.DataFrame()
+
+
+def read_evidence_csv(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=EVIDENCE_COLUMNS)
+    for encoding in ("utf-8-sig", "utf-8", "cp932"):
+        try:
+            return pd.read_csv(path, encoding=encoding, dtype=str, keep_default_na=False, na_filter=False)
+        except UnicodeDecodeError:
+            continue
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame(columns=EVIDENCE_COLUMNS)
+    raise ValueError(f"evidence CSV encoding is invalid: {path}")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -111,9 +129,89 @@ def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
 
 
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return isinstance(value, str) and value.strip().lower() in MISSING_TEXT_VALUES
+
+
+def _canonical_integer(value: Any, column: str, allow_missing: bool = False) -> int | str:
+    if _is_missing_value(value):
+        if allow_missing:
+            return ""
+        raise ValueError(f"{column} is required")
+    if isinstance(value, bool):
+        raise ValueError(f"{column} must be an integer")
+    try:
+        numeric = float(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{column} must be an integer: {value}") from exc
+    if not numeric.is_integer():
+        raise ValueError(f"{column} must be an integer: {value}")
+    return int(numeric)
+
+
+def _canonical_boolean(value: Any, column: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if not _is_missing_value(value):
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1"}:
+            return True
+        if normalized in {"false", "0"}:
+            return False
+    raise ValueError(f"{column} must be a boolean: {value}")
+
+
+def _canonical_string(value: Any) -> str:
+    return "" if _is_missing_value(value) else str(value).strip()
+
+
+def normalize_evidence_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = {}
+    for column in EVIDENCE_COLUMNS:
+        value = record.get(column, "")
+        if column in EVIDENCE_INTEGER_COLUMNS:
+            normalized[column] = _canonical_integer(value, column)
+        elif column in EVIDENCE_BOOLEAN_COLUMNS:
+            normalized[column] = _canonical_boolean(value, column)
+        elif column == EVIDENCE_SEED_COLUMN:
+            normalized[column] = _canonical_integer(value, column, allow_missing=True)
+        else:
+            normalized[column] = _canonical_string(value)
+    return normalized
+
+
+def canonicalize_evidence_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_evidence_record(record)
+    return {key: normalized[key] for key in EVIDENCE_COLUMNS if key not in RECORD_HASH_EXCLUDED}
+
+
+def calculate_record_sha256(record: dict[str, Any]) -> str:
+    return sha256_bytes(_canonical_json(canonicalize_evidence_record(record)))
+
+
 def _record_hash(record: dict[str, Any]) -> str:
-    payload = {key: record.get(key, "") for key in EVIDENCE_COLUMNS if key not in RECORD_HASH_EXCLUDED}
-    return sha256_bytes(_canonical_json(payload))
+    return calculate_record_sha256(record)
+
+
+def calculate_evidence_id(identity: dict[str, Any]) -> str:
+    canonical = {
+        "game": _canonical_string(identity.get("game")),
+        "draw": _canonical_integer(identity.get("draw"), "draw"),
+        "model": _canonical_string(identity.get("model")),
+        "candidate": _canonical_integer(identity.get("candidate"), "candidate"),
+        "numbers": [int(number) for number in identity.get("numbers", [])],
+        "input_hash": _canonical_string(identity.get("input_hash")),
+        "commit": _canonical_string(identity.get("commit")),
+        "seed": _canonical_integer(identity.get("seed"), "seed", allow_missing=True),
+    }
+    return sha256_bytes(_canonical_json(canonical))
 
 
 def _batch_hash(records: list[dict[str, Any]]) -> str:
@@ -227,7 +325,7 @@ def generate_preview(context: dict[str, Any], diagnosis: dict[str, Any], selecte
             continue
         identity = {"game": context["game"], "draw": context["target_draw"], "model": key, "candidate": 1, "numbers": numbers, "input_hash": diagnosis["input_hash"], "commit": diagnosis["commit_hash"], "seed": seed}
         record = {
-            "evidence_id": sha256_bytes(_canonical_json(identity)), "game": context["game"], "開催回": context["target_draw"], "抽せん日": context["draw_date"],
+            "evidence_id": calculate_evidence_id(identity), "game": context["game"], "開催回": context["target_draw"], "抽せん日": context["draw_date"],
             "予測生成日時": generated_at.isoformat(timespec="seconds"), "保存日時": "pending", "使用モデル": label, "正規化モデル名": key,
             "モデルバージョン": MODEL_VERSION, "重みバージョン": "not_applicable", "使用seed": seed, "再現性レベル": model["reproducibility"],
             "候補番号": 1, "予測番号": _numbers_text(numbers), "予測口数": 1, "入力データ最終開催回": diagnosis["input_latest_draw"],
@@ -236,7 +334,8 @@ def generate_preview(context: dict[str, Any], diagnosis: dict[str, Any], selecte
             "予測生成オプション": json.dumps({"draw_size": config["draw_size"], "number_max": config["number_max"], "ticket_count": 1}, ensure_ascii=False, sort_keys=True),
             "prospective判定": True, "抽せん前保存判定": True, "保存状態": "preview", "レコードSHA-256": "", "バッチSHA-256": "", "備考": "本番買い目・正式予測履歴とは分離",
         }
-        record["レコードSHA-256"] = _record_hash(record)
+        record = normalize_evidence_record(record)
+        record["レコードSHA-256"] = calculate_record_sha256(record)
         records.append(record)
     return {"records": pd.DataFrame(records, columns=EVIDENCE_COLUMNS), "errors": errors, "model_status": catalog}
 
@@ -247,7 +346,7 @@ def _existing_evidence_ids(root: Path, game: str) -> set[str]:
     if not game_root.exists():
         return values
     for path in game_root.rglob("predictions.csv"):
-        frame = read_csv_safely(path)
+        frame = read_evidence_csv(path)
         if "evidence_id" in frame:
             values.update(frame["evidence_id"].astype(str))
     return values
@@ -264,7 +363,7 @@ def verify_batch(batch_dir: Path) -> dict[str, Any]:
         return {"status": "invalid_schema", "reasons": ["predictions.csvまたはmanifest.jsonがありません"], "records": pd.DataFrame()}
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        frame = read_csv_safely(csv_path)
+        frame = read_evidence_csv(csv_path)
     except Exception as exc:
         return {"status": "corrupted", "reasons": [str(exc)], "records": pd.DataFrame()}
     reasons = []
@@ -277,9 +376,15 @@ def verify_batch(batch_dir: Path) -> dict[str, Any]:
     manifest_payload = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     if sha256_bytes(_canonical_json(manifest_payload)) != manifest.get("manifest_sha256"):
         reasons.append("manifest hash mismatch")
-    records = frame.to_dict("records") if not frame.empty else []
-    for record in records:
-        if _record_hash(record) != str(record.get("レコードSHA-256", "")):
+    records = []
+    for raw_record in frame.to_dict("records") if not frame.empty else []:
+        try:
+            record = normalize_evidence_record(raw_record)
+        except ValueError as exc:
+            reasons.append(f"invalid schema: {exc}")
+            continue
+        records.append(record)
+        if calculate_record_sha256(record) != record.get("レコードSHA-256", ""):
             reasons.append(f"record hash mismatch: {record.get('evidence_id', '')}")
         numbers = _parse_numbers(record.get("予測番号"))
         config = GAME_CONFIGS.get(str(record.get("game")))
@@ -293,7 +398,9 @@ def verify_batch(batch_dir: Path) -> dict[str, Any]:
             reasons.append(f"required value missing: {record.get('evidence_id', '')}")
     if records and _batch_hash(records) != manifest.get("batch_sha256"):
         reasons.append("batch hash mismatch")
-    return {"status": "invalid_hash" if reasons else "valid", "reasons": reasons, "records": frame, "manifest": manifest}
+    normalized_frame = pd.DataFrame(records, columns=EVIDENCE_COLUMNS)
+    status = "invalid_schema" if any(reason.startswith("invalid schema:") for reason in reasons) else "invalid_hash" if reasons else "valid"
+    return {"status": status, "reasons": reasons, "records": normalized_frame, "manifest": manifest}
 
 
 def save_batch(preview: pd.DataFrame, diagnosis: dict[str, Any], root: Path, saved_at: datetime | None = None, fail_stage: str = "") -> dict[str, Any]:
@@ -302,10 +409,11 @@ def save_batch(preview: pd.DataFrame, diagnosis: dict[str, Any], root: Path, sav
     if preview is None or preview.empty:
         raise ValueError("保存対象がありません")
     game = str(diagnosis["game"])
-    if preview["evidence_id"].astype(str).duplicated().any():
+    normalized_preview = pd.DataFrame([normalize_evidence_record(record) for record in preview.to_dict("records")], columns=EVIDENCE_COLUMNS)
+    if normalized_preview["evidence_id"].duplicated().any():
         raise ValueError("バッチ内でevidence_idが重複しています")
     existing = _existing_evidence_ids(root, game)
-    duplicate = set(preview["evidence_id"].astype(str)) & existing
+    duplicate = set(normalized_preview["evidence_id"]) & existing
     if duplicate:
         raise FileExistsError(f"完全同一証拠は保存済みです: {sorted(duplicate)[0]}")
     saved_at = saved_at or datetime.now()
@@ -315,15 +423,16 @@ def save_batch(preview: pd.DataFrame, diagnosis: dict[str, Any], root: Path, sav
     temp_dir = final_dir.parent / f".{final_dir.name}.tmp-{uuid.uuid4().hex}"
     temp_dir.mkdir(parents=True, exist_ok=False)
     try:
-        records = preview.copy()
+        records = normalized_preview.copy()
         records["保存日時"] = saved_at.isoformat(timespec="seconds")
         records["保存状態"] = "saved"
         for index, record in records.iterrows():
-            records.at[index, "レコードSHA-256"] = _record_hash(record.to_dict())
+            records.at[index, "レコードSHA-256"] = calculate_record_sha256(record.to_dict())
         payload = records.to_dict("records")
         batch_hash = _batch_hash(payload)
         records["バッチSHA-256"] = batch_hash
         csv_path = temp_dir / "predictions.csv"
+        records = pd.DataFrame([normalize_evidence_record(record) for record in records.to_dict("records")], columns=EVIDENCE_COLUMNS)
         records.to_csv(csv_path, index=False, encoding="utf-8-sig")
         manifest = {"schema_version": "1.0", "game": game, "draw_no": int(diagnosis["target_draw"]), "draw_date": diagnosis["draw_date"], "created_at": saved_at.isoformat(timespec="seconds"), "record_count": len(records), "batch_sha256": batch_hash, "file_sha256": sha256_file(csv_path), "commit_hash": diagnosis["commit_hash"], "input_data_sha256": diagnosis["input_hash"]}
         manifest["manifest_sha256"] = sha256_bytes(_canonical_json(manifest))
