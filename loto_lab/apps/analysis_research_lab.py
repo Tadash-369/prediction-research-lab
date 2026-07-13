@@ -11,6 +11,7 @@ AI_IMPROVEMENT_DIR = DATA_DIR / "ai_improvement"
 DOCS_DIR = LOTO_LAB_DIR / "docs"
 BACKUP_DIR = DATA_DIR / "backups"
 ACCURACY_BASELINE_DIR = DATA_DIR / "research" / "accuracy_baseline"
+PROSPECTIVE_EVIDENCE_DIR = DATA_DIR / "research" / "prospective_evidence"
 
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
@@ -19,6 +20,8 @@ import pandas as pd
 import streamlit as st
 
 from accuracy_baseline import load_accuracy_baseline, planned_report_files, save_accuracy_baseline_report
+from prospective_evidence import generate_preview, load_game_context, model_catalog as prospective_model_catalog
+from prospective_evidence import planned_batch_path, save_batch as save_prospective_batch, scan_evidence
 from arl_research_engine import (
     CONTRIBUTION_COLUMNS,
     FUTURE_LOTO_MODEL_LABELS,
@@ -1089,6 +1092,75 @@ def render_accuracy_baseline_research():
                 st.success(f"{saved['snapshot']} に {len(saved['files'])}ファイルを保存しました。")
 
 
+def render_prospective_evidence():
+    with st.expander("将来予測証拠", expanded=False):
+        st.caption("本番買い目・正式予測履歴とは分離し、抽せん前の研究用予測だけを改変検出可能なバッチとして保存します。")
+        contexts = {game: load_game_context(DATA_DIR, PROJECT_ROOT, game) for game in ("loto6", "loto7")}
+        overview = []
+        for game, label in (("loto6", "ロト6"), ("loto7", "ロト7")):
+            diagnosis = contexts[game]["diagnosis"]
+            overview.append({"ゲーム": label, "次回開催回": diagnosis["target_draw"], "次回抽せん日": diagnosis["draw_date"],
+                "保存可否": "可能" if diagnosis["prospective"] else "不可", "保存不可理由": " / ".join(diagnosis["reasons"]),
+                "入力最終回": diagnosis["input_latest_draw"], "入力件数": diagnosis["input_count"],
+                "入力SHA-256": diagnosis["input_hash"], "commit hash": diagnosis["commit_hash"]})
+        display_dataframe(pd.DataFrame(overview), width="stretch", hide_index=True)
+
+        catalog = prospective_model_catalog()
+        st.markdown("**対象モデル一覧**")
+        display_dataframe(catalog, width="stretch", hide_index=True)
+        active = catalog[catalog["status"] == "有効"]
+        game = st.radio("証拠対象", ["loto6", "loto7"], horizontal=True, key="prospective_game")
+        all_models = st.checkbox("有効モデルを一括実行", value=True, key="prospective_all_models")
+        selected = st.multiselect("選択モデル", active["model_key"].tolist(), default=[], disabled=all_models,
+            format_func=lambda key: str(active.loc[active["model_key"] == key, "model_name"].iloc[0]), key="prospective_selected_models")
+        selected_models = active["model_key"].tolist() if all_models else selected
+        diagnosis = contexts[game]["diagnosis"]
+        if st.button("メモリ上で予測プレビュー", disabled=not diagnosis["prospective"] or not selected_models, key="prospective_preview"):
+            with st.spinner("既存モデルから研究用予測を生成しています..."):
+                st.session_state["prospective_preview_result"] = generate_preview(contexts[game]["context"], diagnosis, selected_models)
+                st.session_state["prospective_preview_game"] = game
+
+        preview_result = st.session_state.get("prospective_preview_result")
+        preview_game = st.session_state.get("prospective_preview_game")
+        preview = preview_result["records"] if preview_result and preview_game == game else pd.DataFrame()
+        if not diagnosis["prospective"]:
+            st.warning("保存不可: " + " / ".join(diagnosis["reasons"]))
+        if preview_result and preview_game == game:
+            st.markdown("**予測プレビュー**")
+            display_dataframe(preview, width="stretch", hide_index=True)
+            if preview_result["errors"]:
+                st.warning(f"モデル実行エラー {len(preview_result['errors'])}件。他モデルの結果は維持しています。")
+
+        existing = scan_evidence(PROSPECTIVE_EVIDENCE_DIR, {
+            "loto6": read_csv(DATA_DIR / "results.csv"), "loto7": read_csv(DATA_DIR / "loto7_results.csv")})
+        duplicate_count = int(preview["evidence_id"].isin(set(existing["evidence_id"])).sum()) if not preview.empty and not existing.empty else 0
+        status_cols = st.columns(4)
+        status_cols[0].metric("既存証拠", len(existing))
+        status_cols[1].metric("評価待ち", int((existing["evaluation_status"] == "awaiting_result").sum()) if not existing.empty else 0)
+        status_cols[2].metric("評価可能", int((existing["evaluation_status"] == "evaluation_ready").sum()) if not existing.empty else 0)
+        status_cols[3].metric("破損・改変疑い", int((existing["integrity_status"] != "valid").sum()) if not existing.empty else 0)
+        if not existing.empty:
+            display_dataframe(existing, width="stretch", hide_index=True)
+
+        target_path = planned_batch_path(PROSPECTIVE_EVIDENCE_DIR, game, diagnosis["target_draw"] or 0)
+        safety = pd.DataFrame([{"game": game, "開催回": diagnosis["target_draw"], "抽せん日": diagnosis["draw_date"],
+            "現在日時": diagnosis["current_time"], "入力最終回": diagnosis["input_latest_draw"], "対象モデル数": len(selected_models),
+            "予測口数": len(preview), "commit hash": diagnosis["commit_hash"], "入力SHA-256": diagnosis["input_hash"],
+            "保存予定先": str(target_path), "重複件数": duplicate_count, "prospective判定": diagnosis["prospective"],
+            "保存不可理由": " / ".join(diagnosis["reasons"])}])
+        st.markdown("**保存前安全確認**")
+        display_dataframe(safety, width="stretch", hide_index=True)
+        can_save = diagnosis["prospective"] and not preview.empty and duplicate_count == 0 and preview_game == game
+        confirmed = st.checkbox("不変の研究証拠バッチとして保存する", disabled=not can_save, key="prospective_save_confirm")
+        if st.button("研究証拠を原子的に保存", disabled=not can_save or not confirmed, key="prospective_save"):
+            try:
+                saved = save_prospective_batch(preview, diagnosis, PROSPECTIVE_EVIDENCE_DIR)
+            except Exception as exc:
+                st.error(f"保存できませんでした。不完全バッチは残しません: {exc}")
+            else:
+                st.success(f"{saved['path']} に {saved['record_count']}件を保存しました。")
+
+
 st.set_page_config(page_title=f"{PROJECT_JAPANESE_NAME} | {PROJECT_SHORT_NAME}", layout="wide")
 st.title(PROJECT_JAPANESE_NAME)
 st.caption(f"{PROJECT_ENGLISH_NAME}（{PROJECT_SHORT_NAME}）")
@@ -1110,6 +1182,7 @@ with st.expander("開発ロードマップ", expanded=False):
     render_roadmap()
 
 render_accuracy_baseline_research()
+render_prospective_evidence()
 
 if lab == "ホーム":
     render_home()
