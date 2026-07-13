@@ -50,8 +50,10 @@ from balance_weight_adoption_ui import render_adoption_overview
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value, run_maintenance
 from runtime_settings import (
+    diagnose_fallback_events,
     diagnose_runtime_setting,
     diagnose_runtime_setting_history,
+    read_fallback_events,
     read_runtime_setting_history,
 )
 
@@ -67,6 +69,7 @@ RUNTIME_HEALTH_CONFIGS = [
         "runtime": BASE_DIR / "runtime" / "model_settings.csv",
         "template": BASE_DIR / "config_templates" / "model_settings.template.csv",
         "history": BASE_DIR / "runtime" / "model_settings_history.csv",
+        "fallback_events": BASE_DIR / "runtime" / "loto6_fallback_events.csv",
         "game": "loto6",
         "setting_name": "active_next_prediction",
     },
@@ -75,6 +78,7 @@ RUNTIME_HEALTH_CONFIGS = [
         "runtime": BASE_DIR / "runtime" / "loto7_model_settings.csv",
         "template": BASE_DIR / "config_templates" / "loto7_model_settings.template.csv",
         "history": BASE_DIR / "runtime" / "loto7_model_settings_history.csv",
+        "fallback_events": BASE_DIR / "runtime" / "loto7_fallback_events.csv",
         "game": "loto7",
         "setting_name": "active_loto7_prediction",
     },
@@ -456,6 +460,41 @@ def render_runtime_setting_history(config):
         st.error(" / ".join(map(str, errors)))
 
 
+def render_fallback_event_audit(config):
+    diagnosis = diagnose_fallback_events(config["fallback_events"])
+    events = read_fallback_events(config["fallback_events"], game=config["game"], limit=10)
+    status = diagnosis.get("status", "error")
+    status_label = diagnosis.get("status_label", "不明")
+    if status in {"healthy", "missing"}:
+        st.success("Fallbackイベントは記録されていません。" if status == "missing" else f"監査状態: {status_label}")
+    elif status == "warning":
+        st.warning(f"監査状態: {status_label}")
+    else:
+        st.error(f"監査状態: {status_label}")
+
+    metrics = st.columns(4)
+    metrics[0].metric("未復旧", diagnosis.get("unresolved_count", 0))
+    metrics[1].metric("総イベント", diagnosis.get("event_count", 0))
+    metrics[2].metric("復旧済み", diagnosis.get("resolved_count", 0))
+    metrics[3].metric("直近発生", diagnosis.get("latest_occurred_at") or "-")
+    if not events.empty:
+        latest = events.iloc[0]
+        st.write(f"直近原因: {latest.get('原因コード') or '-'}")
+        st.write(f"直近発生箇所: {latest.get('発生箇所') or '-'}")
+        st.write(f"直近代替モデル: {latest.get('代替モデル名') or latest.get('代替モデルキー') or '-'}")
+        with st.expander("最新10件のFallbackイベント", expanded=False):
+            st.dataframe(events, width="stretch", hide_index=True)
+    elif status != "missing":
+        st.info("表示できるFallbackイベントはありません。")
+
+    warnings = diagnosis.get("warnings") or []
+    errors = diagnosis.get("errors") or []
+    if warnings:
+        st.warning(" / ".join(map(str, warnings)))
+    if errors:
+        st.error(" / ".join(map(str, errors)))
+
+
 def render_runtime_settings_health():
     st.markdown("**システム健全性**")
     st.markdown("**実行時設定診断（読み取り専用）**")
@@ -471,6 +510,12 @@ def render_runtime_settings_health():
     for tab, config in zip(history_tabs, RUNTIME_HEALTH_CONFIGS):
         with tab:
             render_runtime_setting_history(config)
+
+    st.markdown("**Fallbackイベント監査（読み取り専用）**")
+    fallback_tabs = st.tabs([config["label"] for config in RUNTIME_HEALTH_CONFIGS])
+    for tab, config in zip(fallback_tabs, RUNTIME_HEALTH_CONFIGS):
+        with tab:
+            render_fallback_event_audit(config)
 
 
 def purchase_summary_row(label, summary):

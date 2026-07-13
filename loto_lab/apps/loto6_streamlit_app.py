@@ -95,7 +95,15 @@ from balance_weight_research import build_balance_weight_research
 from balance_weight_adoption_ui import render_adoption_dry_run_ui
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value
-from runtime_settings import diagnose_runtime_setting, read_runtime_setting, save_runtime_setting
+from runtime_settings import (
+    diagnose_runtime_setting,
+    fallback_cause_code_from_diagnosis,
+    read_runtime_setting,
+    record_fallback_event,
+    runtime_state_token_from_diagnosis,
+    save_runtime_setting,
+    select_prediction_model,
+)
 
 
 def render_balance_research_details(balance_stats, diagnostics, reports=None, draw_size=6):
@@ -192,6 +200,7 @@ VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "verification_reports.csv"
 MODEL_SETTINGS_CSV = RUNTIME_DIR / "model_settings.csv"
 MODEL_SETTINGS_TEMPLATE_CSV = CONFIG_TEMPLATE_DIR / "model_settings.template.csv"
 MODEL_SETTINGS_HISTORY_CSV = RUNTIME_DIR / "model_settings_history.csv"
+FALLBACK_EVENTS_CSV = RUNTIME_DIR / "loto6_fallback_events.csv"
 CONTRIBUTIONS_CSV = VERIFICATION_DIR / "loto6_model_contributions.csv"
 RESEARCH_CYCLES_CSV = VERIFICATION_DIR / "loto6_research_cycles.csv"
 VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
@@ -593,6 +602,29 @@ def runtime_setting_diagnostic():
         BACKTEST_MODELS,
         create=False,
     )
+
+
+def record_prediction_fallback(diagnosis, decision, target_round):
+    details = [*(diagnosis.get("errors") or []), *(diagnosis.get("warnings") or [])]
+    try:
+        return record_fallback_event(
+            FALLBACK_EVENTS_CSV,
+            game="loto6",
+            occurrence_location="loto6_prediction_generation",
+            cause_code=fallback_cause_code_from_diagnosis(diagnosis),
+            cause_detail=" / ".join(map(str, details)),
+            source_setting_name=diagnosis.get("setting_name", ""),
+            source_model_key=diagnosis.get("model_key", ""),
+            source_model_name=diagnosis.get("model_name", ""),
+            fallback_method=decision["fallback_method"],
+            fallback_model_key=decision["selected_model_key"],
+            fallback_model_name=decision["selected_model_name"],
+            target_round=target_round,
+            runtime_state_token=runtime_state_token_from_diagnosis(diagnosis),
+            note="標準予想買い目生成時に安全な代替モデルを採用",
+        )
+    except Exception as exc:
+        return {"success": False, "recorded": False, "duplicate_suppressed": False, "errors": [str(exc)]}
 
 
 def render_runtime_setting_diagnostics(lottery_label="ロト6"):
@@ -2558,14 +2590,29 @@ def render_prediction_picks(scores, results, target_round):
     st.markdown("**研究フロー: 当選番号追加 → 結果分析 → 反省履歴保存 → 履歴分析 → モデル評価 → 改善条件抽出 → 次回予想生成**")
     with st.spinner("予想生成前の履歴分析とモデル評価を実行しています..."):
         pre_summary, _, best_model_key = get_pre_prediction_research(results)
+    runtime_diagnosis = runtime_setting_diagnostic()
     active_setting = read_active_model_setting()
-    active_model_key = best_model_key or (active_setting["model_key"] if active_setting else None)
-    active_model_name = BACKTEST_MODELS.get(active_model_key, active_setting["model_name"] if active_setting else "score_balance_v1")
+    model_decision = select_prediction_model(
+        best_model_key,
+        active_setting,
+        BACKTEST_MODELS,
+        "score_balance_v1",
+        "標準スコアバランス",
+        "safe_default",
+    )
+    active_model_key = None if model_decision["selection_source"] == "default" else model_decision["selected_model_key"]
+    active_model_name = model_decision["selected_model_name"]
     picks = generate_prediction_picks(scores, results, active_model_key=active_model_key, target_round=target_round)
     st.subheader("次回予想買い目")
     if not picks:
         st.info("買い目生成に必要な候補スコアまたは抽せん結果が不足しています。")
         return
+
+    if model_decision["fallback_active"]:
+        audit_result = record_prediction_fallback(runtime_diagnosis, model_decision, target_round)
+        st.warning(f"runtime設定を利用できなかったため、{active_model_name}へ安全に切り替えました。")
+        if not audit_result.get("success"):
+            st.caption("Fallback監査ログを保存できませんでしたが、予想処理は継続しています。")
 
     if best_model_key and not pre_summary.empty:
         best_row = pre_summary[pre_summary["モデル"] == BACKTEST_MODELS[best_model_key]].iloc[0]

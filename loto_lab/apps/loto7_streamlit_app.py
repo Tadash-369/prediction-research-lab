@@ -91,7 +91,15 @@ from balance_weight_research import build_balance_weight_research
 from balance_weight_adoption_ui import render_adoption_dry_run_ui
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value
-from runtime_settings import diagnose_runtime_setting, read_runtime_setting, save_runtime_setting
+from runtime_settings import (
+    diagnose_runtime_setting,
+    fallback_cause_code_from_diagnosis,
+    read_runtime_setting,
+    record_fallback_event,
+    runtime_state_token_from_diagnosis,
+    save_runtime_setting,
+    select_prediction_model,
+)
 
 
 def render_balance_research_details(balance_stats, diagnostics, reports=None, draw_size=7):
@@ -187,6 +195,7 @@ VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
 MODEL_SETTINGS_CSV = RUNTIME_DIR / "loto7_model_settings.csv"
 MODEL_SETTINGS_TEMPLATE_CSV = CONFIG_TEMPLATE_DIR / "loto7_model_settings.template.csv"
 MODEL_SETTINGS_HISTORY_CSV = RUNTIME_DIR / "loto7_model_settings_history.csv"
+FALLBACK_EVENTS_CSV = RUNTIME_DIR / "loto7_fallback_events.csv"
 CONTRIBUTIONS_CSV = VERIFICATION_DIR / "loto7_model_contributions.csv"
 RESEARCH_CYCLES_CSV = VERIFICATION_DIR / "loto7_research_cycles.csv"
 VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
@@ -383,6 +392,29 @@ def runtime_setting_diagnostic():
         MODEL_LABELS,
         create=False,
     )
+
+
+def record_prediction_fallback(diagnosis, decision, target_round):
+    details = [*(diagnosis.get("errors") or []), *(diagnosis.get("warnings") or [])]
+    try:
+        return record_fallback_event(
+            FALLBACK_EVENTS_CSV,
+            game="loto7",
+            occurrence_location="loto7_prediction_generation",
+            cause_code=fallback_cause_code_from_diagnosis(diagnosis),
+            cause_detail=" / ".join(map(str, details)),
+            source_setting_name=diagnosis.get("setting_name", ""),
+            source_model_key=diagnosis.get("model_key", ""),
+            source_model_name=diagnosis.get("model_name", ""),
+            fallback_method=decision["fallback_method"],
+            fallback_model_key=decision["selected_model_key"],
+            fallback_model_name=decision["selected_model_name"],
+            target_round=target_round,
+            runtime_state_token=runtime_state_token_from_diagnosis(diagnosis),
+            note="標準予想買い目生成時に安全な代替モデルを採用",
+        )
+    except Exception as exc:
+        return {"success": False, "recorded": False, "duplicate_suppressed": False, "errors": [str(exc)]}
 
 
 def render_runtime_setting_diagnostics(lottery_label="ロト7"):
@@ -2049,8 +2081,18 @@ def render_prediction_area(results):
     with st.spinner("予想生成前の履歴分析とモデル評価を実行しています..."):
         pre_summary, _, best_key = get_pre_prediction_research(results)
     model_options = [key for key in MODEL_LABELS if key not in ("random_baseline", CHAMINI6_GOD_MODE_KEY)]
+    selectable_models = {key: MODEL_LABELS[key] for key in model_options}
+    runtime_diagnosis = runtime_setting_diagnostic()
     active_setting = read_active_model_setting()
-    default_model = best_key if best_key in model_options else active_setting["model_key"] if active_setting and active_setting["model_key"] in model_options else "machine_learning"
+    model_decision = select_prediction_model(
+        best_key,
+        active_setting,
+        selectable_models,
+        "machine_learning",
+        MODEL_LABELS["machine_learning"],
+        "machine_learning_default",
+    )
+    default_model = model_decision["selected_model_key"]
     model_key = st.selectbox(
         "研究モデル",
         model_options,
@@ -2097,6 +2139,21 @@ def render_prediction_area(results):
     if not picks:
         st.info("予想生成に必要な履歴が不足しています。")
         return
+    if model_decision["fallback_active"]:
+        actual_decision = dict(model_decision)
+        if model_key != model_decision["selected_model_key"]:
+            actual_decision.update(
+                selected_model_key=model_key,
+                selected_model_name=MODEL_LABELS[model_key],
+                fallback_method="other",
+            )
+        audit_result = record_prediction_fallback(runtime_diagnosis, actual_decision, target_round)
+        if actual_decision["fallback_method"] == "best_key":
+            st.warning("runtime設定を利用できなかったため、事前分析の最上位モデルを使用しました。")
+        else:
+            st.warning(f"runtime設定を利用できなかったため、{actual_decision['selected_model_name']}へ安全に切り替えました。")
+        if not audit_result.get("success"):
+            st.caption("Fallback監査ログを保存できませんでしたが、予想処理は継続しています。")
     st.caption(f"第{target_round}回の標準予測を表示しています。まだ loto7_predictions.csv には保存していません。")
     if st.button("このロト7予測を保存", key="loto7_standard_prediction_save"):
         result = save_prediction_picks(picks, target_round, model_key, MODEL_LABELS[model_key])

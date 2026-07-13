@@ -1,5 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from fnmatch import fnmatchcase
+import hashlib
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +37,56 @@ RUNTIME_HISTORY_CHANGE_SOURCES = {
     "unknown",
 }
 RUNTIME_HISTORY_SAVE_RESULTS = {"success", "rejected", "failed", "no_change"}
+FALLBACK_EVENT_COLUMNS = [
+    "イベントID",
+    "ゲーム",
+    "発生日時",
+    "発生箇所",
+    "原因コード",
+    "原因詳細",
+    "元設定名",
+    "元モデルキー",
+    "元モデル名",
+    "代替方式",
+    "代替モデルキー",
+    "代替モデル名",
+    "対象開催回",
+    "重複キー",
+    "復旧状態",
+    "復旧日時",
+    "備考",
+]
+FALLBACK_CAUSE_CODES = {
+    "runtime_missing",
+    "runtime_empty",
+    "runtime_unreadable",
+    "runtime_columns_missing",
+    "setting_name_missing",
+    "setting_name_duplicate",
+    "model_key_empty",
+    "model_key_invalid",
+    "model_name_corrupted",
+    "template_missing",
+    "template_invalid",
+    "unknown_runtime_error",
+}
+FALLBACK_OCCURRENCE_LOCATIONS = {
+    "loto6_prediction_generation",
+    "loto6_pre_prediction_research",
+    "loto6_backtest",
+    "loto7_prediction_generation",
+    "loto7_pre_prediction_research",
+    "loto7_backtest",
+    "unknown",
+}
+FALLBACK_METHODS = {
+    "machine_learning_default",
+    "best_key",
+    "safe_default",
+    "existing_session_value",
+    "other",
+}
+FALLBACK_RECOVERY_STATES = {"unresolved", "resolved", "auto_resolved", "ignored"}
 RUNTIME_DIAGNOSIS_STATUS_LABELS = {
     "healthy": "正常",
     "warning": "注意",
@@ -47,6 +99,13 @@ RUNTIME_HISTORY_STATUS_LABELS = {
     "healthy": "正常",
     "warning": "注意",
     "missing": "履歴なし",
+    "corrupted": "破損",
+    "error": "読込エラー",
+}
+FALLBACK_EVENT_STATUS_LABELS = {
+    "healthy": "正常",
+    "warning": "注意",
+    "missing": "イベントなし",
     "corrupted": "破損",
     "error": "読込エラー",
 }
@@ -661,6 +720,409 @@ def diagnose_runtime_setting_history(history_csv):
         diagnostic["warnings"].append("変更日時が空欄の履歴があります。")
     if diagnostic["corrupted_model_name_count"]:
         diagnostic["warnings"].append("モデル名に破損疑い文字 '?' を含む履歴があります。")
+    return diagnostic
+
+
+def select_prediction_model(
+    best_key,
+    runtime_setting,
+    valid_model_keys,
+    default_model_key,
+    default_model_name,
+    default_fallback_method,
+):
+    model_names = _available_model_names(valid_model_keys)
+    best_key = _clean_runtime_value(best_key)
+    runtime_key = _clean_runtime_value((runtime_setting or {}).get("model_key"))
+    runtime_usable = bool(runtime_key and runtime_key in model_names)
+    best_usable = bool(best_key and best_key in model_names)
+    if best_usable:
+        selected_key = best_key
+        selected_name = model_names.get(best_key, best_key)
+        selection_source = "best_key"
+    elif runtime_usable:
+        selected_key = runtime_key
+        selected_name = _clean_runtime_value((runtime_setting or {}).get("model_name")) or model_names.get(runtime_key, runtime_key)
+        selection_source = "runtime"
+    else:
+        selected_key = _clean_runtime_value(default_model_key)
+        selected_name = _clean_runtime_value(default_model_name) or model_names.get(selected_key, selected_key)
+        selection_source = "default"
+    fallback_active = not runtime_usable
+    fallback_method = ""
+    if fallback_active:
+        fallback_method = "best_key" if selection_source == "best_key" else default_fallback_method
+    return {
+        "selected_model_key": selected_key,
+        "selected_model_name": selected_name,
+        "selection_source": selection_source,
+        "runtime_usable": runtime_usable,
+        "fallback_active": fallback_active,
+        "fallback_method": fallback_method,
+    }
+
+
+def fallback_cause_code_from_diagnosis(diagnosis):
+    diagnosis = diagnosis or {}
+    if not diagnosis.get("runtime_file_exists"):
+        return "runtime_missing"
+    if not diagnosis.get("readable"):
+        return "runtime_unreadable"
+    if not diagnosis.get("required_columns_ok"):
+        return "runtime_columns_missing"
+    if int(diagnosis.get("row_count") or 0) == 0:
+        return "runtime_empty"
+    if int(diagnosis.get("matching_row_count") or 0) == 0:
+        return "setting_name_missing"
+    if int(diagnosis.get("matching_row_count") or 0) > 1:
+        return "setting_name_duplicate"
+    if not _clean_runtime_value(diagnosis.get("model_key")):
+        return "model_key_empty"
+    if not diagnosis.get("model_key_ok"):
+        return "model_key_invalid"
+    if not diagnosis.get("model_name_ok"):
+        return "model_name_corrupted"
+    if not diagnosis.get("template_file_exists"):
+        return "template_missing"
+    if diagnosis.get("template_status") not in {"healthy", "warning"}:
+        return "template_invalid"
+    return "unknown_runtime_error"
+
+
+def runtime_state_token_from_diagnosis(diagnosis):
+    diagnosis = diagnosis or {}
+    payload = {
+        key: diagnosis.get(key)
+        for key in (
+            "status",
+            "runtime_file_exists",
+            "readable",
+            "required_columns_ok",
+            "row_count",
+            "matching_row_count",
+            "model_key",
+            "model_name",
+            "updated_at",
+            "template_status",
+            "errors",
+            "warnings",
+        )
+    }
+    path = Path(diagnosis.get("path", ""))
+    try:
+        if path.is_file():
+            stat = path.stat()
+            payload["file_size"] = stat.st_size
+            payload["file_mtime_ns"] = stat.st_mtime_ns
+    except OSError:
+        pass
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def build_fallback_dedup_key(
+    game,
+    occurrence_location,
+    cause_code,
+    source_model_key,
+    fallback_model_key,
+    target_round,
+    runtime_state_token="",
+):
+    values = [
+        game,
+        occurrence_location,
+        cause_code,
+        source_model_key,
+        fallback_model_key,
+        target_round,
+        runtime_state_token,
+    ]
+    text = "|".join(_clean_runtime_value(value) for value in values)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def _fallback_event_id(game):
+    prefix = {"loto6": "L6", "loto7": "L7"}.get(_clean_runtime_value(game), "RX")
+    return f"{prefix}-FALLBACK-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+
+
+def _read_fallback_event_csv(path):
+    path = Path(path)
+    for encoding in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            return pd.read_csv(path, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path)
+
+
+def read_fallback_events(events_csv, game=None, limit=None):
+    path = Path(events_csv)
+    if not path.is_file():
+        return pd.DataFrame(columns=FALLBACK_EVENT_COLUMNS)
+    try:
+        events = _read_fallback_event_csv(path)
+    except Exception:
+        return pd.DataFrame(columns=FALLBACK_EVENT_COLUMNS)
+    if _missing_columns(events, FALLBACK_EVENT_COLUMNS):
+        return pd.DataFrame(columns=FALLBACK_EVENT_COLUMNS)
+    events = events.reindex(columns=FALLBACK_EVENT_COLUMNS).copy()
+    if game is not None:
+        events = events[events["ゲーム"].map(_clean_runtime_value) == _clean_runtime_value(game)]
+    events["_occurred_at"] = pd.to_datetime(events["発生日時"], errors="coerce")
+    events["_row_order"] = range(len(events))
+    events = events.sort_values(["_occurred_at", "_row_order"], ascending=[False, False], na_position="last")
+    events = events.drop(columns=["_occurred_at", "_row_order"])
+    if limit is not None:
+        try:
+            events = events.head(max(0, int(limit)))
+        except (TypeError, ValueError):
+            pass
+    return events.reset_index(drop=True)
+
+
+def _write_fallback_events_atomic(events, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    output = events.reindex(columns=FALLBACK_EVENT_COLUMNS)
+    try:
+        output.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        check = _read_fallback_event_csv(tmp_path)
+        missing = _missing_columns(check, FALLBACK_EVENT_COLUMNS)
+        if missing:
+            raise ValueError("FallbackイベントCSVの一時保存検証に失敗しました: " + ", ".join(missing))
+        ids = check["イベントID"].map(_clean_runtime_value)
+        if ids.eq("").any() or ids.duplicated().any():
+            raise ValueError("FallbackイベントIDが空、または重複しています。")
+        if len(check) != len(output):
+            raise ValueError("FallbackイベントCSVの行数検証に失敗しました。")
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            if tmp_path.is_file():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def record_fallback_event(
+    events_csv,
+    *,
+    game,
+    occurrence_location,
+    cause_code,
+    fallback_method,
+    fallback_model_key,
+    fallback_model_name,
+    cause_detail="",
+    source_setting_name="",
+    source_model_key="",
+    source_model_name="",
+    target_round="",
+    runtime_state_token="",
+    occurred_at=None,
+    note="",
+    dedup_hours=24,
+):
+    result = {
+        "success": False,
+        "recorded": False,
+        "duplicate_suppressed": False,
+        "event_id": None,
+        "warnings": [],
+        "errors": [],
+    }
+    game = _clean_runtime_value(game)
+    occurrence_location = _clean_runtime_value(occurrence_location) or "unknown"
+    cause_code = _clean_runtime_value(cause_code)
+    fallback_method = _clean_runtime_value(fallback_method)
+    fallback_model_key = _clean_runtime_value(fallback_model_key)
+    fallback_model_name = _clean_runtime_value(fallback_model_name)
+    validation_errors = []
+    if game not in RUNTIME_HISTORY_GAMES:
+        validation_errors.append("ゲーム名が不正です。")
+    if occurrence_location not in FALLBACK_OCCURRENCE_LOCATIONS:
+        validation_errors.append("発生箇所が不正です。")
+    if cause_code not in FALLBACK_CAUSE_CODES:
+        validation_errors.append("原因コードが不正です。")
+    if fallback_method not in FALLBACK_METHODS:
+        validation_errors.append("代替方式が不正です。")
+    if not fallback_model_key or not fallback_model_name or "?" in fallback_model_name:
+        validation_errors.append("代替モデルが空、または破損しています。")
+    if validation_errors:
+        result["errors"].extend(validation_errors)
+        return result
+
+    occurred_dt = pd.to_datetime(occurred_at, errors="coerce") if occurred_at is not None else pd.Timestamp.now()
+    if pd.isna(occurred_dt):
+        occurred_dt = pd.Timestamp.now()
+    occurred_text = occurred_dt.strftime("%Y/%m/%d %H:%M:%S")
+    dedup_key = build_fallback_dedup_key(
+        game,
+        occurrence_location,
+        cause_code,
+        source_model_key,
+        fallback_model_key,
+        target_round,
+        runtime_state_token,
+    )
+    event_id = _fallback_event_id(game)
+    row = {
+        "イベントID": event_id,
+        "ゲーム": game,
+        "発生日時": occurred_text,
+        "発生箇所": occurrence_location,
+        "原因コード": cause_code,
+        "原因詳細": _clean_runtime_value(cause_detail),
+        "元設定名": _clean_runtime_value(source_setting_name),
+        "元モデルキー": _clean_runtime_value(source_model_key),
+        "元モデル名": _clean_runtime_value(source_model_name),
+        "代替方式": fallback_method,
+        "代替モデルキー": fallback_model_key,
+        "代替モデル名": fallback_model_name,
+        "対象開催回": _clean_runtime_value(target_round),
+        "重複キー": dedup_key,
+        "復旧状態": "unresolved",
+        "復旧日時": "",
+        "備考": _clean_runtime_value(note),
+    }
+    path = Path(events_csv)
+    try:
+        if path.exists():
+            existing = _read_fallback_event_csv(path)
+            missing = _missing_columns(existing, FALLBACK_EVENT_COLUMNS)
+            if missing:
+                raise ValueError("既存FallbackイベントCSVの不足列: " + ", ".join(missing))
+            existing = existing.reindex(columns=FALLBACK_EVENT_COLUMNS)
+        else:
+            existing = pd.DataFrame(columns=FALLBACK_EVENT_COLUMNS)
+
+        if not existing.empty:
+            same_key = existing["重複キー"].map(_clean_runtime_value).eq(dedup_key)
+            unresolved = existing["復旧状態"].map(_clean_runtime_value).eq("unresolved")
+            event_times = pd.to_datetime(existing["発生日時"], errors="coerce")
+            cutoff = occurred_dt - timedelta(hours=max(0, float(dedup_hours)))
+            recent = event_times.ge(cutoff) & event_times.le(occurred_dt)
+            matches = existing[same_key & unresolved & recent]
+            if not matches.empty:
+                result.update(
+                    success=True,
+                    duplicate_suppressed=True,
+                    event_id=_clean_runtime_value(matches.tail(1).iloc[0].get("イベントID")) or None,
+                )
+                return result
+
+        combined = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
+        _write_fallback_events_atomic(combined, path)
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        return result
+    result.update(success=True, recorded=True, event_id=event_id)
+    return result
+
+
+def diagnose_fallback_events(events_csv, stale_hours=24):
+    path = Path(events_csv)
+    diagnostic = {
+        "path": str(path),
+        "display_path": _display_path(path),
+        "status": "missing",
+        "status_label": FALLBACK_EVENT_STATUS_LABELS["missing"],
+        "file_exists": path.exists(),
+        "readable": False,
+        "required_columns_ok": False,
+        "event_count": 0,
+        "duplicate_event_ids": 0,
+        "duplicate_keys": 0,
+        "invalid_games": 0,
+        "invalid_cause_codes": 0,
+        "invalid_fallback_methods": 0,
+        "invalid_recovery_states": 0,
+        "missing_datetime_count": 0,
+        "corrupted_model_name_count": 0,
+        "unresolved_count": 0,
+        "resolved_count": 0,
+        "stale_unresolved_count": 0,
+        "latest_occurred_at": "",
+        "save_error_count": 0,
+        "warnings": [],
+        "errors": [],
+    }
+    if not path.exists():
+        return diagnostic
+    try:
+        events = _read_fallback_event_csv(path)
+        diagnostic["readable"] = True
+    except Exception as exc:
+        diagnostic["status"] = "error"
+        diagnostic["status_label"] = FALLBACK_EVENT_STATUS_LABELS["error"]
+        diagnostic["errors"].append(str(exc))
+        diagnostic["save_error_count"] = 1
+        return diagnostic
+    missing = _missing_columns(events, FALLBACK_EVENT_COLUMNS)
+    if missing:
+        diagnostic["status"] = "corrupted"
+        diagnostic["status_label"] = FALLBACK_EVENT_STATUS_LABELS["corrupted"]
+        diagnostic["errors"].append("不足列: " + ", ".join(missing))
+        return diagnostic
+
+    diagnostic["required_columns_ok"] = True
+    events = events.reindex(columns=FALLBACK_EVENT_COLUMNS)
+    diagnostic["event_count"] = int(len(events))
+    ids = events["イベントID"].map(_clean_runtime_value)
+    diagnostic["duplicate_event_ids"] = int(ids[ids.duplicated(keep=False) & ids.ne("")].nunique())
+    recovery = events["復旧状態"].map(_clean_runtime_value)
+    unresolved = recovery.eq("unresolved")
+    keys = events["重複キー"].map(_clean_runtime_value)
+    unresolved_keys = keys[unresolved & keys.ne("")]
+    diagnostic["duplicate_keys"] = int(unresolved_keys[unresolved_keys.duplicated(keep=False)].nunique())
+    diagnostic["invalid_games"] = int((~events["ゲーム"].map(_clean_runtime_value).isin(RUNTIME_HISTORY_GAMES)).sum())
+    diagnostic["invalid_cause_codes"] = int((~events["原因コード"].map(_clean_runtime_value).isin(FALLBACK_CAUSE_CODES)).sum())
+    diagnostic["invalid_fallback_methods"] = int((~events["代替方式"].map(_clean_runtime_value).isin(FALLBACK_METHODS)).sum())
+    diagnostic["invalid_recovery_states"] = int((~recovery.isin(FALLBACK_RECOVERY_STATES)).sum())
+    event_times = pd.to_datetime(events["発生日時"], errors="coerce")
+    diagnostic["missing_datetime_count"] = int(event_times.isna().sum())
+    source_names = events["元モデル名"].map(_clean_runtime_value)
+    fallback_names = events["代替モデル名"].map(_clean_runtime_value)
+    diagnostic["corrupted_model_name_count"] = int((source_names.str.contains("?", regex=False) | fallback_names.str.contains("?", regex=False)).sum())
+    diagnostic["unresolved_count"] = int(unresolved.sum())
+    diagnostic["resolved_count"] = int(recovery.isin({"resolved", "auto_resolved"}).sum())
+    stale_cutoff = pd.Timestamp.now() - timedelta(hours=max(0, float(stale_hours)))
+    diagnostic["stale_unresolved_count"] = int((unresolved & event_times.lt(stale_cutoff)).sum())
+    latest = read_fallback_events(path, limit=1)
+    if not latest.empty:
+        diagnostic["latest_occurred_at"] = _clean_runtime_value(latest.iloc[0].get("発生日時"))
+
+    corrupted = any(
+        diagnostic[key]
+        for key in (
+            "duplicate_event_ids",
+            "duplicate_keys",
+            "invalid_games",
+            "invalid_cause_codes",
+            "invalid_fallback_methods",
+            "invalid_recovery_states",
+            "corrupted_model_name_count",
+        )
+    )
+    warning = bool(diagnostic["missing_datetime_count"] or diagnostic["unresolved_count"] or diagnostic["stale_unresolved_count"])
+    diagnostic["status"] = "corrupted" if corrupted else "warning" if warning else "healthy"
+    diagnostic["status_label"] = "イベントなし" if events.empty else FALLBACK_EVENT_STATUS_LABELS[diagnostic["status"]]
+    if diagnostic["duplicate_event_ids"]:
+        diagnostic["warnings"].append("イベントIDが重複しています。")
+    if diagnostic["duplicate_keys"]:
+        diagnostic["warnings"].append("未復旧イベントの重複キーが重複しています。")
+    if diagnostic["invalid_cause_codes"]:
+        diagnostic["warnings"].append("不正な原因コードがあります。")
+    if diagnostic["invalid_fallback_methods"]:
+        diagnostic["warnings"].append("不正な代替方式があります。")
+    if diagnostic["corrupted_model_name_count"]:
+        diagnostic["warnings"].append("モデル名に破損疑い文字 '?' を含むイベントがあります。")
+    if diagnostic["stale_unresolved_count"]:
+        diagnostic["warnings"].append("24時間を超える未復旧イベントがあります。")
     return diagnostic
 
 

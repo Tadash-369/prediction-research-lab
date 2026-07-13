@@ -38,6 +38,8 @@ loto_lab/runtime/model_settings.csv
 loto_lab/runtime/loto7_model_settings.csv
 loto_lab/runtime/model_settings_history.csv
 loto_lab/runtime/loto7_model_settings_history.csv
+loto_lab/runtime/loto6_fallback_events.csv
+loto_lab/runtime/loto7_fallback_events.csv
 loto_lab/runtime/*.tmp
 loto_lab/runtime/*.bak
 
