@@ -186,6 +186,7 @@ OFFICIAL_RESULTS_CSV = DATA_DIR / "loto7_results.csv"
 VERIFICATION_REPORTS_CSV = VERIFICATION_DIR / "loto7_verification_reports.csv"
 MODEL_SETTINGS_CSV = RUNTIME_DIR / "loto7_model_settings.csv"
 MODEL_SETTINGS_TEMPLATE_CSV = CONFIG_TEMPLATE_DIR / "loto7_model_settings.template.csv"
+MODEL_SETTINGS_HISTORY_CSV = RUNTIME_DIR / "loto7_model_settings_history.csv"
 CONTRIBUTIONS_CSV = VERIFICATION_DIR / "loto7_model_contributions.csv"
 RESEARCH_CYCLES_CSV = VERIFICATION_DIR / "loto7_research_cycles.csv"
 VIDEO_HYPOTHESES_CSV = VERIFICATION_DIR / "video_hypotheses.csv"
@@ -330,7 +331,7 @@ def read_active_model_setting():
     return setting
 
 
-def save_active_model_setting(model_key, reason):
+def save_active_model_setting(model_key, reason, change_source="unknown"):
     model_name = MODEL_LABELS.get(model_key, model_key)
     return save_runtime_setting(
         MODEL_SETTINGS_CSV,
@@ -342,6 +343,9 @@ def save_active_model_setting(model_key, reason):
         reason,
         MODEL_LABELS,
         now_text(),
+        history_csv=MODEL_SETTINGS_HISTORY_CSV,
+        game="loto7",
+        change_source=change_source,
     )
 
 
@@ -1529,7 +1533,11 @@ def run_pre_prediction_research(results, persist_setting=False):
     summary_df, detail_df = run_backtest(results, lookback_rounds=lookback_rounds)
     best_key = best_actionable_model_key(summary_df)
     if best_key and persist_setting:
-        save_active_model_setting(best_key, f"予想生成前の履歴分析・直近{lookback_rounds}回評価")
+        save_active_model_setting(
+            best_key,
+            f"予想生成前の履歴分析・直近{lookback_rounds}回評価",
+            change_source="pre_prediction_research",
+        )
     return summary_df, detail_df, best_key
 
 
@@ -2380,7 +2388,11 @@ def render_lab():
                 st.session_state["loto7_backtest_detail"] = detail_df
                 best_key = best_actionable_model_key(summary_df)
                 if best_key:
-                    save_active_model_setting(best_key, f"直近{lookback_rounds}回バックテストで最上位")
+                    save_active_model_setting(
+                        best_key,
+                        f"直近{lookback_rounds}回バックテストで最上位",
+                        change_source="backtest",
+                    )
                     st.session_state["loto7_model_notice"] = f"{MODEL_LABELS[best_key]}を次回予想モデルとして保存しました。"
                     st.rerun()
 

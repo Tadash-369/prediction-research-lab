@@ -36,6 +36,8 @@ loto7_*_frames/
 # Runtime settings
 loto_lab/runtime/model_settings.csv
 loto_lab/runtime/loto7_model_settings.csv
+loto_lab/runtime/model_settings_history.csv
+loto_lab/runtime/loto7_model_settings_history.csv
 loto_lab/runtime/*.tmp
 loto_lab/runtime/*.bak
 

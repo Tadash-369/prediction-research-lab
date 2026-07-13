@@ -49,7 +49,11 @@ from balance_weight_research import build_balance_weight_research
 from balance_weight_adoption_ui import render_adoption_overview
 from balance_weight_research_ui import render_balance_weight_research_ui
 from prl_maintenance import collect_csv_safety_diagnostics, is_light_smoke_mode, is_light_smoke_value, run_maintenance
-from runtime_settings import diagnose_runtime_setting
+from runtime_settings import (
+    diagnose_runtime_setting,
+    diagnose_runtime_setting_history,
+    read_runtime_setting_history,
+)
 
 
 BASE_DIR = LOTO_LAB_DIR
@@ -62,12 +66,16 @@ RUNTIME_HEALTH_CONFIGS = [
         "label": "ロト6",
         "runtime": BASE_DIR / "runtime" / "model_settings.csv",
         "template": BASE_DIR / "config_templates" / "model_settings.template.csv",
+        "history": BASE_DIR / "runtime" / "model_settings_history.csv",
+        "game": "loto6",
         "setting_name": "active_next_prediction",
     },
     {
         "label": "ロト7",
         "runtime": BASE_DIR / "runtime" / "loto7_model_settings.csv",
         "template": BASE_DIR / "config_templates" / "loto7_model_settings.template.csv",
+        "history": BASE_DIR / "runtime" / "loto7_model_settings_history.csv",
+        "game": "loto7",
         "setting_name": "active_loto7_prediction",
     },
 ]
@@ -398,6 +406,56 @@ def render_runtime_health_card(config):
             st.json(safe_details)
 
 
+def render_runtime_setting_history(config):
+    def display_value(value, default="-"):
+        try:
+            if pd.isna(value):
+                return default
+        except (TypeError, ValueError):
+            pass
+        text = str(value or "").strip()
+        return text or default
+
+    diagnosis = diagnose_runtime_setting_history(config["history"])
+    history = read_runtime_setting_history(config["history"], game=config["game"], limit=10)
+    status = diagnosis.get("status", "error")
+    status_label = diagnosis.get("status_label", "不明")
+    if status == "healthy":
+        st.success(f"履歴状態: {status_label}")
+    elif status == "missing":
+        st.info("実行時設定の変更履歴はまだありません。")
+    elif status == "warning":
+        st.warning(f"履歴状態: {status_label}")
+    else:
+        st.error(f"履歴状態: {status_label}")
+
+    metrics = st.columns(4)
+    metrics[0].metric("履歴件数", diagnosis.get("history_count", 0))
+    metrics[1].metric("rejected", diagnosis.get("rejected_count", 0))
+    metrics[2].metric("failed", diagnosis.get("failed_count", 0))
+    metrics[3].metric("最終変更", diagnosis.get("latest_changed_at") or "-")
+    if history.empty:
+        if status != "missing":
+            st.info("表示できる設定変更履歴はありません。")
+    else:
+        latest = history.iloc[0]
+        old_model = display_value(latest.get("旧モデル名"), display_value(latest.get("旧モデルキー"), "未設定"))
+        new_model = display_value(latest.get("新モデル名"), display_value(latest.get("新モデルキー"), "未設定"))
+        st.write(f"最新変更元: {display_value(latest.get('変更元'), 'unknown')}")
+        st.write(f"モデル変更: {old_model} → {new_model}")
+        st.write(f"変更理由: {display_value(latest.get('変更理由'))}")
+        st.write(f"保存結果: {display_value(latest.get('保存結果'))}")
+        with st.expander("直近10件の設定変更履歴", expanded=False):
+            st.dataframe(history, width="stretch", hide_index=True)
+
+    warnings = diagnosis.get("warnings") or []
+    errors = diagnosis.get("errors") or []
+    if warnings:
+        st.warning(" / ".join(map(str, warnings)))
+    if errors:
+        st.error(" / ".join(map(str, errors)))
+
+
 def render_runtime_settings_health():
     st.markdown("**システム健全性**")
     st.markdown("**実行時設定診断（読み取り専用）**")
@@ -407,6 +465,12 @@ def render_runtime_settings_health():
         with column:
             st.markdown(f"**{config['label']} runtime設定**")
             render_runtime_health_card(config)
+
+    st.markdown("**実行時設定変更履歴**")
+    history_tabs = st.tabs([config["label"] for config in RUNTIME_HEALTH_CONFIGS])
+    for tab, config in zip(history_tabs, RUNTIME_HEALTH_CONFIGS):
+        with tab:
+            render_runtime_setting_history(config)
 
 
 def purchase_summary_row(label, summary):
