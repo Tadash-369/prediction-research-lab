@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.20.1] - 2026-07-14
+
+### Fixed
+- **Local環境でのimportエラー修正**: `loto_lab.core` 配下で `ModuleNotFoundError` が発生する問題を解消
+- `evidence_evaluation.py`, `prospective_evidence.py`, `prl_maintenance.py`, `arl_research_engine.py` の6箇所を相対importに変更
+- `tests/` 配下2ファイルのimportパスを `from loto_lab.core import` 形式に修正
+- pytest 38件全passを確認
+
+### Changed
+- なし（importパスのみ修正、機能変更なし）
+
+### Notes
+- Ver1.20.0からVer1.20.1への更新は全ユーザーのローカル開発環境での動作を改善します
+- 既存の研究データ・生成済みEvidenceには影響ありません
+- 本番環境・CI環境ではVer1.20.0でも問題ありませんでした
+
+---
+
+## [1.20.0] - 2026-07-10
+...既存の内容...
+
 ## 2026-07-12 Ver1.12
 
 - ロト7のAI改善履歴に含まれる破損疑いモデル名（半角 `?` を含む値）を、モデル重み集計から除外する防御を追加しました。
